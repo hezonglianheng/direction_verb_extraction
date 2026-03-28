@@ -1,0 +1,6 @@
+.venv
+LTP_model
+.vscode
+__pycache__
+*.pyc
+*copy*
