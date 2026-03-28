@@ -33,12 +33,18 @@ def _filter_sentence_batch(batch: list[dict[str, Any]]) -> list[dict[str, Any]]:
 	filtered_batch: list[dict[str, Any]] = []
 	for s in batch:
 		curr_sentence: str = s.get("sentence", "")
+		if not _WORKER_FILTER.judge(curr_sentence):
+			continue
+
+		# fast path: 仅对命中句子构建 explain 与匹配树
 		judge_result, explanation = _WORKER_FILTER.explain(curr_sentence)
-		if judge_result:
-			filter_methods = explanation.get("methods", [])
-			match_tree: list[sentenceFilters.MatchNode] = explanation.get("match_tree", [])
-			simplified_tree = sentenceFilters.simplify_tree(match_tree)
-			filtered_batch.append(s | {"filter_methods": filter_methods, "match_tree": simplified_tree})
+		if not judge_result:
+			continue
+
+		filter_methods = explanation.get("methods", [])
+		match_tree: list[sentenceFilters.MatchNode] = explanation.get("match_tree", [])
+		simplified_tree = sentenceFilters.simplify_tree(match_tree)
+		filtered_batch.append(s | {"filter_methods": filter_methods, "match_tree": simplified_tree})
 	return filtered_batch
 
 

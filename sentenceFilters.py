@@ -4,6 +4,7 @@ import json5
 import abc
 from typing import Sequence, Any
 from dataclasses import dataclass, field
+from collections import defaultdict
 
 import config
 from sentenceTable import SentenceTaskCache
@@ -212,11 +213,13 @@ class SingleJudgeMethod(JudgeMethod):
     # -------------------------
 
     def judge(self, sentence: str) -> bool:
-        indices = self._search_indices(sentence, self.config)
+        context = self._build_sentence_context(sentence)
+        indices = self._search_indices_with_context(context, self.config)
         return bool(indices)
 
     def judge_with_indices(self, sentence: str):
-        indices = self._search_indices(sentence, self.config)
+        context = self._build_sentence_context(sentence)
+        indices = self._search_indices_with_context(context, self.config)
         return bool(indices), indices
 
     # -------------------------
@@ -224,7 +227,8 @@ class SingleJudgeMethod(JudgeMethod):
     # -------------------------
 
     def explain(self, sentence: str):
-        result_map = self._search_with_explain(sentence, self.config)
+        context = self._build_sentence_context(sentence)
+        result_map = self._search_with_explain_with_context(context, self.config)
 
         return (
             bool(result_map),
@@ -241,49 +245,86 @@ class SingleJudgeMethod(JudgeMethod):
     # 原逻辑（保持）
     # -------------------------
 
-    def _search_indices(self, sentence, config_dict, specific_idx=None):
-
+    def _build_sentence_context(self, sentence: str) -> dict[str, Any]:
         words = cache.get_task_value(sentence, config.CWS)
+        pos_tags = cache.get_task_value(sentence, config.POS)
+        dep = cache.get_task_value(sentence, config.DEP)
+        sdp = cache.get_task_value(sentence, config.SDP)
 
+        word_indices_map: dict[str, set[int]] = defaultdict(set)
+        for idx, w in enumerate(words):
+            word_indices_map[w].add(idx)
+
+        pos_indices_map: dict[str, set[int]] = defaultdict(set)
+        for idx, p in enumerate(pos_tags):
+            pos_indices_map[p].add(idx)
+
+        dep_label_indices_map: dict[str, set[int]] = defaultdict(set)
+        dep_child_map: dict[tuple[int, str], set[int]] = defaultdict(set)
+        for idx, (head, label) in enumerate(zip(dep["head"], dep["label"])):
+            dep_label_indices_map[label].add(idx)
+            dep_child_map[(head - 1, label)].add(idx)
+
+        sdp_label_indices_map: dict[str, set[int]] = defaultdict(set)
+        sdp_child_map: dict[tuple[int, str], set[int]] = defaultdict(set)
+        for idx, (head, label) in enumerate(zip(sdp["head"], sdp["label"])):
+            sdp_label_indices_map[label].add(idx)
+            sdp_child_map[(head - 1, label)].add(idx)
+
+        return {
+            "words": words,
+            "word_indices_map": word_indices_map,
+            "pos_indices_map": pos_indices_map,
+            "dep_label_indices_map": dep_label_indices_map,
+            "dep_child_map": dep_child_map,
+            "sdp_label_indices_map": sdp_label_indices_map,
+            "sdp_child_map": sdp_child_map,
+        }
+
+    def _get_vocab_indices(self, context: dict[str, Any], vocab_set: set[str]) -> set[int]:
+        word_indices_map = context["word_indices_map"]
+        result: set[int] = set()
+        for vocab in vocab_set:
+            result.update(word_indices_map.get(vocab, set()))
+        return result
+
+    def _collect_base_indices(self, context: dict[str, Any], config_dict: dict[str, Any], specific_idx=None) -> dict[str, set[int] | None]:
         vocab_indices = None
         pos_indices = None
         syntax_indices = None
         semantic_indices = None
 
         if self.VOCAB in config_dict:
-            vocab_indices = {i for i, w in enumerate(words) if w in config_dict[self.VOCAB]}
+            vocab_indices = self._get_vocab_indices(context, config_dict[self.VOCAB])
 
         if self.POS in config_dict:
-            pos_tags = cache.get_task_value(sentence, config.POS)
-            pos_indices = {i for i, p in enumerate(pos_tags) if p == config_dict[self.POS]}
+            pos_indices = context["pos_indices_map"].get(config_dict[self.POS], set())
 
         if self.SYNTAX in config_dict:
-            dep = cache.get_task_value(sentence, config.DEP)
-            labels = dep["label"]
-            heads = dep["head"]
-
-            if specific_idx is not None:
-                syntax_indices = {
-                    i for i, (h, l) in enumerate(zip(heads, labels))
-                    if l == config_dict[self.SYNTAX] and h - 1 == specific_idx
-                }
+            syntax_label = config_dict[self.SYNTAX]
+            if specific_idx is None:
+                syntax_indices = context["dep_label_indices_map"].get(syntax_label, set())
             else:
-                syntax_indices = {i for i, l in enumerate(labels) if l == config_dict[self.SYNTAX]}
+                syntax_indices = context["dep_child_map"].get((specific_idx, syntax_label), set())
 
         if self.SEMANTIC in config_dict:
-            sdp = cache.get_task_value(sentence, config.SDP)
-            labels = sdp["label"]
-            heads = sdp["head"]
-
-            if specific_idx is not None:
-                semantic_indices = {
-                    i for i, (h, l) in enumerate(zip(heads, labels))
-                    if l == config_dict[self.SEMANTIC] and h - 1 == specific_idx
-                }
+            semantic_label = config_dict[self.SEMANTIC]
+            if specific_idx is None:
+                semantic_indices = context["sdp_label_indices_map"].get(semantic_label, set())
             else:
-                semantic_indices = {i for i, l in enumerate(labels) if l == config_dict[self.SEMANTIC]}
+                semantic_indices = context["sdp_child_map"].get((specific_idx, semantic_label), set())
 
-        sets = [s for s in [vocab_indices, pos_indices, syntax_indices, semantic_indices] if s is not None]
+        return {
+            self.VOCAB: vocab_indices,
+            self.POS: pos_indices,
+            self.SYNTAX: syntax_indices,
+            self.SEMANTIC: semantic_indices,
+        }
+
+    def _search_indices_with_context(self, context: dict[str, Any], config_dict: dict[str, Any], specific_idx=None):
+
+        base_indices = self._collect_base_indices(context, config_dict, specific_idx)
+        sets = [s for s in base_indices.values() if s is not None]
 
         if not sets:
             return set()
@@ -297,7 +338,7 @@ class SingleJudgeMethod(JudgeMethod):
             for idx in result:
                 ok = True
                 for _, cond in config_dict[self.LINK].items():
-                    if not self._search_indices(sentence, cond, idx):
+                    if not self._search_indices_with_context(context, cond, idx):
                         ok = False
                         break
                 if ok:
@@ -306,54 +347,20 @@ class SingleJudgeMethod(JudgeMethod):
 
         return result
 
+    def _search_indices(self, sentence, config_dict, specific_idx=None):
+        context = self._build_sentence_context(sentence)
+        return self._search_indices_with_context(context, config_dict, specific_idx)
+
     # -------------------------
     # 🌳 核心：树结构解释
     # -------------------------
 
-    def _search_with_explain(self, sentence, config_dict, specific_idx=None):
+    def _search_with_explain_with_context(self, context: dict[str, Any], config_dict: dict[str, Any], specific_idx=None):
 
-        words = cache.get_task_value(sentence, config.CWS)
+        words = context["words"]
         result = {}
-
-        vocab_indices = None
-        pos_indices = None
-        syntax_indices = None
-        semantic_indices = None
-
-        if self.VOCAB in config_dict:
-            vocab_indices = {i for i, w in enumerate(words) if w in config_dict[self.VOCAB]}
-
-        if self.POS in config_dict:
-            pos_tags = cache.get_task_value(sentence, config.POS)
-            pos_indices = {i for i, p in enumerate(pos_tags) if p == config_dict[self.POS]}
-
-        if self.SYNTAX in config_dict:
-            dep = cache.get_task_value(sentence, config.DEP)
-            labels = dep["label"]
-            heads = dep["head"]
-
-            if specific_idx is not None:
-                syntax_indices = {
-                    i for i, (h, l) in enumerate(zip(heads, labels))
-                    if l == config_dict[self.SYNTAX] and h - 1 == specific_idx
-                }
-            else:
-                syntax_indices = {i for i, l in enumerate(labels) if l == config_dict[self.SYNTAX]}
-
-        if self.SEMANTIC in config_dict:
-            sdp = cache.get_task_value(sentence, config.SDP)
-            labels = sdp["label"]
-            heads = sdp["head"]
-
-            if specific_idx is not None:
-                semantic_indices = {
-                    i for i, (h, l) in enumerate(zip(heads, labels))
-                    if l == config_dict[self.SEMANTIC] and h - 1 == specific_idx
-                }
-            else:
-                semantic_indices = {i for i, l in enumerate(labels) if l == config_dict[self.SEMANTIC]}
-
-        sets = [s for s in [vocab_indices, pos_indices, syntax_indices, semantic_indices] if s is not None]
+        base_indices = self._collect_base_indices(context, config_dict, specific_idx)
+        sets = [s for s in base_indices.values() if s is not None]
 
         if not sets:
             return {}
@@ -368,10 +375,10 @@ class SingleJudgeMethod(JudgeMethod):
                 index=idx,
                 word=words[idx],
                 conditions={
-                    "_vocab": idx in vocab_indices if vocab_indices else None,
-                    "_pos": idx in pos_indices if pos_indices else None,
-                    "_syntax": idx in syntax_indices if syntax_indices else None,
-                    "_semantic": idx in semantic_indices if semantic_indices else None,
+                    "_vocab": idx in base_indices[self.VOCAB] if base_indices[self.VOCAB] is not None else None,
+                    "_pos": idx in base_indices[self.POS] if base_indices[self.POS] is not None else None,
+                    "_syntax": idx in base_indices[self.SYNTAX] if base_indices[self.SYNTAX] is not None else None,
+                    "_semantic": idx in base_indices[self.SEMANTIC] if base_indices[self.SEMANTIC] is not None else None,
                 },
                 children=[]
             )
@@ -383,8 +390,8 @@ class SingleJudgeMethod(JudgeMethod):
                 children = []
                 ok = True
 
-                for subname, cond in config_dict[self.LINK].items():
-                    sub_res = self._search_with_explain(sentence, cond, idx)
+                for _, cond in config_dict[self.LINK].items():
+                    sub_res = self._search_with_explain_with_context(context, cond, idx)
 
                     if not sub_res:
                         ok = False
@@ -399,6 +406,10 @@ class SingleJudgeMethod(JudgeMethod):
             return filtered
 
         return result
+
+    def _search_with_explain(self, sentence, config_dict, specific_idx=None):
+        context = self._build_sentence_context(sentence)
+        return self._search_with_explain_with_context(context, config_dict, specific_idx)
 
 
 # =========================
