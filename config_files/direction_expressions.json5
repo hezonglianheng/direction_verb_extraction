@@ -1,0 +1,160 @@
+// 包含搜索汉语趋向动词相关的句子的条件
+
+{
+    // 注意：一个字典表示一个或一组条件
+    // 如果字典中包含"_vocab"/"_pos"/"_syntax"/"_semantic"等保留字，则字典表示1个条件，它表示该条件涉及的词汇列表和筛选函数列表
+    // 否则，字典表示一组条件，包含一个或多个子条件（以非下划线开头），以及它们之间的逻辑关系（由"_logic"保留字表示，默认为"or"）
+    "direction_verb_as_center": {
+        // 搜索条件：趋向动词作为谓语动词的核心成分
+        // _vocab是保留字，表示该条件涉及的词汇列表
+        // "_vocab": ["上", "下", "进", "出", "过", "回", "来", "去", "上来", "上去", "下来", "下去", "进来", "进去", "出来", "出去", "过来", "过去", "回来", "回去"],
+        "_vocab": ["上", "下", "进", "出", "过", "回", "上来", "上去", "下来", "下去", "进来", "进去", "出来", "出去", "过来", "过去", "回来", "回去"],
+        "_pos": "v", 
+        "_link": {
+            "has_locative_complement": {
+                "_semantic": "LOC", 
+            }
+        }, 
+    }, 
+    "accompany_verb_two_complement": {
+        // 搜索条件：伴随动词作为谓语动词的核心成分
+        "_vocab": ["搬", "抱", "背", "搀", "带", "担", "端", "递", "扶", "捡", "扛", "拉", "拿", "捧", "牵", "送", "提", "推", "抬", "拖", "运", "抓", "追", ],
+        "_pos": "v",
+        "_link": {
+            "has_locative_complement": {
+                "_semantic": "LOC", 
+            }, 
+            "direction_verb_as_first_complement": {
+                "_vocab": ["上", "下", "进", "出", "过", "回", ],
+                "_pos": "v",
+                "_semantic": "mDEPD", 
+            }, 
+            "direction_verb_as_second_complement": {
+                "_vocab": ["来", "去", ],
+                "_pos": "v",
+                "_semantic": "mDEPD", 
+            }, 
+        },
+    }, 
+    "accompany_verb_one_complement": {
+        // 搜索条件：伴随动词作为谓语动词的核心成分
+        "_vocab": ["搬", "抱", "背", "搀", "带", "担", "端", "递", "扶", "捡", "扛", "拉", "拿", "捧", "牵", "送", "提", "推", "抬", "拖", "运", "抓", "追", ],
+        "_pos": "v",
+        "_link": {
+            "has_locative_complement": {
+                "_semantic": "LOC", 
+            }, 
+            "direction_verb_as_single_complement": {
+                "_vocab": ["上", "下", "进", "出", "过", "回", "来", "去", "上来", "上去", "下来", "下去", "进来", "进去", "出来", "出去", "过来", "过去", "回来", "回去"],
+                "_pos": "v",
+                "_semantic": "mDEPD", 
+            }, 
+        },
+    }, 
+    "cause_verb_two_complement": {
+        // 搜索条件：原因动词作为谓语动词的核心成分
+        "_vocab": ["插", "拆", "扯", "抽", "钉", "丢", "割", "刮", "寄", "抛", "泼", "切", "扔", "塞", "洒", "撒", "掏", "踢", "提", "挑", "投", "推", "挖", "砸", "摘", ],
+        "_pos": "v",
+        "_link": {
+            "has_locative_complement": {
+                "_semantic": "LOC", 
+            }, 
+            "direction_verb_as_first_complement": {
+                "_vocab": ["上", "下", "进", "出", "过", "回", ],
+                "_pos": "v",
+                "_semantic": "mDEPD", 
+            }, 
+            "direction_verb_as_second_complement": {
+                "_vocab": ["来", "去", ],
+                "_pos": "v",
+                "_semantic": "mDEPD", 
+            }, 
+        },
+    }, 
+    "cause_verb_one_complement": {
+        // 搜索条件：原因动词作为谓语动词的核心成分
+        "_vocab": ["插", "拆", "扯", "抽", "钉", "丢", "割", "刮", "寄", "抛", "泼", "切", "扔", "塞", "洒", "撒", "掏", "踢", "提", "挑", "投", "推", "挖", "砸", "摘", ],
+        "_pos": "v",
+        "_link": {
+            "has_locative_complement": {
+                "_semantic": "LOC", 
+            }, 
+            "direction_verb_as_single_complement": {
+                "_vocab": ["上", "下", "进", "出", "过", "回", "来", "去", "上来", "上去", "下来", "下去", "进来", "进去", "出来", "出去", "过来", "过去", "回来", "回去"],
+                "_pos": "v",
+                "_semantic": "mDEPD", 
+            }, 
+        },
+    }, 
+    "manner_verb_two_complement": {
+        // 搜索条件：方式动词作为谓语动词的核心成分
+        "_vocab": ["奔", "蹦", "沉", "闯", "凑", "跌", "飞", "滚", "爬", "跑", "漂", "飘", "扑", "伸", "缩", "逃", "围", "拥", "游", "走", "钻", ],
+        "_pos": "v",
+        "_link": {
+            "has_locative_complement": {
+                "_semantic": "LOC", 
+            }, 
+            "direction_verb_as_first_complement": {
+                "_vocab": ["上", "下", "进", "出", "过", "回", ],
+                "_pos": "v",
+                "_semantic": "mDEPD", 
+            }, 
+            "direction_verb_as_second_complement": {
+                "_vocab": ["来", "去", ],
+                "_pos": "v",
+                "_semantic": "mDEPD", 
+            }, 
+        },
+    }, 
+    "manner_verb_one_complement": {
+        // 搜索条件：方式动词作为谓语动词的核心成分
+        "_vocab": ["奔", "蹦", "沉", "闯", "凑", "跌", "飞", "滚", "爬", "跑", "漂", "飘", "扑", "伸", "缩", "逃", "围", "拥", "游", "走", "钻", ],
+        "_pos": "v",
+        "_link": {
+            "has_locative_complement": {
+                "_semantic": "LOC", 
+            }, 
+            "direction_verb_as_single_complement": {
+                "_vocab": ["上", "下", "进", "出", "过", "回", "来", "去", "上来", "上去", "下来", "下去", "进来", "进去", "出来", "出去", "过来", "过去", "回来", "回去"],
+                "_pos": "v",
+                "_semantic": "mDEPD", 
+            }, 
+        },
+    }, 
+/*
+    "other_verb_two_complement": {
+        // 搜索条件：其他动词作为谓语动词的核心成分
+        "_pos": "v",
+        "_link": {
+            "has_locative_complement": {
+                "_semantic": "LOC", 
+            }, 
+            "direction_verb_as_first_complement": {
+                "_vocab": ["上", "下", "进", "出", "过", "回", ],
+                "_pos": "v",
+                "_semantic": "mDEPD", 
+            }, 
+            "direction_verb_as_second_complement": {
+                "_vocab": ["来", "去", ],
+                "_pos": "v",
+                "_semantic": "mDEPD", 
+            }, 
+        },
+    },
+    "other_verb_one_complement": {
+        // 搜索条件：其他动词作为谓语动词的核心成分
+        "_pos": "v",
+        "_link": {
+            "has_locative_complement": {
+                "_semantic": "LOC",
+            }, 
+            "direction_verb_as_single_complement": {
+                "_vocab": ["上", "下", "进", "出", "过", "回", "来", "去", "上来", "上去", "下来", "下去", "进来", "进去", "出来", "出去", "过来", "过去", "回来", "回去"],
+                "_pos": "v",
+                "_semantic": "mDEPD",
+            },
+        },
+    },
+*/
+    "_logic": "or", // _logic是保留字，表示不同条件之间的逻辑关系。在这个例子中，六个条件之间是“或”关系，即满足任一条件即可
+}
