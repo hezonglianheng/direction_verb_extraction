@@ -8,9 +8,21 @@ from collections import OrderedDict
 
 import config
 
-ltp = LTP(config.LTP_MODEL_PATH)
-if torch.cuda.is_available():
-    ltp.to("cuda")
+_ltp = None
+_ltp_init_lock = threading.Lock()
+
+
+def _get_ltp() -> LTP:
+    """Lazy-init LTP in current process to avoid CUDA init before multiprocessing fork/spawn."""
+    global _ltp
+    if _ltp is None:
+        with _ltp_init_lock:
+            if _ltp is None:
+                model = LTP(config.LTP_MODEL_PATH)
+                if torch.cuda.is_available():
+                    model.to("cuda")
+                _ltp = model
+    return _ltp
 
 class SentenceTaskCache:
     BASE_TASKS = (config.CWS, config.POS, config.DEP, config.SDP)
@@ -61,7 +73,7 @@ class SentenceTaskCache:
 
         # 对核心任务采用单次 pipeline 统一推理，减少重复模型调用
         if task in self.BASE_TASKS and self._need_base_tasks(sentence):
-            result = ltp.pipeline(sentence, tasks=list(self.BASE_TASKS))
+            result = _get_ltp().pipeline(sentence, tasks=list(self.BASE_TASKS))
             self._update_cache(sentence, {t: result[t] for t in self.BASE_TASKS})
 
         cached_value = self._get_cached_value(sentence, task)
@@ -70,6 +82,6 @@ class SentenceTaskCache:
 
         # 兜底：非核心任务按需计算，并缓存
         tasks_list = [config.CWS, task] if task != config.CWS else [task]
-        value = ltp.pipeline(sentence, tasks=tasks_list)[task]
+        value = _get_ltp().pipeline(sentence, tasks=tasks_list)[task]
         self._update_cache(sentence, {task: value})
         return value

@@ -5,6 +5,7 @@ import jsonlines
 
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
 import re
 from typing import Any, Iterable
 import csv
@@ -148,8 +149,10 @@ def filter_sentences_streaming(
 			)
 	else:
 		max_pending = max_workers * 2
+		spawn_ctx = mp.get_context("spawn")
 		with ProcessPoolExecutor(
 			max_workers=max_workers,
+			mp_context=spawn_ctx,
 			initializer=_init_filter_worker,
 			initargs=(filter_config_path,),
 		) as executor:
