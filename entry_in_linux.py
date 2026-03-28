@@ -81,7 +81,7 @@ def _print_batch_progress(postfix: dict[str, str | int]) -> None:
 	]
 	if "pending" in postfix:
 		lines.append(f"pending：{postfix['pending']}")
-	print("\n".join(lines))
+	print("\t".join(lines))
 
 
 def get_sentences_list(article: str) -> list[str]:
