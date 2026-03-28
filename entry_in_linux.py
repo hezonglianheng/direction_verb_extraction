@@ -10,12 +10,14 @@ import re
 from typing import Any, Iterable
 import csv
 import os
+import time
 
 import config
 import sentenceFilters
 
 
 _WORKER_FILTER = None
+_START_TIME = None
 
 
 def _init_filter_worker(filter_config_path: str):
@@ -81,6 +83,9 @@ def _print_batch_progress(postfix: dict[str, str | int]) -> None:
 	]
 	if "pending" in postfix:
 		lines.append(f"pending：{postfix['pending']}")
+	if _START_TIME is not None:
+		elapsed = time.time() - _START_TIME
+		lines.append(f"elapsed：{elapsed:.2f}s")
 	print("\t".join(lines))
 
 
@@ -192,6 +197,8 @@ def filter_sentences_streaming(
 
 
 def run(src_path: str, tgt_path: str = ".", filter_config_path: str = "filter_config.json5"):
+	global _START_TIME
+	_START_TIME = time.time()
 	print("[运行模式] Linux/Other: 流式处理")
 	output_file = Path(tgt_path) / "filtered_sentences.csv"
 	sentences = iter_path_sentences(src_path)
