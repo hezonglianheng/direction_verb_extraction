@@ -8,7 +8,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
 import re
 from typing import Any, Iterable
-import csv
+import json
 import os
 import time
 
@@ -44,7 +44,11 @@ def _filter_sentence_batch(batch: list[dict[str, Any]]) -> list[dict[str, Any]]:
 		filter_methods = explanation.get("methods", [])
 		match_tree: list[sentenceFilters.MatchNode] = explanation.get("match_tree", [])
 		simplified_tree = sentenceFilters.simplify_tree(match_tree)
-		filtered_batch.append(s | {"filter_methods": filter_methods, "match_tree": simplified_tree})
+		
+		# 获取CWS结果并替换原本的sentence
+		cws_result = sentenceFilters.cache.get_task_value(curr_sentence, config.CWS)
+		
+		filtered_batch.append(s | {"sentence": cws_result, "filter_methods": filter_methods, "match_tree": simplified_tree})
 	return filtered_batch
 
 
@@ -136,7 +140,7 @@ def iter_path_sentences(src_path: str, vocabs: list[str] = None):
 def filter_sentences_streaming(
 	sentences: Iterable[dict[str, Any]],
 	filter_config_path: str,
-	writer: csv.DictWriter,
+	out_file,
 ):
 	candidate_count = 0
 	filtered_count = 0
@@ -152,7 +156,7 @@ def filter_sentences_streaming(
 			filtered_batch = _filter_sentence_batch(batch)
 			filtered_count += len(filtered_batch)
 			for row in filtered_batch:
-				writer.writerow(row)
+				out_file.write(json.dumps(row, ensure_ascii=False) + "\n")
 			_print_batch_progress(
 				_build_progress_postfix(
 					candidate_count,
@@ -190,7 +194,7 @@ def filter_sentences_streaming(
 				filtered_batch = done_future.result()
 				filtered_count += len(filtered_batch)
 				for row in filtered_batch:
-					writer.writerow(row)
+					out_file.write(json.dumps(row, ensure_ascii=False) + "\n")
 				_print_batch_progress(
 					_build_progress_postfix(
 						candidate_count,
@@ -208,13 +212,11 @@ def run(src_path: str, tgt_path: str = ".", filter_config_path: str = "filter_co
 	global _START_TIME
 	_START_TIME = time.time()
 	print("[运行模式] Linux/Other: 流式处理")
-	output_file = Path(tgt_path) / "filtered_sentences.csv"
+	output_file = Path(tgt_path) / "filtered_sentences.jsonl"
 	sentences = iter_path_sentences(src_path, vocabs=vocabs)
 
-	with open(output_file, "w", newline="", encoding="utf-8") as csvfile:
-		writer = csv.DictWriter(csvfile, fieldnames=["sentence", "source_file", "filter_methods", "match_tree", ])
-		writer.writeheader()
-		filter_sentences_streaming(sentences, filter_config_path, writer)
+	with open(output_file, "w", encoding="utf-8") as f:
+		filter_sentences_streaming(sentences, filter_config_path, f)
 
 
 def run_linux_entry(src_path: str, tgt_path: str, filter_config_path: str, vocabs: list[str] = None):

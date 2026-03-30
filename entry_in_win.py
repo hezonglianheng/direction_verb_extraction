@@ -5,7 +5,7 @@ from tqdm import tqdm
 from pathlib import Path
 import re
 from typing import Any
-import csv
+import json
 
 import config
 import sentenceFilters
@@ -32,7 +32,11 @@ def _filter_sentence(item: dict[str, Any]) -> dict[str, Any] | None:
 	filter_methods = explanation.get("methods", [])
 	match_tree: list[sentenceFilters.MatchNode] = explanation.get("match_tree", [])
 	simplified_tree = sentenceFilters.simplify_tree(match_tree)
-	return item | {"filter_methods": filter_methods, "match_tree": simplified_tree}
+	
+	# 获取CWS结果并替换原本的sentence
+	cws_result = sentenceFilters.cache.get_task_value(curr_sentence, config.CWS)
+	
+	return item | {"sentence": cws_result, "filter_methods": filter_methods, "match_tree": simplified_tree}
 
 
 def _build_progress_postfix(candidate_count: int, filtered_count: int, *, batch_size: int | None = None) -> dict[str, str | int]:
@@ -130,12 +134,11 @@ def filter_sentences_windows_in_memory(sentences: list[dict[str, Any]], filter_c
 
 
 def run_windows_entry(src_path: str, tgt_path: str, filter_config_path: str, vocabs: list[str] = None):
-	output_file = Path(tgt_path) / "filtered_sentences.csv"
+	output_file = Path(tgt_path) / "filtered_sentences.jsonl"
 	print("[运行模式] Windows: 整文件读入内存处理")
 	sentences = load_path_sentences_in_memory(src_path, vocabs)
 	filtered_sentences = filter_sentences_windows_in_memory(sentences, filter_config_path)
 
-	with open(output_file, "w", newline="", encoding="utf-8") as csvfile:
-		writer = csv.DictWriter(csvfile, fieldnames=["sentence", "source_file", "filter_methods", "match_tree"])
-		writer.writeheader()
-		writer.writerows(filtered_sentences)
+	with open(output_file, "w", encoding="utf-8") as f:
+		for row in filtered_sentences:
+			f.write(json.dumps(row, ensure_ascii=False) + "\n")
