@@ -95,37 +95,39 @@ def _print_batch_progress(postfix: dict[str, str | int]) -> None:
 	print("\t".join(lines))
 
 
-def get_sentences_list(article: str) -> list[str]:
+def get_sentences_list(article: str, vocabs: list[str] = None) -> list[str]:
 	sentences = StnSplit().split(article)
 	sentences = [s for s in sentences if config.SENTENCE_LEN_LOWER_BOUND <= len(s) <= config.SENTENCE_LEN_UPPER_BOUND]
 	sentences = [s for s in sentences if s.isascii() or re.search(r"[\u4e00-\u9fff]", s)]
 	sentences = [s for s in sentences if "【【【缺文】】】" not in s]
 	sentences = [s.strip() for s in sentences]
+	if vocabs:
+		sentences = [s for s in sentences if any(vocab in s for vocab in vocabs)]
 	return [s.split()[-1] for s in sentences]
 
 
-def iter_jsonl_file_sentences(input_file: str, position: int = 0):
+def iter_jsonl_file_sentences(input_file: str, position: int = 0, vocabs: list[str] = None):
 	extracted_count = 0
 	with jsonlines.open(input_file) as reader:
 		for obj in reader:
 			article: str = obj["content"]
-			sentence_list = get_sentences_list(article)
+			sentence_list = get_sentences_list(article, vocabs)
 			for sentence in sentence_list:
 				extracted_count += 1
 				yield {"sentence": sentence, "source_file": input_file}
 	print(f"从文件 {input_file} 中提取了 {extracted_count} 个句子")
 
 
-def iter_path_sentences(src_path: str):
+def iter_path_sentences(src_path: str, vocabs: list[str] = None):
 	input_path = Path(src_path)
 	if input_path.is_file():
-		yield from iter_jsonl_file_sentences(src_path, position=0)
+		yield from iter_jsonl_file_sentences(src_path, position=0, vocabs=vocabs)
 		return
 
 	if input_path.is_dir():
 		files = list(input_path.glob("*.jsonl"))
 		for i, file in enumerate(files):
-			yield from iter_jsonl_file_sentences(str(file), position=i)
+			yield from iter_jsonl_file_sentences(str(file), position=i, vocabs=vocabs)
 		return
 
 	raise ValueError(f"输入路径 {src_path} 既不是文件也不是目录")
@@ -202,12 +204,12 @@ def filter_sentences_streaming(
 	print(f"从 {candidate_count} 个备选句子中筛选出了 {filtered_count} 个符合条件的句子")
 
 
-def run(src_path: str, tgt_path: str = ".", filter_config_path: str = "filter_config.json5"):
+def run(src_path: str, tgt_path: str = ".", filter_config_path: str = "filter_config.json5", vocabs: list[str] = None):
 	global _START_TIME
 	_START_TIME = time.time()
 	print("[运行模式] Linux/Other: 流式处理")
 	output_file = Path(tgt_path) / "filtered_sentences.csv"
-	sentences = iter_path_sentences(src_path)
+	sentences = iter_path_sentences(src_path, vocabs=vocabs)
 
 	with open(output_file, "w", newline="", encoding="utf-8") as csvfile:
 		writer = csv.DictWriter(csvfile, fieldnames=["sentence", "source_file", "filter_methods", "match_tree", ])
@@ -215,5 +217,5 @@ def run(src_path: str, tgt_path: str = ".", filter_config_path: str = "filter_co
 		filter_sentences_streaming(sentences, filter_config_path, writer)
 
 
-def run_linux_entry(src_path: str, tgt_path: str, filter_config_path: str):
-	run(src_path, tgt_path, filter_config_path)
+def run_linux_entry(src_path: str, tgt_path: str, filter_config_path: str, vocabs: list[str] = None):
+	run(src_path, tgt_path, filter_config_path, vocabs)

@@ -47,16 +47,18 @@ def _build_progress_postfix(candidate_count: int, filtered_count: int, *, batch_
 	return postfix
 
 
-def get_sentences_list(article: str) -> list[str]:
+def get_sentences_list(article: str, vocabs: list[str] = None) -> list[str]:
 	sentences = StnSplit().split(article)
 	sentences = [s for s in sentences if config.SENTENCE_LEN_LOWER_BOUND <= len(s) <= config.SENTENCE_LEN_UPPER_BOUND]
 	sentences = [s for s in sentences if s.isascii() or re.search(r"[\u4e00-\u9fff]", s)]
 	sentences = [s for s in sentences if "【【【缺文】】】" not in s]
 	sentences = [s.strip() for s in sentences]
+	if vocabs:
+		sentences = [s for s in sentences if any(vocab in s for vocab in vocabs)]
 	return [s.split()[-1] for s in sentences]
 
 
-def load_jsonl_file_sentences_in_memory(input_file: str, position: int = 0) -> list[dict[str, Any]]:
+def load_jsonl_file_sentences_in_memory(input_file: str, position: int = 0, vocabs: list[str] = None) -> list[dict[str, Any]]:
 	extracted_count = 0
 	extracted_sentences: list[dict[str, Any]] = []
 	with jsonlines.open(input_file) as reader:
@@ -70,7 +72,7 @@ def load_jsonl_file_sentences_in_memory(input_file: str, position: int = 0) -> l
 			dynamic_ncols=True,
 		):
 			article: str = obj["content"]
-			sentence_list = get_sentences_list(article)
+			sentence_list = get_sentences_list(article, vocabs)
 			for sentence in sentence_list:
 				extracted_count += 1
 				extracted_sentences.append({"sentence": sentence, "source_file": input_file})
@@ -78,17 +80,17 @@ def load_jsonl_file_sentences_in_memory(input_file: str, position: int = 0) -> l
 	return extracted_sentences
 
 
-def load_path_sentences_in_memory(src_path: str) -> list[dict[str, Any]]:
+def load_path_sentences_in_memory(src_path: str, vocabs: list[str] = None) -> list[dict[str, Any]]:
 	input_path = Path(src_path)
 	all_sentences: list[dict[str, Any]] = []
 
 	if input_path.is_file():
-		return load_jsonl_file_sentences_in_memory(src_path, position=0)
+		return load_jsonl_file_sentences_in_memory(src_path, position=0, vocabs=vocabs)
 
 	if input_path.is_dir():
 		files = list(input_path.glob("*.jsonl"))
 		for i, file in enumerate(files):
-			all_sentences.extend(load_jsonl_file_sentences_in_memory(str(file), position=i))
+			all_sentences.extend(load_jsonl_file_sentences_in_memory(str(file), position=i, vocabs=vocabs))
 		return all_sentences
 
 	raise ValueError(f"输入路径 {src_path} 既不是文件也不是目录")
@@ -127,10 +129,10 @@ def filter_sentences_windows_in_memory(sentences: list[dict[str, Any]], filter_c
 	return filtered_sentences
 
 
-def run_windows_entry(src_path: str, tgt_path: str, filter_config_path: str):
+def run_windows_entry(src_path: str, tgt_path: str, filter_config_path: str, vocabs: list[str] = None):
 	output_file = Path(tgt_path) / "filtered_sentences.csv"
 	print("[运行模式] Windows: 整文件读入内存处理")
-	sentences = load_path_sentences_in_memory(src_path)
+	sentences = load_path_sentences_in_memory(src_path, vocabs)
 	filtered_sentences = filter_sentences_windows_in_memory(sentences, filter_config_path)
 
 	with open(output_file, "w", newline="", encoding="utf-8") as csvfile:
