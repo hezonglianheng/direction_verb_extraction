@@ -59,7 +59,8 @@ def get_sentences_list(article: str, vocabs: list[str] = None) -> list[str]:
 	sentences = [s.strip() for s in sentences]
 	if vocabs:
 		sentences = [s for s in sentences if any(vocab in s for vocab in vocabs)]
-	return [s.split()[-1] for s in sentences]
+	# 纯空白片段在 strip 后为空串，必须剔除（旧写法 s.split()[-1] 会在此抛 IndexError）
+	return [s for s in sentences if s]
 
 
 def load_jsonl_file_sentences_in_memory(input_file: str, position: int = 0, vocabs: list[str] = None) -> list[dict[str, Any]]:
