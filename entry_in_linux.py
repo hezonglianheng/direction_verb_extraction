@@ -33,10 +33,7 @@ def _filter_sentence_batch(batch: list[dict[str, Any]]) -> list[dict[str, Any]]:
 	filtered_batch: list[dict[str, Any]] = []
 	for s in batch:
 		curr_sentence: str = s.get("sentence", "")
-		if not _WORKER_FILTER.judge(curr_sentence):
-			continue
-
-		# fast path: 仅对命中句子构建 explain 与匹配树
+		# explain 的真值判定与 judge 严格等价（同一套 context + 集合运算），单次调用即可
 		judge_result, explanation = _WORKER_FILTER.explain(curr_sentence)
 		if not judge_result:
 			continue

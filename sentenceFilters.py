@@ -37,6 +37,9 @@ class JudgeMethod(abc.ABC):
     def judge(self, sentence: str) -> bool:
         """判断句子是否符合判断条件的要求
 
+        注意：生产筛选链路只走 explain（其真值判定与 judge 严格等价，且额外提供匹配树）。
+        judge 仅用于调试与自测，修改判定逻辑时必须与 explain 同步。
+
         Args:
             sentence (str): 待判断的句子
 
@@ -213,6 +216,8 @@ class SingleJudgeMethod(JudgeMethod):
     # -------------------------
 
     def judge(self, sentence: str) -> bool:
+        # 与 _search_with_explain_with_context 是两份等价实现，生产链路只走 explain，
+        # 修改任一处的检索语义时必须同步另一处
         context = self._build_sentence_context(sentence)
         indices = self._search_indices_with_context(context, self.config)
         return bool(indices)
