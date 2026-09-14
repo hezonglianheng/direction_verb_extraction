@@ -4,6 +4,9 @@
 配置文件
 """
 
+import os
+from pathlib import Path
+
 SENTENCE_LEN_LOWER_BOUND = 10
 """句子长度下界，单位为字符数"""
 SENTENCE_LEN_UPPER_BOUND = 1000
@@ -19,8 +22,16 @@ FILTER_BATCH_SIZE = 1000
 FILTER_WORKERS = 2
 """筛选阶段进程数，0 表示自动使用 CPU 核数"""
 
-LTP_MODEL_PATH = r"LTP_model/base2"
-"""LTP 模型加载路径，默认从本地加载基础模型，如果需要加载本地或线上其他模型，请修改路径"""
+_PROJECT_ROOT = Path(__file__).resolve().parent
+"""项目根目录（config.py 所在目录），与运行时 cwd 无关"""
+
+# 优先级：环境变量 > 项目根目录下的本地模型
+# 环境变量可填本地目录的绝对路径，也可填 HuggingFace 模型名（如 "LTP/small"）。
+# 注意：子进程（spawn）会重新 import 本模块，因此运行期修改该属性不会传播到子进程，请用环境变量。
+LTP_MODEL_PATH = os.environ.get("LTP_MODEL_PATH") or str(_PROJECT_ROOT / "LTP_model" / "base2")
+"""LTP 模型加载路径。默认加载项目根目录下的 base2 基础模型（LTP_model 在 .gitignore 中，
+故新克隆的仓库需自行将模型放置于 config.py 同级目录），如需加载其他本地或线上模型，
+可修改此值或设置 LTP_MODEL_PATH 环境变量。必须是 str：LTP() 内部会调用 .split("@")，不支持 Path。"""
 # LTP支持的任务：分词 cws、词性 pos、命名实体标注 ner、语义角色标注 srl、依存句法分析 dep、语义依存分析树 sdp、语义依存分析图 sdpg
 CWS = "cws"
 """分词"""
