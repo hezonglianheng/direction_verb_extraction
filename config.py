@@ -28,8 +28,12 @@ LTP_BATCH_CHUNK = 32
 32 在真实语料的长度分布下略优于 64。"""
 
 # FILTER_WORKERS = 0
-FILTER_WORKERS = 2
-"""筛选阶段进程数，0 表示自动使用 CPU 核数"""
+FILTER_WORKERS = 1
+"""筛选阶段进程数，0 表示自动使用 CPU 核数。
+
+实测单张 GPU 上开 2 个进程仅比单进程快约 1.2 倍，却要多一份 LTP 模型副本
+（约 0.66GB 显存）和约 5s 的进程启动开销；配合 LTP 批量推理后单进程已能打满单卡，
+故默认为 1。多进程分支仍保留在 entry_in_linux.py 中，需要时改回即可。"""
 
 _PROJECT_ROOT = Path(__file__).resolve().parent
 """项目根目录（config.py 所在目录），与运行时 cwd 无关"""
