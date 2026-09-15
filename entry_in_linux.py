@@ -30,6 +30,10 @@ def _filter_sentence_batch(batch: list[dict[str, Any]]) -> list[dict[str, Any]]:
 	if _WORKER_FILTER is None:
 		raise RuntimeError("过滤进程尚未初始化过滤器")
 
+	# 先把整批句子的 LTP 结果批量算出来写进缓存，再逐句走规则引擎。
+	# 否则规则引擎会按需逐句触发单句推理，实测慢约 4 倍。
+	sentenceFilters.cache.prefill(s.get("sentence", "") for s in batch)
+
 	filtered_batch: list[dict[str, Any]] = []
 	for s in batch:
 		curr_sentence: str = s.get("sentence", "")

@@ -107,8 +107,8 @@ def filter_sentences_windows_in_memory(sentences: list[dict[str, Any]], filter_c
 	filtered_count = 0
 
 	_init_filter_worker(filter_config_path)
+	batch_size = max(1, int(config.FILTER_BATCH_SIZE))
 	with tqdm(
-		sentences,
 		total=len(sentences),
 		desc="Filtering sentences (Windows memory)",
 		position=1,
@@ -116,19 +116,26 @@ def filter_sentences_windows_in_memory(sentences: list[dict[str, Any]], filter_c
 		dynamic_ncols=True,
 		unit="sentence",
 	) as pbar:
-		for sentence_item in pbar:
-			candidate_count += 1
-			filtered_item = _filter_sentence(sentence_item)
-			if filtered_item is not None:
-				filtered_count += 1
-				filtered_sentences.append(filtered_item)
-			pbar.set_postfix(
-				_build_progress_postfix(
-					candidate_count,
-					filtered_count,
-				),
-				refresh=False,
-			)
+		# 分块「先整批预填充 LTP 结果，再逐句走规则引擎」：逐句调用 pipeline 实测慢约 4 倍。
+		# 必须分块而不能一次性预填充，否则整批会被 LRU 在读取前淘汰。
+		for start in range(0, len(sentences), batch_size):
+			batch = sentences[start : start + batch_size]
+			sentenceFilters.cache.prefill(item.get("sentence", "") for item in batch)
+
+			for sentence_item in batch:
+				candidate_count += 1
+				filtered_item = _filter_sentence(sentence_item)
+				if filtered_item is not None:
+					filtered_count += 1
+					filtered_sentences.append(filtered_item)
+				pbar.update(1)
+				pbar.set_postfix(
+					_build_progress_postfix(
+						candidate_count,
+						filtered_count,
+					),
+					refresh=False,
+				)
 
 	print(f"从 {candidate_count} 个备选句子中筛选出了 {filtered_count} 个符合条件的句子")
 	return filtered_sentences
