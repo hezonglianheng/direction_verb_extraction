@@ -4,3 +4,7 @@ LTP_model
 __pycache__
 *.pyc
 *copy*
+
+# 运行产物
+results/
+nohup.out
