@@ -11,43 +11,75 @@ import config
 import sentenceFilters
 
 
-_WORKER_FILTER = None
+_WORKER_FILTERS: list[tuple[str, Any]] = []
+"""[(规则族名, 规则过滤器)]，一个进程内同时持有多套规则"""
+
+ANY_HIT = "_any"
+"""进度信息里表示“至少命中一套规则的句子数”的保留键"""
 
 
-def _init_filter_worker(filter_config_path: str):
-	global _WORKER_FILTER
-	generator = sentenceFilters.FilterGenerator(filter_config_path)
-	_WORKER_FILTER = generator.generate_filter()
+def _as_list(value: Any) -> list[Any]:
+	"""兼容单个值与列表两种传参"""
+	if isinstance(value, (list, tuple)):
+		return list(value)
+	return [value]
 
 
-def _filter_sentence(item: dict[str, Any]) -> dict[str, Any] | None:
-	if _WORKER_FILTER is None:
+def _init_filter_worker(filter_config_paths: Any):
+	global _WORKER_FILTERS
+	_WORKER_FILTERS = [
+		(Path(path).stem, sentenceFilters.FilterGenerator(path).generate_filter())
+		for path in _as_list(filter_config_paths)
+	]
+
+
+def _filter_sentence(item: dict[str, Any]) -> list[dict[str, Any] | None]:
+	"""对单个句子跑全部规则
+
+	Returns:
+		list[dict[str, Any] | None]: 与 _WORKER_FILTERS 同序的结果，未命中为 None
+	"""
+	if not _WORKER_FILTERS:
 		raise RuntimeError("过滤进程尚未初始化过滤器")
 
 	curr_sentence: str = item.get("sentence", "")
-	judge_result, explanation = _WORKER_FILTER.explain(curr_sentence)
-	if not judge_result:
-		return None
+	results: list[dict[str, Any] | None] = []
+	cws_result = None
+	for _, curr_filter in _WORKER_FILTERS:
+		judge_result, explanation = curr_filter.explain(curr_sentence)
+		if not judge_result:
+			results.append(None)
+			continue
 
-	filter_methods = explanation.get("methods", [])
-	match_tree: list[sentenceFilters.MatchNode] = explanation.get("match_tree", [])
-	simplified_tree = sentenceFilters.simplify_tree(match_tree)
-	
-	# 获取CWS结果并替换原本的sentence
-	cws_result = sentenceFilters.cache.get_task_value(curr_sentence, config.CWS)
-	
-	return item | {"sentence": cws_result, "filter_methods": filter_methods, "match_tree": simplified_tree}
+		if cws_result is None:
+			# 获取CWS结果并替换原本的sentence（延迟到确有命中时才取）
+			cws_result = sentenceFilters.cache.get_task_value(curr_sentence, config.CWS)
+
+		filter_methods = explanation.get("methods", [])
+		match_tree: list[sentenceFilters.MatchNode] = explanation.get("match_tree", [])
+		simplified_tree = sentenceFilters.simplify_tree(match_tree)
+
+		results.append(item | {"sentence": cws_result, "filter_methods": filter_methods, "match_tree": simplified_tree})
+	return results
 
 
-def _build_progress_postfix(candidate_count: int, filtered_count: int, *, batch_size: int | None = None) -> dict[str, str | int]:
-	hit_rate = (filtered_count / candidate_count * 100) if candidate_count else 0.0
-	postfix: dict[str, str | int] = {
-		"cand": candidate_count,
-		"hit": filtered_count,
-		"rate": f"{hit_rate:.2f}%",
-	}
+def _build_progress_postfix(candidate_count: int, hit_counts: dict[str, int], *, batch_size: int | None = None) -> dict[str, str]:
+	"""构造进度信息
+
+	Args:
+		candidate_count (int): 已处理的备选句数
+		hit_counts (dict[str, int]): 键为规则族名（外加保留键 ANY_HIT）的命中数
+	"""
+	def _with_rate(count: int) -> str:
+		rate = (count / candidate_count * 100) if candidate_count else 0.0
+		return f"{count} ({rate:.2f}%)"
+
+	any_hit = hit_counts.get(ANY_HIT, 0)
+	any_rate = (any_hit / candidate_count * 100) if candidate_count else 0.0
+	postfix: dict[str, str] = {"cand": str(candidate_count), "hit": str(any_hit), "rate": f"{any_rate:.2f}%"}
+	postfix.update({family: _with_rate(count) for family, count in hit_counts.items() if family != ANY_HIT})
 	if batch_size is not None:
-		postfix["batch"] = batch_size
+		postfix["batch"] = str(batch_size)
 	return postfix
 
 
@@ -101,12 +133,19 @@ def load_path_sentences_in_memory(src_path: str, vocabs: list[str] = None) -> li
 	raise ValueError(f"输入路径 {src_path} 既不是文件也不是目录")
 
 
-def filter_sentences_windows_in_memory(sentences: list[dict[str, Any]], filter_config_path: str) -> list[dict[str, Any]]:
-	filtered_sentences: list[dict[str, Any]] = []
-	candidate_count = 0
-	filtered_count = 0
+def filter_sentences_windows_in_memory(sentences: list[dict[str, Any]], filter_config_paths: Any) -> list[list[dict[str, Any]]]:
+	"""一次遍历、多套规则，各自把命中句累积在一个列表里
 
-	_init_filter_worker(filter_config_path)
+	Returns:
+		list[list[dict[str, Any]]]: 与 filter_config_paths 同序的命中结果
+	"""
+	families = [Path(path).stem for path in _as_list(filter_config_paths)]
+	filtered_sentences: list[list[dict[str, Any]]] = [[] for _ in families]
+	candidate_count = 0
+	hit_counts: dict[str, int] = {ANY_HIT: 0}
+	hit_counts.update({family: 0 for family in families})
+
+	_init_filter_worker(filter_config_paths)
 	batch_size = max(1, int(config.FILTER_BATCH_SIZE))
 	with tqdm(
 		total=len(sentences),
@@ -118,35 +157,46 @@ def filter_sentences_windows_in_memory(sentences: list[dict[str, Any]], filter_c
 	) as pbar:
 		# 分块「先整批预填充 LTP 结果，再逐句走规则引擎」：逐句调用 pipeline 实测慢约 4 倍。
 		# 必须分块而不能一次性预填充，否则整批会被 LRU 在读取前淘汰。
+		# 多套规则共用这份缓存，故 prefill 每批只做一次，不会重复推理。
 		for start in range(0, len(sentences), batch_size):
 			batch = sentences[start : start + batch_size]
 			sentenceFilters.cache.prefill(item.get("sentence", "") for item in batch)
 
 			for sentence_item in batch:
 				candidate_count += 1
-				filtered_item = _filter_sentence(sentence_item)
-				if filtered_item is not None:
-					filtered_count += 1
-					filtered_sentences.append(filtered_item)
+				item_results = _filter_sentence(sentence_item)
+				if any(result is not None for result in item_results):
+					hit_counts[ANY_HIT] += 1
+				for idx, family in enumerate(families):
+					if item_results[idx] is not None:
+						hit_counts[family] += 1
+						filtered_sentences[idx].append(item_results[idx])
 				pbar.update(1)
 				pbar.set_postfix(
 					_build_progress_postfix(
 						candidate_count,
-						filtered_count,
+						hit_counts,
 					),
 					refresh=False,
 				)
 
-	print(f"从 {candidate_count} 个备选句子中筛选出了 {filtered_count} 个符合条件的句子")
+	print(f"从 {candidate_count} 个备选句子中筛选出了 {hit_counts[ANY_HIT]} 个符合条件的句子")
+	for family in families:
+		print(f"    {family}：{hit_counts[family]} 个句子")
 	return filtered_sentences
 
 
-def run_windows_entry(src_path: str, tgt_path: str, filter_config_path: str, vocabs: list[str] = None):
-	output_file = Path(tgt_path) / "filtered_sentences.jsonl"
+def run_windows_entry(src_path: str, filter_config_paths: Any, output_paths: Any, vocabs: list[str] = None):
 	print("[运行模式] Windows: 整文件读入内存处理")
-	sentences = load_path_sentences_in_memory(src_path, vocabs)
-	filtered_sentences = filter_sentences_windows_in_memory(sentences, filter_config_path)
+	filter_config_paths = _as_list(filter_config_paths)
+	paths = [Path(p) for p in _as_list(output_paths)]
+	if len(filter_config_paths) != len(paths):
+		raise ValueError(f"规则套数（{len(filter_config_paths)}）与输出文件数（{len(paths)}）不一致")
 
-	with open(output_file, "w", encoding="utf-8") as f:
-		for row in filtered_sentences:
-			f.write(json.dumps(row, ensure_ascii=False) + "\n")
+	sentences = load_path_sentences_in_memory(src_path, vocabs)
+	filtered_sentences = filter_sentences_windows_in_memory(sentences, filter_config_paths)
+
+	for path, rows in zip(paths, filtered_sentences):
+		with open(path, "w", encoding="utf-8") as f:
+			for row in rows:
+				f.write(json.dumps(row, ensure_ascii=False) + "\n")
