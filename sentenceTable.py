@@ -58,6 +58,14 @@ class SentenceTaskCache:
                 return True
             return any(t not in task_dict for t in self.BASE_TASKS)
 
+    def has_base_tasks(self, sentence: str) -> bool:
+        """该句的基础任务结果是否都已在缓存里
+
+        供预填充后的自检使用：推理发生在锁外（见 get_task_value），
+        所以"预热过"必须能验证，否则多线程下仍会并发调同一份模型。
+        """
+        return not self._need_base_tasks(sentence)
+
     def prefill(self, sentences: Iterable[str], chunk_size: int = None) -> int:
         """批量预填充一批句子的基础任务结果
 
