@@ -8,3 +8,6 @@ __pycache__
 # 运行产物
 results/
 nohup.out
+
+# 敏感文件
+model_config/api_keys.json
