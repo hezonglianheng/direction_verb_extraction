@@ -1,0 +1,123 @@
+// 语义特征类别表（feature_agent 用）
+//
+// 语义特征分为 4 类，本文件定义这 4 类是什么。feature_agent 是一个 deep agent，
+// 每一类交给一个 subagent 负责：subagent 拿到句子后先调 parse_sentence 取句法证据，
+// 再按 description 里的判据给出该类的取值，最后由主 agent 汇总成一个特征对象。
+//
+// 每类需要填的字段：
+//   key         特征字段名，会作为最终特征对象的键，也是 schema_table.json5 里 match 用的键
+//   name        中文名，显示用
+//   description 该类特征要抽什么、按什么判据抽。这句话会原样进 subagent 的提示语，
+//               写得越具体（列出可选取值、边界情形怎么算）抽取越稳
+//   values      可选取值列表（留空表示开放式取值，由模型自行概括）
+//   examples    正例，形如 {"sentence": "...", "<key>": "<取值>"}
+//
+// 4 个槽位留空待填：key 为空的类别会被跳过（不建对应 subagent）。
+// 4 类全空时 feature_agent 退化为单个 agent 自由抽取特征，结果记录里的
+// features_source 会标成 "unfilled_config"，提醒这不是按既定类别抽的。
+//
+// 填完后可直接跑 .venv/bin/python spatial_runner.py --graph pair --limit 5 观察抽取结果。
+{
+    "classes": [
+        {
+            "key": "area",
+            "name": "范围",
+            "description": "请判断该句子中目标物是否处于一个空间范围内，以及这个空间范围究竟属于容纳一个物体的容器，还是表示一个空间区域的边界。",
+            "values": ["[+容器内]", "[+边界内]", "[-容器内]", "[-边界内]",], 
+            "examples": [
+                {
+                    "sentence": "杯子里盛着一些水。",
+                    "area": "[+容器内]",
+                },
+                {
+                    "sentence": "一群人站在操场里。",
+                    "area": "[+边界内]",
+                },
+                {
+                    "sentence": "这个房间外面有一张桌子。",
+                    "area": "[-容器内]",
+                },
+                {
+                    "sentence": "他站在围墙外面。",
+                    "area": "[-边界内]",
+                },
+            ],
+        },
+        {
+            "key": "vertical_direction",
+            "name": "竖直方向",
+            "description": "请判断该句子中目标物和参照物之间在竖直方向上的相对位置关系。",
+            "values": ["[+上方]", "[+下方]", "[无]"],
+            "examples": [
+                {
+                    "sentence": "桌子上放着一个杯子。",
+                    "vertical_direction": "[+上方]",
+                },
+                {
+                    "sentence": "书放在桌子下面。",
+                    "vertical_direction": "[+下方]",
+                },
+                {
+                    "sentence": "这个房间里有一张桌子。",
+                    "vertical_direction": "[无]",
+                },
+            ],
+        },
+        {
+            "key": "horizontal_direction",
+            "name": "水平方向",
+            "description": "请判断该句子中目标物和参照物之间在水平方向上的相对位置关系。",
+            "values": ["[+前方]", "[+后方]", "[+左方]", "[+右方]", "[无]"],
+            "examples": [
+                {
+                    "sentence": "他站在我前面。",
+                    "horizontal_direction": "[+前方]",
+                },
+                {
+                    "sentence": "我坐在他后面。",
+                    "horizontal_direction": "[+后方]",
+                },
+                {
+                    "sentence": "书架在教室的左边。",
+                    "horizontal_direction": "[+左方]",
+                },
+                {
+                    "sentence": "门在房间的右边。",
+                    "horizontal_direction": "[+右方]",
+                },
+                {
+                    "sentence": "这个房间里有一张桌子。",
+                    "horizontal_direction": "[无]",
+                },
+            ],
+        },
+        {
+            "key": "distance",
+            "name": "距离",
+            "description": "请判断该句子中目标物和参照物之间的距离关系。",
+            "values": ["[+邻接]", "[+紧连]", "[+近]", "[+远]", "[无]"],
+            "examples": [
+                {
+                    "sentence": "海报贴在墙上",
+                    "distance": "[+紧连]",
+                },
+                {
+                    "sentence": "蒋一轮靠在树上",
+                    "distance": "[+邻接]",
+                },
+                {
+                    "sentence": "桌子旁边有一把椅子。",
+                    "distance": "[+近]",
+                },
+                {
+                    "sentence": "他们通过线上教学和外面的老师互动。",
+                    "distance": "[+远]",
+                },
+                {
+                    "sentence": "这个房间里有一张桌子。",
+                    "distance": "[无]",
+                }, 
+            ],
+        },
+    ],
+}
