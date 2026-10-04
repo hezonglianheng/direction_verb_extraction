@@ -51,8 +51,10 @@ message 缓存在各自的 agent 实例里（见 spatial_agents.CACHEABLE_SOURCE
 每跑一次产出一个 jsonl，一条记录就是一条完整链路的结果（两个句子、各自的语义特征、
 各自对应的 schema、两侧各自的关注词、判定信息，外加逐节点的上下文历史），
 另在同目录写一份 .summary.json 汇总。
-记录在 save 节点流式落盘，长跑中途也能 tail 到进度；并发跑时输出顺序不等于输入顺序，
-按记录里的 line_no（同一句再按 candidate.index）可还原。
+记录在 save 节点流式落盘，长跑中途也能 tail 到进度；并发跑时落盘顺序等于完成顺序、不等于
+输入顺序，但**收尾时 ResultWriter.finish 会把文件按 (line_no, candidate.index) 重排**
+（键见 spatial_graphs.record_order_key），所以跑完之后两份输出（本图与 all_in_one.py 那边）
+顺序完全一致，可以逐行对账。中途 tail 到的仍是完成顺序——这是刻意保留的取舍。
 
 用法：
     .venv/bin/python spatial_runner.py --limit 5                        # 跑前 5 条（pair 图，方位词）
@@ -104,6 +106,9 @@ class ResultWriter:
     多线程跑图时 save 节点会并发调用，故用锁串起"写文件 + 计数"；
     每条写完即关文件，长跑中途 tail 也能看到完整行。
 
+    收尾（finish）会把文件按 (line_no, candidate.index) 重排（见 _sort_records）：
+    并发下写进来的顺序是完成顺序，重排后才与 all_in_one.py 的输出同序、可逐行对账。
+
     统计口径由图决定（spatial_graphs.GraphSpec.counter_names / tally）：
     pair 图统计两侧的 schema 来源，单句图只有一句——写死成 pair 的形状会让单句图
     静默统计出一堆 "none"。
@@ -154,12 +159,41 @@ class ResultWriter:
             if self.count % 10 == 0:
                 print(f"  已写出 {self.count} 条", flush=True)
 
+    def _sort_records(self) -> None:
+        """把已落盘的 jsonl 按 (line_no, candidate.index) 重排（键见 sg.record_order_key）
+
+        write() 是各 worker 在 save 节点并发追加（见模块 docstring），落盘顺序 = 完成顺序，
+        与输入顺序无关。收尾统一重排，于是本脚本与 all_in_one.py 的 finish() 走同一段代码、
+        产出同一个顺序，两份文件可逐行对账。all_in_one 本来就按输入顺序写，这里重排是兜底。
+
+        流式落盘照旧：跑的过程中文件仍是完成顺序，tail 得到进度；只收尾重排一次。
+        先写临时文件再原子替换，重排途中被打断也不会把结果文件截断。
+        """
+        if not self.path.exists():
+            return
+        records = st.read_jsonl(self.path)
+        if not records:
+            return
+        if len(records) != self.count:
+            # 条数对不上说明文件被中途截断或人工拼接改过；仍照常排，只当场说清楚
+            print(f"警告：输出文件里有 {len(records)} 条，本次记录数为 {self.count}，请核对该文件")
+        records.sort(key=sg.record_order_key)  # 稳定排序；键由构造保证唯一
+        tmp = self.path.with_name(self.path.name + ".sorting")
+        st.write_jsonl(records, tmp)  # 复用唯一一份 jsonl 写法
+        tmp.replace(self.path)  # Path.replace = os.replace，原子替换
+        print(f"  输出已按 (line_no, candidate.index) 排序（{len(records)} 条）", flush=True)
+
     def finish(self) -> dict:
+        self._sort_records()
         # corpus_type / config_tables 是这次跑批「读的是哪一组表」的唯一凭据：user message
         # 不落盘（记录里只有 node 与耗时），事后要复现或核对口径就得靠这两项
         provenance = {"corpus_type": self.corpus_type} if self.corpus_type else {}
         if self.config_tables:
             provenance["config_tables"] = self.config_tables
+        if self.reality_prefill:
+            provenance["reality_prefill"] = self.reality_prefill
+        if self.agent_stats:
+            provenance["agent_stats"] = self.agent_stats
         summary = {
             "output_file": str(self.path),
             **provenance,

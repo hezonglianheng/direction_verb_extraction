@@ -57,8 +57,10 @@ sg.alter_node 返回的 history 口径）是刻意的：它们是那套口径的
     .venv/bin/python all_in_one.py --limit 200 --all-candidates --workers 8   # 全量：与 pair 图逐条对账
 
 --workers 只改**同时有多少条记录在跑**，不改每条记录的语义：一条记录仍至多一次调用，
-落盘顺序也仍是输入顺序（pool.map 按输入顺序产出、由主线程逐条写），所以与 pair 图对账
-照样按 (line_no, candidate.index) 对齐——这一侧甚至是**有序**的一份。默认 1 = 逐条跑；
+落盘顺序也仍是输入顺序（pool.map 按输入顺序产出、由主线程逐条写）。与 pair 图对账按
+(line_no, candidate.index) 对齐——两侧的 ResultWriter.finish() 会做同一遍排序（见
+spatial_runner._sort_records），所以跑完之后两个文件顺序完全一致，本侧的有序是天然就有的。
+默认 1 = 逐条跑；
 只有全量对照时才需要它：--all-candidates 会把 200 条语料展开成上千个状态，逐条发请求
 按 4 秒/条算接近两小时。并发有个前提——预填充必须真兜住全部句子（推理在锁外做，见
 sentenceTable.get_task_value），装不下缓存时启动会像 runner 那样告警，见 main 里那段自检。

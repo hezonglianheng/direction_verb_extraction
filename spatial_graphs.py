@@ -790,6 +790,27 @@ def _candidate_block(state: dict) -> dict | None:
     }
 
 
+def record_order_key(record: dict) -> tuple[int, int]:
+    """结果记录的排序键：(line_no, candidate.index)
+
+    「同一位置」在一份输出里唯一：line_no 是语料文件里的真实行号（st.read_corpus 写入，
+    不受 --offset/--limit 影响），同一句展开出的多条记录再按 candidate.index 分先后。
+
+    没展开出待选句的记录（bad_record / alter_missed）candidate 为 None，落在该行的 0 位——
+    这类记录每行至多一条（见 alter_init_states），不会与第 0 个待选句相撞。
+
+    键只由记录算出、**不写进记录**（记录形状不随排序而变）：落盘侧（ResultWriter.finish）
+    与对账脚本（compare_runs.py）共用这一份，要改「什么算同一位置」只改这里。
+    缺 line_no 的坏记录排到最前，而不是抛异常打断收尾。
+    """
+    line_no = record.get("line_no")
+    index = (record.get("candidate") or {}).get("index")
+    return (
+        line_no if isinstance(line_no, int) else -1,
+        index if isinstance(index, int) else 0,
+    )
+
+
 def serialize_pair(state: PairState) -> dict:
     """把最终状态整理成一条结果记录
 

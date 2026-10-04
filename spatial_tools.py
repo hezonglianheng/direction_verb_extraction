@@ -1413,6 +1413,20 @@ def append_jsonl(record: dict, path: str | Path) -> None:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def read_jsonl(path: str | Path) -> list[dict]:
+    """读一份结果 jsonl，逐行解析（空行跳过）
+
+    与 write_jsonl / append_jsonl 并列，是仓库里唯一的 jsonl 读法：收尾排序（见
+    spatial_runner.ResultWriter._sort_records）与对账脚本（compare_runs.py）都走它。
+    """
+    records = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                records.append(json.loads(line))
+    return records
+
+
 # --------------------------------------------------------------------------
 # 七、供 LLM agent 调用的工具
 # --------------------------------------------------------------------------
