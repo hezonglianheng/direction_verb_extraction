@@ -12,7 +12,10 @@
 //   description 该类特征要抽什么、按什么判据抽。这句话会原样进 subagent 的提示语，
 //               写得越具体（列出可选取值、边界情形怎么算）抽取越稳
 //   values      可选取值列表（留空表示开放式取值，由模型自行概括）
-//   examples    正例，形如 {"sentence": "...", "<key>": "<取值>"}
+//   examples    正例，形如 {"sentence": "...", "<key>": "<取值>", "instruction": "..."}
+//               instruction 是一段提示语，说明「怎么判断这句话属于这个取值」，会缩进渲染在
+//               该条示例的 JSON 行下面。可留空（留空则该条只显示句子与取值）；没写这个字段
+//               与写了空串效果一样。示例最多渲染前 5 条（见 spatial_agents.render_example_lines）
 //
 // 槽位留空待填：key 为空的类别会被跳过（不建对应 subagent）。
 // 全空时 feature_agent 退化为单个 agent 自由抽取特征，结果记录里的
