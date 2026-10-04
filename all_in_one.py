@@ -10,6 +10,10 @@ feature 那个 deep agent 还带 subagent 派发 → schema → judge），而�
 不是照着抄一遍字段名）。于是两件事同时成立：用一次调用换到原来六次调用的结论；两份 jsonl
 可以直接逐字段对账，看单次调用掉了多少精度、省了多少次往返。
 
+其中 reality 那一问在 pair 侧是**按原句共享**的：闸门判的只是原句，而一条语料会展开成多个
+候选，所以那边在跑批前把要判的原句一次判完、候选之间共用一份判定（见 sr._prefill_reality），
+不再是「每个候选各问一遍」。收尾的对照下界照此扣掉重复的那几次。
+
 一次调用到底指什么：一次 agent.invoke、一次消息往返。两道不需要模型的闸门在最前面短路，
 连这一次也不发——
 
@@ -32,7 +36,7 @@ feature 那个 deep agent 还带 subagent 派发 → schema → judge），而�
 
 为什么不给 parse_sentence 工具：工具调用就是又一次 API 请求，六次往返正是要消掉的东西。
 句法证据由本地 st.parse_sentence_text 算好塞进消息（--no-syntax 可以省掉，但那样就与
-六 agent 那条路不可比了——那边模型是自己调工具取证据的）。
+六 agent 那条路不可比了——那边同样把句法证据内联进消息，只是没有这个开关）。
 
 记录形状、status 词表、闸门顺序、查表优先级全部复用 spatial_graphs.py 与 spatial_agents.py
 里的纯函数，本脚本不另立一套：模型把五步都答了，**采信与否**在装配记录时按流水线口径施加
@@ -96,11 +100,14 @@ DEFAULT_LIMIT = 1
 """默认只处理 1 条：本脚本是单次调用的诊断入口，不是跑批工具（runner 那边默认 100）"""
 
 PAIR_CALLS_PER_STEP = {"reality": 1, "semantic": 2, "feature": 1, "schema": 1, "judgement": 1}
-"""pair 图走到某一步**至少**要发几次请求（两侧各判一次通顺，所以 semantic 是 2）
+"""pair 图走到某一步**至少**要发几次请求（两侧各判一次语法与空间语义，所以 semantic 是 2）
 
 **下界，不是精确值**：feature 那个 deep agent 还要给每个特征类别派一次 subagent（方位词那套是
 4 类，即 +4），派几次随句子而定，这里只数它自己那一次。它的用途是给「一次调用省了多少」一个
 可核对的口径——收尾打印的数就是这么算出来的，不是估的。alter 不在表里：它是纯规则，0 次。
+
+reality 那一项是**每个走到闸门的状态**记一次，而 pair 侧实际按原句去重（候选之间共享一份判定，
+见 sr._prefill_reality）：收尾打印时会按 (原句, 关注词) 把重复的那几次扣掉，扣法见 main。
 """
 
 
@@ -163,8 +170,8 @@ def _build_verdict_model(feature_classes: list[dict]) -> type:
     )
     side_fluency = create_model(
         "SideFluency",
-        a=(sa.SemanticVerdict, Field(description="原句是否通顺")),
-        b=(sa.SemanticVerdict, Field(description="改写句是否通顺")),
+        a=(sa.SemanticVerdict, Field(description="原句的语法是否通顺、空间语义是否异常")),
+        b=(sa.SemanticVerdict, Field(description="改写句的语法是否通顺、空间语义是否异常")),
     )
     side_schema = create_model(
         "SideSchema",
@@ -174,7 +181,7 @@ def _build_verdict_model(feature_classes: list[dict]) -> type:
     return create_model(
         "AllInOneVerdict",
         reality=(sa.RealityVerdict, Field(description="第 1 步：原句那个关注词是否表达现实世界中的空间场景")),
-        semantic=(side_fluency, Field(description="第 2 步：两句各自是否通顺")),
+        semantic=(side_fluency, Field(description="第 2 步：两句各自的语法是否通顺、空间语义是否异常")),
         features=(side_features, Field(description="第 3 步：两侧的语义特征")),
         schema=(side_schema, Field(description="第 4 步：两侧各自的 schema")),
         judgement=(sa.JudgeVerdict, Field(description="第 5 步：两句意义是否相同")),
@@ -195,20 +202,27 @@ def _feature_roster(feature_classes: list[dict]) -> tuple[str, str]:
     if not feature_classes:
         return "尚未填写（还是空表），没有既定类别可依", ""
     n = f"已填写，共 {len(feature_classes)} 类；features.a 与 features.b 各有这几个字段，字段名用键名"
-    roster = "\n".join(
-        f"    {feature_class['key']}（{feature_class.get('name') or feature_class['key']}）："
-        f"{feature_class.get('description') or '（未写说明，按这一类的名称理解）'}"
-        + (
-            # 取值渲染成 JSON 字符串数组而不是「A、B、C」：查表是逐字比对字符串，模型照抄这串
-            # 引号里的内容比从顿号列表里誊抄更不容易漏掉 [+ ] 这类记号（实测顿号列表下会掉方括号）
-            "；可选取值（原样照抄，含方括号）："
-            + json.dumps([str(v) for v in feature_class["values"]], ensure_ascii=False)
-            if feature_class.get("values")
-            else "；取值开放，自行概括"
+    roster_lines: list[str] = []
+    for feature_class in feature_classes:
+        roster_lines.append(
+            f"    {feature_class['key']}（{feature_class.get('name') or feature_class['key']}）："
+            f"{feature_class.get('description') or '（未写说明，按这一类的名称理解）'}"
+            + (
+                # 取值渲染成 JSON 字符串数组而不是「A、B、C」：查表是逐字比对字符串，模型照抄这串
+                # 引号里的内容比从顿号列表里誊抄更不容易漏掉 [+ ] 这类记号（实测顿号列表下会掉方括号）
+                "；可选取值（原样照抄，含方括号）："
+                + json.dumps([str(v) for v in feature_class["values"]], ensure_ascii=False)
+                if feature_class.get("values")
+                else "；取值开放，自行概括"
+            )
         )
-        for feature_class in feature_classes
-    )
-    return n, roster
+        # 示例挂在本类那一行下面，缩进再深两级；渲染口径与 feature_agent 共用（见 spatial_agents），
+        # 这边只是把缩进调深，免得和 roster 行左对齐、看不出从属关系
+        examples = sa.render_example_lines(feature_class, indent="      ")
+        if examples:
+            roster_lines.append("      示例：")
+            roster_lines.append(examples)
+    return n, "\n".join(roster_lines)
 
 
 def build_system_prompt(feature_classes: list[dict], *, reality_criteria: str) -> str:
@@ -335,7 +349,7 @@ def build_user_message(
         block_a,
         block_b,
         "请按顺序作答：① 第 1 行那个词是不是在说现实空间（reality）"
-        "② 两个句子各自是否通顺（semantic.a / semantic.b）"
+        "② 两个句子各自的语法是否通顺、空间语义是否异常（semantic.a / semantic.b）"
         "③ 两侧各自的语义特征（features.a / features.b）"
         "④ 两侧各自的 schema（schema.a / schema.b）"
         "⑤ 两句意义是否相同（judgement）。",
@@ -468,14 +482,23 @@ def resolve_reality(
 def resolve_fluency(
     agent, sentence: str, focus_word: dict | None, side_dump: dict | None, *, llm_used: bool, error: str | None
 ) -> dict:
-    """对齐 SemanticAgent.run"""
+    """对齐 SemanticAgent.run：返回形状由 sa.semantic_verdict_result / sa.semantic_blank 合成
+
+    合成的两处（合 is_fluent 的算式、失败时的键集）都从 spatial_agents 取，这里不再自己拼 dict
+    ——两次链路各拼一遍正是「对不上账」的来源。
+    """
     if not llm_used:
         return agent.run(sentence, focus_word)
     if error or side_dump is None:
-        return {"is_fluent": None, "reason": error, "source": "error"}
-    if side_dump.get("is_fluent") is None:
-        return {"is_fluent": None, "reason": "模型没有给出 is_fluent", "source": "error"}
-    return {"is_fluent": bool(side_dump["is_fluent"]), "reason": side_dump.get("reason") or "", "source": "llm"}
+        return sa.semantic_blank("error", error)
+    if side_dump.get("grammar_ok") is None or side_dump.get("spatial_ok") is None:
+        return sa.semantic_blank("error", "模型没有给出 grammar_ok / spatial_ok")
+    return sa.semantic_verdict_result(
+        side_dump["grammar_ok"],
+        side_dump.get("grammar_reason") or "",
+        side_dump["spatial_ok"],
+        side_dump.get("spatial_reason") or "",
+    )
 
 
 def resolve_schema(
@@ -959,7 +982,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--no-syntax",
         action="store_true",
-        help="不把句法证据放进消息：与六 agent 那条路不可比（那边模型自己调 parse_sentence 取证据）",
+        help="不把句法证据放进消息：与六 agent 那条路不可比（那边把句法证据内联进消息，且没有这个开关）",
     )
     parser.add_argument(
         "--print-prompt",
@@ -1050,11 +1073,16 @@ def main(argv: list[str] | None = None) -> None:
     failed = 0
     failed_lines: list[int] = []
     pair_calls = 0
+    gate_states = 0
+    """走到了 reality 闸门的状态数（每条给 pair 侧记 1 次调用）"""
+    gate_keys: set = set()
+    """这些状态问的原句：同一条语料的几个候选问的是同一句，pair 侧按它去重（见下面的修正）"""
     started = time.time()
     print(f"输出文件：{out_path}")
     # 落盘与统计都留在主线程：pool.map 按输入顺序产出，于是输出文件与串行跑逐字节同序
-    # （line_no 升序、同句再按 candidate.index）——pair 图那边是各 worker 在 save 节点并发落盘、
-    # 顺序不等于输入顺序，逐字段对账时这一侧反而是有序的那份。worker 里只有 CallCounter 在自加，
+    # （line_no 升序、同句再按 candidate.index）。pair 图那边是各 worker 在 save 节点并发落盘、
+    # 顺序是完成顺序，但两侧收尾都由 ResultWriter.finish 按同一个键重排，所以两份文件最终同序、
+    # 可逐行对账（本侧的重排是兜底，顺序本来就对）。worker 里只有 CallCounter 在自加，
     # 它自带锁；异常照旧在此处抛出（与 runner 的 pool.map 同一行为），不吞进记录里。
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
         for record in pool.map(
@@ -1069,6 +1097,14 @@ def main(argv: list[str] | None = None) -> None:
                 failed += 1
                 failed_lines.append(record["line_no"])
             pair_calls += record["all_in_one"]["pair_llm_calls"]
+            if record.get("reality"):
+                # 走到了闸门（serialize_pair 对没走到的那批写 {}）。问的是哪一句原话：拿 a 侧句子
+                # 与关注词定位，与 pair 侧预填充的缓存键同源
+                gate_states += 1
+                focus = record.get("focus_word") or {}
+                gate_keys.add(
+                    (record["pair"]["a"]["sentence"], focus.get("index"), focus.get("word"), focus.get("kind"))
+                )
 
     summary = writer.finish()
     print(
@@ -1076,10 +1112,15 @@ def main(argv: list[str] | None = None) -> None:
         f"；LLM 调用 {counter.count} 次（每条记录至多 1 次）"
     )
     # 对照数是按**逐条实际走到哪一步**累加的，不是「记录数 × 换算系数」：停在 reality 闸门的记录
-    # 本来只要一次调用，一律按整条链路算会把这批语料说得比实际贵
+    # 本来只要一次调用，一律按整条链路算会把这批语料说得比实际贵。
+    #
+    # 闸门那一项还要再按原句去重：pair 图在跑批前把要判的原句一次判完、候选之间共用一份判定
+    # （见 sr._prefill_reality），所以同一条语料的几个候选只算一次。调用失败的不入缓存、会在各自
+    # 候选上重试，扣掉的是「本该共享却被重复问」的那部分，所以这个数照旧是下界。
     print(
-        f"对照：同样这些状态，pair 图至少要 {pair_calls} 次调用"
-        f"（下界；feature 那一环还要给每个特征类别各派一次 subagent，未计入）"
+        f"对照：同样这些状态，pair 图至少要 {pair_calls - (gate_states - len(gate_keys))} 次调用"
+        f"（下界；已按原句扣掉闸门的 {gate_states - len(gate_keys)} 次重复；"
+        "feature 那一环还要给每个特征类别各派一次 subagent，未计入）"
     )
     if failed:
         # 给出语料行号与重跑办法：这类失败多半是模型偶发地吐出并发工具调用，deepseek 那边直接回

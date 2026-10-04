@@ -9,9 +9,12 @@
     alter_agent     输入切片（list[str]）与关注词（dict，含 index/word/kind），按 index 定位
                     该词，用规则表里包含它的同义词组中其他词逐一替换，产出一批待选句
                     （一个词能换几个词就有几个）。纯规则、不调 LLM（实现在 spatial_tools.alter_sentence）。
-    semantic_agent  输入一个句子，判断其语义是否通顺（is_fluent）。
-    feature_agent   输入一个句子，输出语义特征。用 deep agent：每类特征一个 subagent，
-                    主 agent 逐类派发后汇总成一个特征对象。
+    semantic_agent  输入一个句子，分别判断语法是否通顺（grammar_ok）与空间语义是否异常
+                    （spatial_ok）：两项在同一次调用里给出、各带一段理由，合出来的
+                    is_fluent 由代码算（见 semantic_verdict_result）。
+    feature_agent   输入一个句子，输出语义特征。默认单次调用直接产出全部特征字段；
+                    也可建 deep agent（deep=True，每类特征一个 subagent、主 agent 汇总），
+                    供质量对照用，见 FeatureAgent。
     schema_agent    输入一个句子、它的语义特征与关注词：先按关注词排除别的词条的图式（一个词条
                     可用 words 覆盖一类词形，外面/外边 都归「外」）、再按特征查表；都未命中时
                     才调 LLM，且只让它在该类的候选图式里挑一个最接近的（这一类下一条图式都没有
@@ -59,8 +62,10 @@ agent 据此选目录；同一条信息也会写进 user message（见 head_bloc
 """
 
 import argparse
+import copy
 import json
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -115,10 +120,62 @@ def _reply_digest(messages: list) -> str:
 
 
 class SemanticVerdict(BaseModel):
-    """semantic_agent 的输出"""
+    """semantic_agent 的输出：语法与空间语义**分开**判，两项各带自己的理由
 
-    is_fluent: bool = Field(description="该文本是否存在空间语义方面的异常")
-    reason: str = Field(description="判断依据")
+    两项判定在同一次调用里给出（多两个字段，不是多一次请求）。合出来的 is_fluent 不在这里：
+    那是代码算的（见 semantic_verdict_result）——让模型再多吐一个能从前两项推出的布尔，只会多
+    一处自相矛盾的可能（grammar_ok=False 而 is_fluent=True 这种），还要再定谁权威。
+    """
+
+    grammar_ok: bool = Field(
+        description="该文本的语法是否通顺：成分是否完整、搭配与语序是否合法、虚词是否用得对。"
+        "这一项**只看语法**，与句子表达的空间关系合不合理无关——空间再离谱，只要合乎语法即为 true"
+    )
+    grammar_reason: str = Field(description="语法这一项的判断依据：哪里不合语法，或为什么没问题")
+    spatial_ok: bool = Field(
+        description="该文本的空间语义是否无异常：描述的空间关系、方向、位置、位移是否自洽，"
+        "方位词、趋向词、空间介词、动词等是否用得得当"
+    )
+    spatial_reason: str = Field(description="空间语义这一项的判断依据：异常在哪，或为什么没问题")
+
+
+def semantic_verdict_result(
+    grammar_ok: bool, grammar_reason: str, spatial_ok: bool, spatial_reason: str
+) -> dict:
+    """一次成功的语义判定 → 返回 dict（SemanticAgent.run 与 all_in_one 的对照实现共用这一处）
+
+    合出 is_fluent 的算式只写在这里：两侧（图那条链路与 all_in_one 那条）只要有一边自己另算一遍，
+    两份输出就没法逐行对账——而逐行对账正是这两条链路同时存在的意义。
+
+    reason 是把两段理由拼起来的一句话，供闸门措辞与人工阅读用；两段原文另存在 grammar_reason /
+    spatial_reason 里，落盘后可以分别统计「这条是被语法挡下的还是被空间语义挡下的」。
+    """
+    return {
+        "is_fluent": bool(grammar_ok and spatial_ok),
+        "grammar_ok": bool(grammar_ok),
+        "spatial_ok": bool(spatial_ok),
+        "grammar_reason": grammar_reason,
+        "spatial_reason": spatial_reason,
+        "reason": f"语法：{grammar_reason}；空间语义：{spatial_reason}",
+        "source": "llm",
+    }
+
+
+def semantic_blank(source: str, reason: str) -> dict:
+    """没判出来时的同形返回（--no-llm / 调用失败 / 模型没给出字段）
+
+    键集与 semantic_verdict_result 一致，只是两项判定与两段理由留空：落盘形状不随「判没判出来」
+    而变，汇总与对账才能按同一套键去读（图里的闸门只看 is_fluent 为 None 这一种）。
+    """
+    return {
+        "is_fluent": None,
+        "grammar_ok": None,
+        "spatial_ok": None,
+        "grammar_reason": "",
+        "spatial_reason": "",
+        "reason": reason,
+        "source": source,
+    }
 
 
 class RealityVerdict(BaseModel):
@@ -179,11 +236,22 @@ PROMPT_SOURCE_CONFIG = "config"
 REALITY_PROMPT_FILE = "reality"
 """reality_agent 的提示语（放 config_files/<语料类型>/ 下，见 PROMPT_SOURCE_CONFIG）"""
 FEATURE_PROMPT_FILE = "feature"
-"""feature_agent 表已填时的主提示语（含 {{n}} 与 {{roster}}）"""
+"""feature_agent deep 模式（每类一个 subagent）的主提示语（含 {{n}} 与 {{roster}}）"""
+FEATURE_FLAT_PROMPT_FILE = "feature_flat"
+"""feature_agent 默认（单次调用）的主提示语（含 {{n}} 与 {{classes}}）"""
 FEATURE_UNFILLED_PROMPT_FILE = "feature_unfilled"
 """feature_agent 类别表为空时的兜底提示语"""
 FEATURE_CLASS_PROMPT_FILE = "feature_class"
-"""每类 subagent 的提示语模板（含 {{name}}/{{description}}/{{values}}/{{examples}}）"""
+"""每类特征的提示语模板（含 {{name}}/{{description}}/{{values}}/{{examples}}/{{usage}}）
+
+{{usage}} 是两种模式的分岔处：deep 那套（调用 parse_sentence、关注词由主 agent 转述）见
+feature_class_usage.txt，flat 那套（句法证据与关注词都已在用户消息里）见
+feature_class_usage_flat.txt——判据与逐字照抄规则留在本模板一份，两种模式共用。
+"""
+FEATURE_CLASS_USAGE_FILE = "feature_class_usage"
+"""deep 模式下 feature_class.txt 里 {{usage}} 的取值（subagent 的工作方式与输出格式）"""
+FEATURE_CLASS_USAGE_FLAT_FILE = "feature_class_usage_flat"
+"""flat 模式下 feature_class.txt 里 {{usage}} 的取值（单次调用时各类的工作方式与输出说明）"""
 
 
 FOCUS_ROLE_RECORD = "record"
@@ -199,7 +267,7 @@ _FOCUS_WHERE = {
     # 绝不说「在改写句的分词结果里是第 N 个词」：这个下标是原句分词切片上的位置，而改写句是
     # join 成字符串后**重新分词**的，替换点附近可能与相邻字并作一个词，那样下标就不再指着替换词
     # ——措辞不能替它担保（见 FOCUS_ROLE_REPLACEMENT 的第二行）。a 侧没有这个问题：
-    # parse_sentence(原句) 与语料切片逐 token 相同（实测 2000/2000）。
+    # st.parse_sentence_text(原句) 与语料切片逐 token 相同（实测 2000/2000）。
     FOCUS_ROLE_RECORD: "在分词结果里是第 {index} 个词",
     FOCUS_ROLE_ORIGINAL: "在原句的分词结果里是第 {index} 个词",
     FOCUS_ROLE_REPLACEMENT: "占的是原句分词结果里第 {index} 个词的位置",
@@ -230,14 +298,18 @@ _FOCUS_TAIL = {
     ),
 }
 
-FOCUS_INDEX_NOTE = "（下标从 0 起，与 parse_sentence 分词行里 token 前的序号一致）"
-"""下标那句注（record / original 共用：这两处的下标就是本句分词的序号）"""
+FOCUS_INDEX_NOTE = "（下标从 0 起，与该句分词结果里 token 前的序号一致）"
+"""下标那句注（record / original 共用：这两处的下标就是本句分词的序号）
+
+措辞刻意不提 parse_sentence：默认已不绑这个工具，句法证据（分词/词性那行，token 前同样打着
+下标）由各 agent 的消息直接带进去（见 syntax_block）；reality 那条消息没有句法证据，但下标
+是上游按同一套分词算好直接给的，这句注在它那里同样成立。"""
 
 FOCUS_INDEX_NOTE_ALTER = "（下标从 0 起，是原句分词结果里的序号，不要在改写句的分词行上数它）"
 """改写句那一侧的下标注：同一个数，但说的是**原句**的分词
 
 与 FOCUS_INDEX_NOTE 只差半句，差别却是要紧的：b 侧的下标是从 a 侧搬过去的（见
-st.replacement_focus_word），模型手上只有改写句，照 FOCUS_INDEX_NOTE 去 parse_sentence 改写句、
+st.replacement_focus_word），模型手上只有改写句，照 FOCUS_INDEX_NOTE 去数改写句的分词行、
 再数第 index 个 token，替换点并词时就会对到别的词上。
 
 实测（把改写句字符串重新喂给 LTP 分词，2000 条样本）：4.9% 的记录下标对不上，形态都是替换点
@@ -300,7 +372,7 @@ def focus_line(focus_word: dict | None, *, role: str = FOCUS_ROLE_RECORD) -> str
     措辞为什么这么绕，两条都要照顾到：
 
     - 五个 agent 的 system_prompt 在几张图之间共用，所以措辞里不能出现只对某一张图成立的说法，
-      只能用条件句交代，并给出 index 这个可核对锚点（parse_sentence 的分词行里每个 token 前都
+      只能用条件句交代，并给出 index 这个可核对锚点（句法证据的分词行里每个 token 前都
       打了下标，能直接对上）。唯一的例外是 replacement：那个下标是原句上的，模型只能按下标
       核对**原句**，改写句上要按词本身找（FOCUS_INDEX_NOTE_ALTER 与 _FOCUS_TAIL 里都说了）。
     - 按 side 生成两套措辞会让 a/b 两侧的特征失去可比性——可比性正是这两个 agent 存在的意义。
@@ -391,20 +463,65 @@ def pair_head_block(
     )
 
 
-def _class_prompt(template: str, feature_class: dict) -> str:
-    """按模板给某一类语义特征的 subagent 写系统提示语（模板见 system_prompt/feature_class.txt）"""
+def syntax_block(sentence: str) -> str | None:
+    """该句的句法证据（分词/词性 + 依存句法），取不到时返回 None
+
+    默认不给 agent 绑 parse_sentence 工具了：工具调用就是又一次 API 请求，而这边本地算好
+    直接塞进消息（与 all_in_one._syntax_block 同一份文本），每一步的往返就少一次。
+
+    LTP 起不来（没装模型、显存不够）不该带走整批：省掉这一段，模型仍能凭句子作答，只是退化成
+    「只凭语感」。真出岔子时由 spatial_runner._prefill 在预填充那一步先报——跑批前整批句子都
+    要过一遍 LTP，那里失败是响的，这里的 None 只是单句失败时的兜底。
+
+    做成模块级函数是为了给 verify_focus_wiring.py 留一个接缝：离线测试把它换成确定性假文本，
+    「全程不加载 LTP」这条承诺才继续成立（见该脚本的模块 docstring）。
+    """
+    try:
+        return st.parse_sentence_text(sentence)
+    except Exception:  # noqa: BLE001 —— 句法分析失败只降级，不让它决定这一条记录跑不跑
+        return None
+
+
+def render_example_lines(feature_class: dict, *, indent: str = "    ", limit: int = 5) -> str:
+    """把一类特征填的示例渲染成提示语里的几行（没有可用示例时返回空串）
+
+    每条示例先出一行 JSON（{sentence, <key>: <取值>}）；该条若另填了非空 instruction，
+    就在它下面再缩进一行「说明：…」。instruction 先从 dict 里摘掉再 dump，否则同一段话
+    会在 JSON 里和说明行里各出现一次。
+
+    instruction 是可选字段：缺字段、空串、类型不对都只是不渲染那一行，不报错——配置里放空串
+    占位（见 feature_classes.json5 表头）时，渲染结果与没有这个字段时逐字一致。
+
+    feature_agent（_class_prompt）与 all_in_one（_feature_roster）共用这一份，两边口径不会分叉；
+    indent 由调用方给，好让示例缩进到各自提示语里合适的位置。
+    """
+    lines: list[str] = []
+    for example in (feature_class.get("examples") or [])[:limit]:
+        if not isinstance(example, dict):
+            continue
+        body = {k: v for k, v in example.items() if k != "instruction"}
+        lines.append(f"{indent}{json.dumps(body, ensure_ascii=False)}")
+        instruction = example.get("instruction")
+        if isinstance(instruction, str) and instruction.strip():
+            lines.append(f"{indent}  说明：{instruction.strip()}")
+    return "\n".join(lines)
+
+
+def _class_prompt(template: str, feature_class: dict, *, usage: str) -> str:
+    """按模板给某一类语义特征写一段提示语（模板见 system_prompt/feature_class.txt）
+
+    usage 是模板里 {{usage}} 的取值：deep 时这段给 subagent（它自己去调 parse_sentence、
+    关注词由主 agent 转述），flat 时这段跟着整份系统提示语一起给单次调用的那个模型。
+    """
     values = "、".join(str(v) for v in (feature_class.get("values") or [])) or "（未限定，按判据自行概括）"
-    example_lines = "\n".join(
-        f"    {json.dumps(e, ensure_ascii=False)}"
-        for e in (feature_class.get("examples") or [])[:5]
-        if isinstance(e, dict)
-    )
+    example_lines = render_example_lines(feature_class)
     return utils.render_prompt(
         template,
         {
             "name": feature_class.get("name") or feature_class["key"],
             "description": feature_class.get("description") or "（未填写）",
             "values": values,
+            "usage": usage,
             # 「示例：」这段有没有取决于有没有示例，末尾那个换行也得跟着一起消失，所以整段
             # （含标签与结尾换行）当**一个**占位符传进去，空时给空串。别把它拆成「模板里写死
             # 『示例：\n』+ 只替换行列表」——那样空示例时会多出一行「示例：」，而模板里看不出问题。
@@ -475,12 +592,35 @@ def _subagent_specs(feature_classes: list[dict]) -> list[dict]:
 
 
 def _render_feature_prompts(
-    feature_classes: list[dict], head_template: str, class_template: str
+    feature_classes: list[dict],
+    head_template: str,
+    class_template: str,
+    *,
+    mode: str,
+    usage: str,
 ) -> tuple[str, list[str]]:
-    """渲染 feature_agent 的提示语，返回 (主提示语, [各类 subagent 的提示语])
+    """渲染 feature_agent 的提示语，返回 (主提示语, [各类的提示语])
 
-    两个模板由调用方读好传进来（FeatureAgent 在构造期用 system_prompt/ 下的文件渲染）。
+    模板由调用方读好传进来（FeatureAgent 在构造期用 system_prompt/ 下的文件渲染）。
+    两种模式共用 class_template（判据与逐字照抄规则只有一份），分岔在 {{usage}}：
+    mode="flat"（默认，单次调用）的主提示语用 feature_flat.txt（占位符 {{n}}/{{classes}}），
+    mode="deep" 用 feature.txt（占位符 {{n}}/{{roster}}，各类的提示语给对应 subagent）。
+
+    flat 的每个类块前加一行标题（类名 + key）：单次调用时模型要靠它把取值填进正确的字段，
+    deep 时 subagent 的归属由 roster 交代，不需要这一行。
     """
+    class_prompts = [_class_prompt(class_template, feature_class, usage=usage) for feature_class in feature_classes]
+    if mode == "flat":
+        blocks = [
+            f"### {spec['label']}（key：{spec['key']}）\n{prompt}"
+            for spec, prompt in zip(_subagent_specs(feature_classes), class_prompts, strict=True)
+        ]
+        head = utils.render_prompt(
+            head_template,
+            {"n": len(feature_classes), "classes": "\n\n".join(blocks)},
+            source=f"{FEATURE_FLAT_PROMPT_FILE}.txt",
+        )
+        return head, class_prompts
     roster = "\n".join(
         f"    {spec['name']}：负责「{spec['label']}」，对应特征字段 {spec['key']}"
         for spec in _subagent_specs(feature_classes)
@@ -488,23 +628,14 @@ def _render_feature_prompts(
     head = utils.render_prompt(
         head_template, {"n": len(feature_classes), "roster": roster}, source=f"{FEATURE_PROMPT_FILE}.txt"
     )
-    return head, [_class_prompt(class_template, feature_class) for feature_class in feature_classes]
+    return head, class_prompts
 
 
-def _build_deep_feature_agent(
-    model_key: str,
-    feature_classes: list[dict],
-    tools: list,
-    head_prompt: str,
-    class_prompts: list[str],
-):
-    """建特征抽取用的 deep agent：每类特征一个 subagent，主 agent 汇总成结构化特征对象
-
-    head_prompt 与 class_prompts 由 FeatureAgent 构造期按 system_prompt/ 下的模板渲染好传进来
-    （本函数是模块级函数，拿不到 agent 实例），class_prompts 与 feature_classes 一一对应。
+def _feature_model(feature_classes: list[dict]):
+    """按类别表建结构化输出模型：每类一个列表字段（flat 与 deep 共用同一个形状）
 
     key 是汉语也是合法的 Python 标识符，可以直接当 pydantic 字段名（合法性由调用方先校验）；
-    含空格、连字符之类的键不行。
+    含空格、连字符之类的键不行（见 _validate_feature_classes）。
     """
     fields = {
         feature_class["key"]: (
@@ -517,24 +648,41 @@ def _build_deep_feature_agent(
         )
         for feature_class in feature_classes
     }
-    feature_model = create_model("SemanticFeatures", **fields)
+    return create_model("SemanticFeatures", **fields)
 
+
+def _build_deep_feature_agent(
+    model_key: str,
+    feature_classes: list[dict],
+    main_tools: list,
+    subagent_tools: list,
+    head_prompt: str,
+    class_prompts: list[str],
+):
+    """建特征抽取用的 deep agent：每类特征一个 subagent，主 agent 汇总成结构化特征对象
+
+    head_prompt 与 class_prompts 由 FeatureAgent 构造期按 system_prompt/ 下的模板渲染好传进来
+    （本函数是模块级函数，拿不到 agent 实例），class_prompts 与 feature_classes 一一对应。
+
+    工具分两份：主 agent 只负责派发与汇总，默认不给工具；subagent 做实际抽取，保留
+    parse_sentence（deep 是唯一还让模型自己调工具的路径），显式注入 tools 时以注入的为准。
+    """
     subagents = [
         {
             "name": spec["name"],
             "description": spec["description"],
             "system_prompt": prompt,
-            "tools": tools,
+            "tools": subagent_tools,
         }
         for spec, prompt in zip(_subagent_specs(feature_classes), class_prompts, strict=True)
     ]
 
     return agent_factory.get_deep_agent(
         model_key,
-        tools=tools,
+        tools=main_tools,
         system_prompt=head_prompt,
         subagents=subagents,
-        response_format=ToolStrategy(feature_model),
+        response_format=ToolStrategy(_feature_model(feature_classes)),
     )
 
 
@@ -575,6 +723,14 @@ class BaseAgent:
     与四张表同一个目录、同一套分组口径（见 spatial_tools.CONFIG_PROMPT_FILES）。
     两种来源的读法与报错文案是同一套（utils.read_prompt_path），只有路径的来源不同。
     """
+    CACHEABLE_SOURCES: tuple[str, ...] = ()
+    """哪些 source 的 run() 结果值得按 user message 缓存（空元组 = 本 agent 不缓存）
+
+    缓存的前提是「同一串 message ⇒ 同一答案」：同一 agent 实例意味着同一模型、同一 system
+    prompt、同一语料类型（三样都在构造期定死），键就是渲染好的 user message 本身。
+    只记成功的那几种 source，失败的不入缓存（一次接口抖动被缓存住，同一条语料的候选会成片
+    记成同一个错；留着失败按候选重试，代价只是失败的那几个多问一次）。见 _cache_put。
+    """
 
     def __init__(
         self,
@@ -604,6 +760,22 @@ class BaseAgent:
         self.system_prompt: str = self.prompts[self.PROMPT_FILES[0]] if self.PROMPT_FILES else ""
         self._agent = None  # 惰性：第一次 run（或 warm）才建底层 agent
         self._lock = threading.Lock()  # 多线程下避免同时建出好几份（对 deep agent 尤其重要）
+        # 按 user message 的结果缓存（见 CACHEABLE_SOURCES）。键就是渲染好的 message 本身——
+        # 命中即等价于「问的是逐字节相同的那一句」，所以日后改措辞不会留下陈旧命中
+        # （message 变了，键就变）。换一份 agent 就是换一份缓存：模型、system prompt、语料类型
+        # 都在构造期定死，这正是「同一串 message ⇒ 同一答案」成立的前提。
+        self._verdicts: dict[str, dict] = {}
+        self._verdict_lock = threading.Lock()  # 多线程读/写 _verdicts 都过这把锁
+        self._flight: dict[str, threading.Lock] = {}
+        """按 message 的在途锁：同一串 message 的首问只许一个线程发出去
+
+        --workers N 时同一条语料的多个候选可能同时第一次问到同一句（a 侧正是这样），
+        没有这把锁就会同时 miss、各发一次——去重的收益被并发吃掉一半。
+        """
+        self._flight_guard = threading.Lock()  # 保护 _flight 自身的建表
+        # 本次跑批的调用统计：模型往返数（含工具往返）与缓存命中数，跑批入口收尾时汇总
+        self._stats = {"roundtrips": 0, "cache_hits": 0}
+        self._stats_lock = threading.Lock()
 
     # -- 子类实现 ----------------------------------------------------------
     def run(self, **kwargs) -> dict:
@@ -627,8 +799,13 @@ class BaseAgent:
 
     # -- 公共设施 ----------------------------------------------------------
     def tools(self) -> list:
-        """本 agent 的工具列表，默认给一个 LTP 句法分析工具"""
-        return list(self._tools) if self._tools is not None else [st.parse_sentence]
+        """本 agent 的工具列表，**默认为空**：句法证据已由 syntax_block 直接写进消息
+
+        工具调用就是又一次 API 请求，默认不绑 parse_sentence，每一步少一次往返。显式注入
+        tools= 时以注入的为准（deep 模式的 subagent 是唯一还默认拿到这个工具的地方，见
+        FeatureAgent._subagent_tools）。
+        """
+        return list(self._tools) if self._tools is not None else []
 
     def _model(self):
         """惰性建底层 agent，双重检查加锁保证只建一份"""
@@ -652,12 +829,74 @@ class BaseAgent:
 
         用 .get 而不是 []：键缺失同样该走这条兜底，而不是让 run() 的兜底把 KeyError 记成
         一句「调用失败」——那样就看不出到底是模型没给判定、还是返回形状变了。
+
+        顺带数模型往返数（见 stats）：返回的 messages 里有几条 AI 消息就是几次往返（工具调用
+        与结构化输出各算一次）。替身返回形状（只有 structured_response、没有 messages）按 1 次
+        算——它毕竟顶替了一次调用。
+
+        注意这是**本层可见**的往返数：deep agent 的 subagent 在 task 工具调用内部各跑各的，
+        它们的往返不在主 agent 的 messages 里，这里数不到（deep 路径的数字因此偏小）。
         """
         result = self._model().invoke({"messages": [{"role": "user", "content": content}]})
+        roundtrips = sum(1 for m in (result.get("messages") or []) if getattr(m, "type", "") == "ai") or 1
+        with self._stats_lock:
+            self._stats["roundtrips"] += roundtrips
         verdict = result.get("structured_response")
         if verdict is None:
             raise StructuredOutputMissing(_reply_digest(result.get("messages") or []))
         return verdict
+
+    # -- 按 message 的缓存 --------------------------------------------------
+    def _cache_get(self, content: str) -> dict | None:
+        """命中就回一份深拷贝：调用方把它交给落盘与统计，缓存里那一份谁都不许改写
+
+        用 deepcopy 而不是 dict(...)：feature 的结果是嵌套 dict（features 底下还有各类的
+        取值列表），浅拷贝会让调用方与缓存共享同一批内层对象。
+        """
+        with self._verdict_lock:
+            hit = self._verdicts.get(content)
+        return copy.deepcopy(hit) if hit is not None else None
+
+    def _cache_put(self, content: str, result: dict) -> None:
+        """只记成功的结果（见 CACHEABLE_SOURCES 里各 agent 的名单）"""
+        if result.get("source") not in self.CACHEABLE_SOURCES:
+            return
+        with self._verdict_lock:
+            self._verdicts[content] = copy.deepcopy(result)
+
+    def _cached_or_ask(self, content: str, ask):
+        """查缓存 → 未命中则问一次并（按 source 决定是否）入缓存
+
+        并发保护是两层的：查缓存走 _verdict_lock；未命中时先取该 message 的在途锁再问，
+        锁内二次查缓存——同一条语料的多个候选同时首问时，只有一个线程真发请求。
+        """
+        cached = self._cache_get(content)
+        if cached is not None:
+            self._note_cache_hit()
+            return cached
+        with self._flight_guard:
+            lock = self._flight.setdefault(content, threading.Lock())
+        with lock:
+            cached = self._cache_get(content)  # 等锁期间别人可能已经问完
+            if cached is not None:
+                self._note_cache_hit()
+                return cached
+            result = ask(content)
+            self._cache_put(content, result)
+            return result
+
+    def _note_cache_hit(self) -> None:
+        with self._stats_lock:
+            self._stats["cache_hits"] += 1
+
+    def stats(self) -> dict:
+        """本次跑批的调用统计（跑批入口收尾汇总用）：模型往返数与缓存命中数
+
+        roundtrips 只数本层可见的往返（见 _invoke：deep agent 的 subagent 往返不在主 agent
+        的 messages 里，数不到）；cache_hits 是被按 message 缓存省下的重复问，不花往返。
+        """
+        with self._stats_lock:
+            return dict(self._stats)
 
     def describe(self) -> str:
         """启动时打印用的一句话"""
@@ -705,8 +944,13 @@ class RealityAgent(BaseAgent):
     这一种，它的错法只能是「漏掉几句引申用法」，不能是「把整批记录挡在门外」——一次接口抖动、
     一次 --no-llm 都不该让整轮跑批空掉，何况 --no-llm 的用途正是绕开模型验纯规则环节。
 
+    不问重复的问题：这是一条语料一条判定，而跑批会把一条语料按规则表展开成多个候选状态、
+    每个状态各过一遍这道闸门——**问的是逐字相同的一句原话**。所以判定按 user message 缓存
+    （见 prefill），跑批前整批判一次、节点读缓存，实测 1782 条记录只对应 200 个原句。
+    缓存只存成功判定，失败的照旧按候选重试（见 CACHEABLE_SOURCES）。
+
     不给工具：判「这个词说的是不是物理空间」靠读句子与常识，句法结构帮不上什么忙（关注词的下标
-    已在消息首行给出，不劳模型自己去数），所以 tools() 默认给空表（显式注入 tools 仍生效）。
+    已在消息首行给出，不劳模型自己去数），走 BaseAgent.tools() 的默认空表。
     提示语按语料类型分两份、与四张表同目录（见 PROMPT_SOURCE_CONFIG）。
     """
 
@@ -716,21 +960,89 @@ class RealityAgent(BaseAgent):
     CONFIG_NOTE = "config_files/<语料类型>/reality.txt（提示语，与该组四张表同目录）"
     PROMPT_FILES = (REALITY_PROMPT_FILE,)
     PROMPT_SOURCE = PROMPT_SOURCE_CONFIG
-
-    def tools(self) -> list:
-        """本 agent 默认不调工具（见类文档）；显式注入 tools 时以注入的为准"""
-        return list(self._tools) if self._tools is not None else []
+    CACHEABLE_SOURCES = ("llm",)
+    """成功的判定按 user message 缓存：预填充整批判一次，节点按 message 读（见 prefill）"""
 
     def _build(self):
         return agent_factory.get_agent(
             self.model_key, self.tools(), self.system_prompt, response_format=ToolStrategy(RealityVerdict)
         )
 
+    def _content(self, sentence: str, focus_word: dict) -> str:
+        """本 agent 的 user message
+
+        单独抽出来是为了让缓存键与真正发出去的请求**同源**：预填充按它去重、run() 按它查缓存，
+        两处拼出不同的串就意味着缓存永远不命中（多花的那份钱还看不出来）。
+        """
+        return (
+            f"{head_block(focus_word, corpus_type=self.corpus_type)}\n"
+            f"请判断这个句子里的关注词是否用于表达现实世界中的空间场景：{sentence}"
+        )
+
+    def _ask(self, content: str) -> dict:
+        """发一次请求，转成与 run() 同形的结果 dict（成功与失败两种形状）"""
+        try:
+            verdict: RealityVerdict = self._invoke(content)
+        except Exception as e:  # 单条记录失败不该带走整批，如实记下原因（图会放行，见 reality_gate）
+            return {"is_spatial_scene": None, "source": "error", "reason": f"调用失败：{e!r}"}
+        return {"is_spatial_scene": verdict.is_spatial_scene, "reason": verdict.reason, "source": "llm"}
+
+    def prefill(self, queries: Iterable[tuple[str, dict | None]], workers: int = 1) -> dict:
+        """跑批前把整批原句判一遍（去重），节点随后按 message 读缓存
+
+        与 spatial_tools.prefill_ltp 同一套做法、同一个理由：同一件判定的重复请求应当在进入
+        线程池之前去掉。一条语料按规则表展开成多个候选状态、每个状态都要过这道闸门，而它们
+        问的是**逐字相同**的一句原话——不去重就是几倍的调用（实测 1782 条记录只对应 200 个原句，
+        其中 1283 条记录只对应 157 个原句）。
+
+        queries 是 [(原句, 关注词), ...]，由图自己声明哪些记录会走到闸门（见
+        spatial_graphs.GraphSpec.gate_queries）：改写未命中的记录不经过闸门，就不该判。
+
+        Args:
+            queries (Iterable[tuple[str, dict | None]]): 去重前的待判清单
+            workers (int): 并发数，取跑批的 --workers（模型由跑批入口提前 warm 好）
+
+        Returns:
+            dict: {"queries", "unique", "asked", "failed", "skipped"}
+                queries  传进来多少条（= 会走到闸门的状态数）
+                unique   去重后真正要判的原句数
+                asked    实际发出去的请求数（已判过的那部分不再问）
+                failed   失败且未入缓存的数量（这些会在各自候选上再问一次）
+                skipped  没有句子/关注词、无从判断因而未发的数量
+        """
+        stat = {"queries": len(queries), "unique": 0, "asked": 0, "failed": 0, "skipped": 0}
+        if not self.llm:
+            return stat
+        contents: dict[str, None] = {}  # 去重且保序（dict 自 3.7 起保插入序）
+        for sentence, focus_word in queries:
+            if not sentence or not (focus_word or {}).get("word"):
+                # run() 对这两种情形本来就不发请求（无句子 / 无关注词），这里也别算进待判清单
+                stat["skipped"] += 1
+                continue
+            contents[self._content(sentence, focus_word)] = None
+        stat["unique"] = len(contents)
+        todo = [content for content in contents if self._cache_get(content) is None]
+        stat["asked"] = len(todo)
+        done = 0
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+            for content, result in zip(todo, pool.map(self._ask, todo)):
+                self._cache_put(content, result)
+                if result.get("source") != "llm":
+                    stat["failed"] += 1
+                done += 1
+                if done % 10 == 0:
+                    print(f"  reality 预填充已判 {done}/{len(todo)}", flush=True)
+        return stat
+
     def run(self, sentence: str, focus_word: dict) -> dict:
         """判这一句里的关注词是不是在说现实空间；判不了就给 None 并记下是哪种判不了
 
         四种 source 分开记而不是都回 None：汇总里要能看出「这一批有多少条压根没判」
         （见 spatial_graphs._tally_reality），混成一种就分不清「没问模型」与「模型说判不了」了。
+
+        先查缓存（跑批前预填充填的，见 prefill）：命中就不发请求，返回的仍是 source="llm"
+        的那份判定——判定本身没变，变的只是「这一问有没有重复问过」。图被单独 invoke
+        （状态里没有预填充这一说）时缓存是空的，行为与从前逐字相同。
         """
         # llm 这一关排在最前（同 SemanticAgent）：--no-llm 下每条记录的 source 都该是 no_llm，
         # 那是「没问过模型」这个事实，而不是某条记录的数据有问题——后者会把它盖成 no_sentence。
@@ -749,14 +1061,7 @@ class RealityAgent(BaseAgent):
                 "source": "no_focus",
                 "reason": "这条记录没有取到关注词，无从判断是哪个词在表达空间",
             }
-        try:
-            verdict: RealityVerdict = self._invoke(
-                f"{head_block(focus_word, corpus_type=self.corpus_type)}\n"
-                f"请判断这个句子里的关注词是否用于表达现实世界中的空间场景：{sentence}"
-            )
-        except Exception as e:  # 单条记录失败不该带走整批，如实记下原因（图会放行，见 reality_gate）
-            return {"is_spatial_scene": None, "source": "error", "reason": f"调用失败：{e!r}"}
-        return {"is_spatial_scene": verdict.is_spatial_scene, "reason": verdict.reason, "source": "llm"}
+        return self._cached_or_ask(self._content(sentence, focus_word), self._ask)
 
     def describe(self) -> str:
         tail = f"模型 {self.model_key}" if self.llm else "未调用 LLM"
@@ -866,51 +1171,104 @@ class AlterAgent(BaseAgent):
 
 
 class SemanticAgent(BaseAgent):
-    """判断单句的语义是否通顺"""
+    """判断单句的语法是否通顺、空间语义是否异常——两项一次问、各带理由
+
+    两道判据合出 is_fluent = grammar_ok and spatial_ok，闸门只读它（见 sg.pair_semantic_gate）；
+    拆开存是为了事后能分清这条记录是被语法挡下的还是被空间语义挡下的。两项在**同一次调用**里给出，
+    所以调用次数与从前逐字相同（每侧仍是一次），多出来的只是输出里的两个字段。
+
+    句法证据直接拼进消息（见 syntax_block）、不绑工具：判语法通不通、空间语义顺不顺，先读现成的
+    分词与依存结构比让模型自己调一次 parse_sentence 又快又省一次往返（措辞与 all_in_one 那条一致）。
+
+    落盘与返回形状由 semantic_verdict_result / semantic_blank 一处合成：all_in_one.py 那条对照
+    链路用同一对函数，两边的键集与合出 is_fluent 的算式因此不可能各走各的。
+
+    a 侧的 message 是一条语料所有候选的纯函数，按 message 缓存（见 CACHEABLE_SOURCES）：一条语料
+    展开成 ~9.5 个候选时，同一句只问一次。
+    """
 
     NAME = "semantic"
     INPUTS = ("sentence", "focus_word")
-    OUTPUTS = ("is_fluent", "reason", "source")
+    OUTPUTS = (
+        "is_fluent",
+        "grammar_ok",
+        "spatial_ok",
+        "reason",
+        "grammar_reason",
+        "spatial_reason",
+        "source",
+    )
     CONFIG_NOTE = "无"
     PROMPT_FILES = ("semantic",)
+    CACHEABLE_SOURCES = ("llm",)
+    """成功的判定按 user message 缓存：a 侧输入只由语料决定，原样复用（b 侧句子不同、键不同）"""
 
     def _build(self):
         return agent_factory.get_agent(
             self.model_key, self.tools(), self.system_prompt, response_format=ToolStrategy(SemanticVerdict)
         )
 
+    def _content(self, sentence: str, focus_word: dict) -> str:
+        """本 agent 的 user message；syntax_block 取不到证据时那两行整块省略"""
+        block = syntax_block(sentence)
+        syntax_lines = f"\n句法证据：\n{block}" if block else ""
+        return (
+            f"{head_block(focus_word, corpus_type=self.corpus_type)}\n"
+            f"句子：{sentence}"
+            f"{syntax_lines}\n"
+            f"请判断这个句子：语法是否通顺，空间语义是否存在异常。"
+        )
+
+    def _ask(self, content: str) -> dict:
+        """发一次请求，转成与 run() 同形的结果 dict（成功与失败两种形状）"""
+        try:
+            verdict: SemanticVerdict = self._invoke(content)
+        except Exception as e:  # 单条记录失败不该带走整批，如实记下原因
+            return semantic_blank("error", f"调用失败：{e!r}")
+        return semantic_verdict_result(
+            verdict.grammar_ok, verdict.grammar_reason, verdict.spatial_ok, verdict.spatial_reason
+        )
+
     def run(self, sentence: str, focus_word: dict) -> dict:
         if not self.llm:
-            return {"is_fluent": None, "reason": "未调用 LLM（--no-llm）", "source": "no_llm"}
-        try:
-            verdict: SemanticVerdict = self._invoke(
-                f"{head_block(focus_word, corpus_type=self.corpus_type)}\n"
-                f"该文本是否存在空间语义方面的异常：{sentence}"
-            )
-        except Exception as e:  # 单条记录失败不该带走整批，如实记下原因
-            return {"is_fluent": None, "reason": f"调用失败：{e!r}", "source": "error"}
-        return {"is_fluent": verdict.is_fluent, "reason": verdict.reason, "source": "llm"}
+            return semantic_blank("no_llm", "未调用 LLM（--no-llm）")
+        return self._cached_or_ask(self._content(sentence, focus_word), self._ask)
 
 
 class FeatureAgent(BaseAgent):
     """抽取单句的语义特征
 
-    类别表填了就用 deep agent（每类一个 subagent 各自抽取、主 agent 汇总）；
-    表为空则退化成单个 agent 自由抽取，并把 source 标成 unfilled_config，
-    提醒这不是按既定类别抽的。
+    类别表填了默认走**单次调用**：把各类的判据拼进一份系统提示语，一次调用直接产出全部特征字段
+    （每类一个列表字段，见 _feature_model）。deep=True 时改用原来的 deep agent（每类一个 subagent
+    各自抽取、主 agent 汇总）——每次约 13 次模型往返，只在需要对照或 flat 抽得不好时开。
 
-    deep agent 建起来贵，所以 __init__ 只读表与校验、不建模型；--no-llm 下一次都不建。
+    表为空则退化成单个 agent 自由抽取，并把 source 标成 unfilled_config，
+    提醒这不是按既定类别抽的（这种情形 deep 无效，一条老路走到底）。
+
+    __init__ 只读表、校验与渲染提示语，不建模型（deep agent 建起来尤其贵）；--no-llm 下一次都不建。
     """
 
     NAME = "feature"
     INPUTS = ("sentence", "focus_word")
     OUTPUTS = ("features", "source", "reason")
     CONFIG_NOTE = "config_files/<语料类型>/feature_classes.json5（类型见 --corpus-type，默认 localization）"
-    PROMPT_FILES = (FEATURE_PROMPT_FILE, FEATURE_UNFILLED_PROMPT_FILE, FEATURE_CLASS_PROMPT_FILE)
-    """三份都在构造期读入，表为空时用不上的那两份也顺带校验（配置错早暴露）"""
+    PROMPT_FILES = (
+        FEATURE_FLAT_PROMPT_FILE,
+        FEATURE_PROMPT_FILE,
+        FEATURE_UNFILLED_PROMPT_FILE,
+        FEATURE_CLASS_PROMPT_FILE,
+        FEATURE_CLASS_USAGE_FILE,
+        FEATURE_CLASS_USAGE_FLAT_FILE,
+    )
+    """都在这构造期读入，表为空时用不上的那几份也顺带校验（配置错早暴露）"""
+    CACHEABLE_SOURCES = ("config", "unfilled_config")
+    """成功抽到的特征按 user message 缓存：a 侧输入只由语料决定，原样复用（b 侧句子不同、键不同）"""
 
-    def __init__(self, *, feature_classes: list[dict] | None = None, **kwargs):
+    def __init__(self, *, feature_classes: list[dict] | None = None, deep: bool = False, **kwargs):
+        # deep 必须在这里显式声明：build_agents 的 overrides（--feature-deep）按构造参数注入，
+        # 让 **kwargs 原样落到 BaseAgent.__init__ 会因未知参数直接 TypeError。
         super().__init__(**kwargs)
+        self.deep = bool(deep)
         if feature_classes is not None:
             self.feature_classes = feature_classes
             self.table_path = "调用方注入的类别表，无路径"
@@ -922,10 +1280,15 @@ class FeatureAgent(BaseAgent):
         # 渲染放构造期而不是 _build()：llm=False 时 _build() 永不调用，放里面就没有任何不碰模型的
         # 路径能覆盖它；而且占位符写错属于配置错误，与「表填错」同一口径，应该启动时就报。
         if self.feature_classes:
+            mode = "deep" if self.deep else "flat"
             self.system_prompt, self.class_prompts = _render_feature_prompts(
                 self.feature_classes,
-                self.prompts[FEATURE_PROMPT_FILE],
+                self.prompts[FEATURE_PROMPT_FILE if mode == "deep" else FEATURE_FLAT_PROMPT_FILE],
                 self.prompts[FEATURE_CLASS_PROMPT_FILE],
+                mode=mode,
+                usage=self.prompts[
+                    FEATURE_CLASS_USAGE_FILE if mode == "deep" else FEATURE_CLASS_USAGE_FLAT_FILE
+                ],
             )
         else:
             self.system_prompt = self.prompts[FEATURE_UNFILLED_PROMPT_FILE]
@@ -936,19 +1299,48 @@ class FeatureAgent(BaseAgent):
             return agent_factory.get_agent(
                 self.model_key, self.tools(), self.system_prompt, response_format=ToolStrategy(FreeFeatures)
             )
+        if not self.deep:
+            return agent_factory.get_agent(
+                self.model_key,
+                self.tools(),
+                self.system_prompt,
+                response_format=ToolStrategy(_feature_model(self.feature_classes)),
+            )
         return _build_deep_feature_agent(
-            self.model_key, self.feature_classes, self.tools(), self.system_prompt, self.class_prompts
+            self.model_key,
+            self.feature_classes,
+            self.tools(),
+            self._subagent_tools(),
+            self.system_prompt,
+            self.class_prompts,
         )
 
-    def run(self, sentence: str, focus_word: dict) -> dict:
-        if not self.llm:
-            return {"features": {}, "source": "no_llm", "reason": "未调用 LLM（--no-llm）"}
+    def _subagent_tools(self) -> list:
+        """deep 模式 subagent 的工具：这是唯一还默认给 parse_sentence 的模型面
+
+        deep agent 的 subagent 拿到的不是完整消息，句法证据没地方内联（主 agent 转述的 task
+        文本只带关注词与句子），所以保留工具让它自己去取；调用方显式注入 tools 时以注入为准。
+        """
+        return self.tools() or [st.parse_sentence]
+
+    def _content(self, sentence: str, focus_word: dict) -> str:
+        """本 agent 的 user message（flat 与 unfilled 两条路共用；syntax_block 取不到就整块省略）
+
+        deep 路径用不上它：主 agent 的输入是消息里的关注词与句子，句法证据由 subagent 自己取。
+        """
+        block = syntax_block(sentence)
+        syntax_lines = f"\n句法证据：\n{block}" if block else ""
+        return (
+            f"{head_block(focus_word, corpus_type=self.corpus_type)}\n"
+            f"句子：{sentence}"
+            f"{syntax_lines}\n"
+            f"请抽取这个句子的语义特征。"
+        )
+
+    def _ask(self, content: str) -> dict:
+        """发一次请求，转成与 run() 同形的结果 dict（成功与失败两种形状）"""
         try:
-            # 关注词写在首行：主 agent 只有把它一起写进 task 的任务文本，subagent 才看得到
-            # （subagent 的 system_prompt 是构造期固定的，见 system_prompt/feature.txt）
-            data = self._invoke(
-                f"{head_block(focus_word, corpus_type=self.corpus_type)}\n请抽取这个句子的语义特征：{sentence}"
-            ).model_dump()
+            data = self._invoke(content).model_dump()
         except Exception as e:
             return {"features": {}, "source": "error", "reason": f"调用失败：{e!r}"}
 
@@ -956,12 +1348,20 @@ class FeatureAgent(BaseAgent):
         features = data.get("features") if set(data) == {"features"} else data
         return {"features": features or {}, "source": self.table_source, "reason": ""}
 
+    def run(self, sentence: str, focus_word: dict) -> dict:
+        if not self.llm:
+            return {"features": {}, "source": "no_llm", "reason": "未调用 LLM（--no-llm）"}
+        return self._cached_or_ask(self._content(sentence, focus_word), self._ask)
+
     def describe(self) -> str:
         n = len(self.feature_classes)
         tail = "" if n else "（未填写，自由抽取）"
+        mode = "deep" if (n and self.deep) else "单次调用"
+        # 模式两种都印（--no-llm 也印）：flat / deep 渲染的是两份不同的 system prompt，
+        # 启动时看不出这次读的是哪一份，对照实验就说不清跑的是哪条路
         if not self.llm:
-            return f"feature：未调用 LLM；特征类别 {n} 类{tail}（{self.table_path}）"
-        return f"feature：模型 {self.model_key}；特征类别 {n} 类{tail}（{self.table_path}）"
+            return f"feature：未调用 LLM；特征类别 {n} 类（{mode}）{tail}（{self.table_path}）"
+        return f"feature：模型 {self.model_key}；特征类别 {n} 类（{mode}）{tail}（{self.table_path}）"
 
     def config_report(self) -> dict:
         n = len(self.feature_classes)
@@ -1003,6 +1403,9 @@ class SchemaAgent(BaseAgent):
     OUTPUTS = ("name", "reason", "source")
     CONFIG_NOTE = "config_files/<语料类型>/schema_table.json5（match 的键取自同目录的 feature_classes.json5）"
     PROMPT_FILES = ("schema",)
+    CACHEABLE_SOURCES = ("llm", "llm_free")
+    """成功选出的名字按 user message 缓存：a 侧输入只由语料决定，原样复用
+    （查表命中在缓存之前就返回、不进缓存；llm_invalid 与 error 不入缓存，留待各候选重试）"""
 
     def __init__(
         self,
@@ -1065,10 +1468,17 @@ class SchemaAgent(BaseAgent):
         if not self.llm:
             return {"name": None, "source": "no_llm", "reason": f"{miss}，且未调用 LLM（--no-llm）"}
 
+        content = self._content(sentence, features, focus_word, word, class_word, miss, candidates)
+        return self._cached_or_ask(content, lambda c: self._ask(c, word, class_word, candidates))
+
+    def _ask(self, content: str, word: str, class_word: str | None, candidates: dict) -> dict:
+        """发一次请求并把名字校验成 run() 的同形结果（成功与失败两种形状）
+
+        校验挡掉的是「名字下游对不上」：候选名单外的名字、自由命名时不合格式的名字都记成
+        llm_invalid 并不入缓存（见 CACHEABLE_SOURCES）——同一句话换个候选重试时还能再问一次。
+        """
         try:
-            verdict: SchemaVerdict = self._invoke(
-                self._content(sentence, features, focus_word, word, class_word, miss, candidates)
-            )
+            verdict: SchemaVerdict = self._invoke(content)
         except Exception as e:
             return {"name": None, "source": "error", "reason": f"调用失败：{e!r}"}
 
@@ -1114,14 +1524,18 @@ class SchemaAgent(BaseAgent):
         miss: str,
         candidates: dict,
     ) -> str:
-        """LLM 兜底时的 user message：关注词行 + 句子 + 特征 + 候选名单（或自由命名要求）
+        """LLM 兜底时的 user message：关注词行 + 句子 + 句法证据 + 特征 + 候选名单（或自由命名要求）
 
         带类名的那句必须拼在 head_block 整块**之后**：head_block 刻意把语料类型行钉在第 3 行，
         插在中间会把类型行顶到第 4 行（verify_focus_wiring._check_focus_head 就在断言这个位置）。
+        句法证据同样拼在首块之后（取不到时整两行省略），选图式要看的正是关注词在句法上的角色。
         """
+        block = syntax_block(sentence)
+        syntax_lines = f"\n句法证据：\n{block}" if block else ""
         head = (
             f"{head_block(focus_word, corpus_type=self.corpus_type)}\n"
-            f"句子：{sentence}\n"
+            f"句子：{sentence}"
+            f"{syntax_lines}\n"
             f"语义特征：{json.dumps(features, ensure_ascii=False)}\n"
             f"{miss}。"
         )
@@ -1184,6 +1598,9 @@ class JudgeAgent(BaseAgent):
     两句意义是否还相同」。b 侧的 schema 是拿替换词重新收窄、重新定的（见 st.replacement_focus_word），
     所以判定表里 上12 × 里1 这样的格子才对得上——两侧若共用一个关注词，b 侧会退回收窄回原词
     那一组，判定就只在同一组内自比了。
+
+    两句的句法证据各带一份拼进消息（见 run），不绑工具。刻意不进按 message 的缓存：b 侧句子
+    逐候选不同，消息也就条条不同，去重收益为零（CACHEABLE_SOURCES 留空）。
     """
 
     NAME = "judge"
@@ -1253,12 +1670,17 @@ class JudgeAgent(BaseAgent):
                 "reason": f"查表没有直接结论（{situation}），且未调用 LLM（--no-llm）",
             }
 
+        block_a, block_b = syntax_block(sentence_a), syntax_block(sentence_b)
+        syntax_a = f"\n原句句法证据：\n{block_a}" if block_a else ""
+        syntax_b = f"\n改写句句法证据：\n{block_b}" if block_b else ""
         content = (
             f"{pair_head_block(focus_word, focus_word_b, corpus_type=self.corpus_type)}\n"
-            f"原句：{sentence_a}\n"
+            f"原句：{sentence_a}"
+            f"{syntax_a}\n"
             f"原句 schema：{schema_a.get('name')}（来源 {schema_a.get('source')}）\n"
             f"原句语义特征：{json.dumps(features_a or {}, ensure_ascii=False)}\n"
-            f"改写句：{sentence_b}\n"
+            f"改写句：{sentence_b}"
+            f"{syntax_b}\n"
             f"改写句 schema：{schema_b.get('name')}（来源 {schema_b.get('source')}）\n"
             f"改写句语义特征：{json.dumps(features_b or {}, ensure_ascii=False)}\n"
             f"判定表情况：{situation}。\n"

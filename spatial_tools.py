@@ -1030,17 +1030,44 @@ def _as_list(value: Any) -> list:
     return list(value) if isinstance(value, (list, tuple, set)) else [value]
 
 
+FEATURE_VALUE_ALIASES: dict[str, tuple[str, ...]] = {
+    # 一个取值代表一组取值的「合称」：语义上它蕴含括号里每一个单值同时成立。只在**句子**那一侧
+    # 展开（见 _expand_feature_value），于是 schema 表里只写了某个单方向的图式也会被它命中，
+    # 不必在表里给每条含方向值的 match 都补一遍这个合称。
+    #
+    # [+四周] 表示目标物环绕参照物、四个水平方向同时成立（feature_classes.json5 的水平方向
+    # 一类里列了这个取值）。因此前1（[+前方]）、后1（[+后方]）、旁1（四个方向任一）、旁2
+    # （[+左方]/[+右方]）这些只覆盖部分方向的图式，对「环绕」句同样算命中——这是语言学上的
+    # 蕴含（四周 ⊃ 前/后/左/右），不是把 [+四周] 当成第五个并列方向。
+    "[+四周]": ("[+前方]", "[+后方]", "[+左方]", "[+右方]"),
+}
+"""取值别名：合称 -> 它蕴含的单值。改这张表等于改下游匹配口径，与配置里列的取值配套。"""
+
+
+def _expand_feature_value(value: Any) -> set[str]:
+    """把一个特征取值展开成它等价的取值集合（至少含它自己）
+
+    只对**句子**一侧的取值调用（见 _match_features）：表里 match 一侧不展开——表写什么就是
+    什么，免得「表里写了一组合称、又被自己展开」绕圈。别名见 FEATURE_VALUE_ALIASES。
+    """
+    text = str(value)
+    return {text, *FEATURE_VALUE_ALIASES.get(text, ())}
+
+
 def _match_features(match: dict, features: dict) -> bool:
     """判断**一组** match 条件是否被 features 满足：match 里的每个键都要在 features 里命中取值
 
     两侧都统一成集合作交集判断：上游一个特征可能传来多个备选值（feature_agent 每类返回的
     就是列表），有交集即算这个键命中。因此一个键写多个值是「该键取其中任一」，多键时就是
     各自取任一的组合；要精确控制组合就写多组条件（见 _schema_alternatives）。
+
+    句子一侧的取值先按 FEATURE_VALUE_ALIASES 展开（句子侧才展开，表侧不展开）：一个合称
+    （如 [+四周]）会被展开成它蕴含的各单值，于是表里只列了其中某个单值的条件也命中。
     """
     for key, expected in (match or {}).items():
         if key not in features:
             return False
-        actual_values = {str(v) for v in _as_list(features[key])}
+        actual_values = {expanded for v in _as_list(features[key]) for expanded in _expand_feature_value(v)}
         expected_values = {str(v) for v in _as_list(expected)}
         if not actual_values & expected_values:
             return False

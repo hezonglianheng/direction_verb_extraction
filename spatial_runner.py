@@ -25,8 +25,17 @@ pair 图（默认，--graph pair）的数据流：
 （判不好的记录也留着，好回头查是被哪条判据挡下的）；判不出来时一律放行，理由见
 spatial_graphs.reality_gate —— 闸门的错法只能是漏掉几句引申用法，不能是把整批记录挡在门外。
 
+这道闸门判的只是**原句**（a 侧那个词，与改写句换上去的词无关），而一条语料会展开出多个候选
+状态、每个状态都要过一遍——问的是逐字相同的一句原话。所以它在跑批前就按原句判完、去重
+（见 _prefill_reality）：节点位置与产物形状都不变（仍在 alter 之后，改写未命中的记录照旧没有
+reality 块），省下的是这几倍的重复调用（实测 1782 条记录只对应 200 个原句）。这份去重账写进
+.summary.json 的 reality_prefill——事后核对调用数时先看它。
+
 semantic / feature / schema 三个节点都是**原句与改写句各跑一遍**（两侧各一份结果，落盘时记在 a/b
 两个键下），judge 是两侧合并的地方：它一份记录只跑一次，同时读两侧的 schema 与关注词。
+这三者的 a 侧输入只由语料决定（同一条语料的所有候选问的是逐字相同的一句），所以结果按 user
+message 缓存在各自的 agent 实例里（见 spatial_agents.CACHEABLE_SOURCES）——第一次问过之后，
+同一句不再重复发请求；每次跑批各 agent 的往返数与命中数写进 .summary.json 的 agent_stats。
 两侧**各看各的关注词**——原句那侧看语料记录里那个词（focus_word），改写句那侧看规则表换上去的
 那个词（focus_word_b，由 alter 节点算出）。所以 b 侧的 schema 收窄到的是**替换词**所属的词组，
 判定表里 上12 × 里1 这样按两组名字写的格子才对得上；两侧共用一个词的话 b 侧会收窄回原词那一组，
@@ -108,11 +117,26 @@ class ResultWriter:
         tally,
         corpus_type: str | None = None,
         config_tables: dict[str, str] | None = None,
+        reality_prefill: dict | None = None,
     ):
         self.corpus_type = corpus_type
         """本次跑批的语料类型；只写进汇总，不进记录（记录形状不随本次改动变）"""
         self.config_tables = dict(config_tables or {})
         """本次实际读的四张配置表：{逻辑表名: 路径}，同样只进汇总（--alter-rules 换过表时很关键）"""
+        self.reality_prefill = dict(reality_prefill or {})
+        """闸门预填充的去重账（见 _prefill_reality）；同样只进汇总
+
+        它解释的是「这一轮 reality 为什么比记录数少很多」——没有这项，事后看到调用数与记录数
+        对不上只能靠猜。跑批是在**建好 writer 之后**才预填充的（图的接线校验要先跑，配置错不该
+        等到花完预填充的钱才发现），所以这项由 main 在预填充之后补写到属性上。
+        """
+        self.agent_stats: dict[str, dict] = {}
+        """各 agent 的调用统计：{名字: {"roundtrips", "cache_hits"}}（见 spatial_agents.BaseAgent.stats）
+
+        run() 结束时才拿得到，同 reality_prefill：由 main 在收尾前补写到属性上。
+        模型往返数是花费的直接口径（缓存命中省下的那部分不在这里，单列 cache_hits）；
+        没跑到的 agent（--no-llm、或图没走到）报全 0，不是漏记。
+        """
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.Lock()
@@ -204,6 +228,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="不调任何模型：只跑纯规则改写、查表与落盘，用于验证规则表与接线",
     )
+    parser.add_argument(
+        "--feature-deep",
+        action="store_true",
+        help="feature_agent 用 deep agent（每类特征一个 subagent、主 agent 汇总）；"
+        "默认是单次调用直接产出全部特征字段，一次省下约一个数量级的模型往返。"
+        "deep 只在需要对照或单次调用抽得不好时开",
+    )
     return parser.parse_args(argv)
 
 
@@ -280,6 +311,23 @@ def _print_config_tables(agents) -> None:
             print(f"            请把同义词组填进 {report['path']}，或用 --alter-rules <路径> 指定另一张表")
 
 
+def _print_agent_stats(stats: dict[str, dict]) -> None:
+    """收尾打印各 agent 的模型往返数与缓存命中数（写进汇总的那份，见 ResultWriter.agent_stats）
+
+    这是花掉的钱的直接口径：往返数含工具往返与结构化输出那次；命中数是被按 message 缓存
+    省下的重复问（命中不花往返）。全 0 的 agent 是没走到或根本没调模型（--no-llm）。
+    """
+    if not stats:
+        return
+    parts = [
+        f"{name} {item['roundtrips']} 次往返／{item['cache_hits']} 次命中"
+        for name, item in stats.items()
+    ]
+    total = sum(item["roundtrips"] for item in stats.values())
+    hits = sum(item["cache_hits"] for item in stats.values())
+    print(f"模型调用账（共 {total} 次往返，缓存省下 {hits} 次）：" + "；".join(parts))
+
+
 def _prefill(records: list[dict], agents, spec: sg.GraphSpec) -> None:
     """跑批前把整批句子一次性喂给 LTP
 
@@ -300,6 +348,34 @@ def _prefill(records: list[dict], agents, spec: sg.GraphSpec) -> None:
             f"警告：本图需 {len(unique)} 句，超过缓存容量 {config.CACHE_MAX_SIZE}，"
             "多线程下可能边填边淘汰；建议减小 --limit 或调大 config.CACHE_MAX_SIZE"
         )
+
+
+def _prefill_reality(records: list[dict], agents, spec: sg.GraphSpec, workers: int) -> dict:
+    """跑批前把闸门要判的原句一次判完（去重），随后节点按 message 读缓存
+
+    与 _prefill 同一套路、同一个理由：同一件判定的重复请求应当在进线程池之前去掉。闸门判的
+    只是原句（a 侧那个词），而一条语料按规则表能展开出 9~11 个候选状态、每个状态都要过一遍
+    ——不去重就是几倍的调用（实测 1782 条记录只对应 200 个原句，其中 1283 条记录只对应 157 个）。
+
+    哪些原句会走到闸门由图自己声明（spec.gate_queries）：改写未命中的记录不经过闸门，
+    也就不在这里判（规则表为空时正是整批都这样，那批一条都不该发）。
+
+    失败不入缓存（见 BaseAgent.CACHEABLE_SOURCES），所以 failed 的那几个会在各自候选上重问——
+    打印里如实交代，事后对不上账时能一眼看出差在哪。
+    """
+    if "reality" not in spec.needs:
+        return {}
+    stat = agents.need("reality").prefill(spec.gate_queries(records, agents), workers=workers)
+    line = (
+        f"reality 预填充：本图需判 {stat['unique']} 个原句"
+        f"（去重前 {stat['queries']} 个待选状态），实际发出 {stat['asked']} 次"
+    )
+    if stat["failed"]:
+        line += f"；其中 {stat['failed']} 次失败未入缓存，会在各自候选上重试"
+    if stat["skipped"]:
+        line += f"；另有 {stat['skipped']} 个状态没有可判的原句/关注词，未发出"
+    print(line)
+    return stat
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -328,12 +404,17 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     # --alter-rules 换的是改写那张表，走的是 build_agents 的注入通道（见 spatial_agents.AlterAgent）。
-    # 不给就由 AlterAgent 自己按语料类型取本组的那张（config_files/<类型目录>/alter_rules.json5）
-    overrides = (
-        {"alter": {"rules": st.load_alter_rules(args.alter_rules), "rules_path": args.alter_rules}}
-        if args.alter_rules
-        else {}
-    )
+    # 不给就由 AlterAgent 自己按语料类型取本组的那张（config_files/<类型目录>/alter_rules.json5）。
+    # --feature-deep 同理：注入 FeatureAgent.deep，默认那条单次调用的路一个字不改
+    overrides: dict[str, dict] = {}
+    if args.alter_rules:
+        overrides["alter"] = {"rules": st.load_alter_rules(args.alter_rules), "rules_path": args.alter_rules}
+    if args.feature_deep:
+        if "feature" not in spec.needs:
+            # 图不建 feature agent，这个开关就无从生效；静默忽略会让人以为 deep 跑过了
+            print(f"提示：--feature-deep 对本图（{spec.name}）无效——它不建 feature agent")
+        else:
+            overrides.setdefault("feature", {})["deep"] = True
     agents = sa.build_agents(
         spec.needs,
         model_key=args.model,
@@ -370,6 +451,9 @@ def main(argv: list[str] | None = None) -> None:
 
     if not args.no_llm:
         _prefill(records, agents, spec)
+        # 闸门的原句在这里一次判完（去重）。图已经建好——接线错在花钱之前就报出来，于是这份
+        # 去重账补写到 writer 上，与语料类型、配置表一并进汇总（见 ResultWriter.reality_prefill）
+        writer.reality_prefill = _prefill_reality(records, agents, spec, args.workers)
 
     # 一条语料能改出好几个待选句，每个待选句一个状态、一条记录，所以状态数一般多于语料条数
     states = spec.init_states(records, agents, str(out_path))
@@ -380,6 +464,8 @@ def main(argv: list[str] | None = None) -> None:
         for _ in pool.map(lambda state: graph.invoke(state, {"recursion_limit": 60}), states):
             pass
 
+    # 各 agent 的调用账（往返数与缓存命中数）：跑完才齐，收尾补写到 writer 上、进汇总
+    writer.agent_stats = {name: agent.stats() for name, agent in agents.items()}
     summary = writer.finish()
     print(
         f"\n完成 {summary['count']} 条记录（{len(records)} 条语料），用时 {summary['elapsed_seconds']} 秒"
@@ -387,6 +473,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     for name in spec.counter_names:
         print(f"{name}：{summary[name]}")
+    _print_agent_stats(writer.agent_stats)
     print(f"汇总文件：{summary['summary_file']}")
 
 

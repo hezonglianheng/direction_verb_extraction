@@ -11,7 +11,7 @@
                  改写未命中、或 reality 判为「不是现实空间用法」则直接 save 收尾。产出前缀 spatial_pairs。
     single       单句：read → reality → 语义 → 特征 → schema。用来看单个句子抽出来的东西是否合理。
                  前缀 spatial_single。
-    alter_check  改写检查：alter → reality → semantic（两句各判一次通顺），语义那一步不做闸门路由
+    alter_check  改写检查：alter → reality → semantic（两句各判一次语法与空间语义），语义那一步不做闸门路由
                  （两侧都判、不通顺也照样落盘），目的就是看改写句与原句各自是否通顺。
                  前缀 spatial_alter_check。
 
@@ -20,6 +20,13 @@
 入口节点（alter / read）**之后**、五个 LLM agent 之前：那两个入口都是纯规则（不调模型、不花钱），
 先跑它们，停下来的记录里才带着句子与切片，事后能看到被滤掉的是哪一句。判不出来时一律放行
 （见 reality_gate）：闸门只拦明确判为 False 的，不拿「没问过模型」当「不是空间用法」。
+
+闸门判的**只是原句**（a 侧那个词，与改写句换上去的词无关），而一条语料展开出的每个候选状态
+都要过一遍——问的是逐字相同的一句原话。所以这一问在跑批前就按原句判完、去重（见
+reality_queries_alter / reality_queries_single 与 spatial_runner._prefill_reality）：
+节点仍在 alter 之后（拓扑与产物形状不动，改写未命中的记录照旧没有 reality 块），变的只是
+时间上一批原句先判完、节点按 message 读缓存（见 spatial_agents.RealityAgent.prefill）。
+实测一条语料能展开出 9~11 个候选，不去重就是几倍的调用。
 
 图内一律是"一对句子"（a 原句 / b 改写句），可一个原句能改出好几个待选句（见 spatial_tools.alter_sentence）：
 **有几个待选句就展开成几条记录**，每条记录仍是完整的一对句子，用 candidate 块标明是第几个待选句。
@@ -42,8 +49,8 @@ b 侧那份的 index 是照搬 a 侧的（改写只动了切片里那一个 toke
     1. 在本模块写一个 TypedDict 状态，继承 BaseState，只加这张图自己的字段；
     2. 写 build_xxx_graph(agents, writer)，用 agent_node 把需要的 agent 包成节点，
        用 StateGraph 接起来，最后 compile()；
-    3. 写 init_states(records, agents, output_file)、plan(records, agents) 与 serialize(state)，
-       以及 tally/counter_names；
+    3. 写 init_states(records, agents, output_file)、plan(records, agents)、
+       gate_queries(records, agents) 与 serialize(state)，以及 tally/counter_names；
     4. 在 GRAPHS 里登记一个 GraphSpec。跑批无需改动：spatial_runner.py --graph <名字>。
 
     不需要的 agent 别写进 needs：needs 里没有的名字根本不会被构造，
@@ -319,6 +326,47 @@ def single_init_states(records: list[dict], agents, output_file: str) -> list[di
     return [init_state(record, output_file) for record in records]
 
 
+def reality_queries_alter(records: list[dict], agents) -> list[tuple[str, dict | None]]:
+    """pair / alter_check 两张图会让 reality 闸门判哪些原句：[(原句, 关注词), ...]
+
+    与 alter_init_states 同源：用同一个纯函数（AlterAgent.expand）算出这条语料有没有待选句，
+    **有候选才产出**——没有候选的状态在 alter 节点就停下、经 save 收尾（见 route_after_alter），
+    闸门根本不会跑。照抄这个条件而不是「每条语料都判」，是为了让预填充与图真正发出的请求严格
+    一致：多判的那些既没人读，又白花钱（规则表为空时正好整批都是这样）。
+
+    一条语料展开出几个候选，就有几个状态过闸门，但它们问的是**逐字相同**的一句原话，所以这里
+    **逐候选各出一项**（与 alter_init_states 展开出的状态一一对应），去重交给 prefill——返回的
+    是「闸门总共会被问几次」，不是「有几个问题」；两个数都进跑批那行打印（见 _prefill_reality）。
+    """
+    alter = agents.need("alter")
+    queries: list[tuple[str, dict | None]] = []
+    for record in records:
+        sentence_slice = record.get("sentence") or []
+        if not isinstance(sentence_slice, list) or not sentence_slice:
+            continue  # bad_record：a 侧句子都拼不出来，闸门无从判起
+        focus_word = st.pick_focus_word(record)
+        candidates, _ = alter.expand(sentence_slice, focus_word or {})
+        if not candidates:
+            continue
+        sentence = st.join_slice(sentence_slice)  # 同一条语料只拼一次，几个候选共用同一份
+        queries.extend((sentence, focus_word) for _ in candidates)
+    return queries
+
+
+def reality_queries_single(records: list[dict], agents) -> list[tuple[str, dict | None]]:
+    """single 图会让 reality 闸门判哪些原句：这张图不改写，句子可用的记录都过闸门
+
+    与 route_after_read 同源：sentence 字段不可用的记录在 read 节点就停下，不进闸门。
+    """
+    queries: list[tuple[str, dict | None]] = []
+    for record in records:
+        sentence_slice = record.get("sentence") or []
+        if not isinstance(sentence_slice, list) or not sentence_slice:
+            continue
+        queries.append((st.join_slice(sentence_slice), st.pick_focus_word(record)))
+    return queries
+
+
 # --------------------------------------------------------------------------
 # 四、reality 闸门：三张图共用的第一道关卡
 # --------------------------------------------------------------------------
@@ -466,8 +514,9 @@ def alter_node(agent) -> Callable[[dict], dict]:
             }
 
         # 状态里没有（图被单独 invoke）就按 record 复算一次。这里不是「唯一入口」：
-        # 这一行与 init_state、alter_init_states、pair_plan、single_entry_node 是**五处并列**的
-        # 调用点（grep st.pick_focus_word 就能数全），口径之所以不会分叉，全靠它们都走同一个
+        # 这一行与 init_state、alter_init_states、pair_plan、single_entry_node、
+        # reality_queries_alter、reality_queries_single 是**七处并列**的调用点
+        # （grep st.pick_focus_word 就能数全），口径之所以不会分叉，全靠它们都走同一个
         # 纯函数 st.pick_focus_word(record)。改取词口径要改那个函数，别只改 init_state。
         focus_word = state.get("focus_word") or st.pick_focus_word(record)
         sentence_a = st.join_slice(sentence_slice)
@@ -937,7 +986,7 @@ class SingleSentenceState(BaseState):
     slice: list[str]
     sentence: str
     semantic: dict
-    """{is_fluent, reason, source}"""
+    """{is_fluent, grammar_ok, spatial_ok, reason, grammar_reason, spatial_reason, source}"""
     features: dict
     features_source: str
     schema: dict
@@ -1259,6 +1308,16 @@ class GraphSpec(NamedTuple):
     serialize: Callable[[dict], dict]
     plan: Callable[[list[dict], Any], list[str]]
     """这张图会让模型看到的全部句子，用于跑批前的 LTP 预填充"""
+    gate_queries: Callable[[list[dict], Any], list[tuple[str, dict | None]]]
+    """这张图会让 reality 闸门判哪些原句：[(原句, 关注词), ...]，跑批前预填充用
+
+    只列**会走到闸门**的记录（改写未命中的记录在 alter 节点就停了，闸门不跑）：预填充据此
+    先把去重后的原句一次判完，节点随后按 message 读缓存（见 spatial_agents.RealityAgent.prefill）。
+    图本身、serialize 与统计口径的形状都不因此改变。
+
+    列的是「闸门总共会被问几次」而不是「有几个问题」——一条语料的每个候选都会各过一遍闸门
+    （见 reality_queries_alter），去重交给 prefill，两个数都进跑批那行打印。
+    """
     counter_names: tuple[str, ...]
     """汇总里输出哪几组计数"""
     tally: Callable[[dict, dict], None]
@@ -1276,6 +1335,7 @@ GRAPHS: dict[str, GraphSpec] = {
         build=build_pair_graph,
         serialize=serialize_pair,
         plan=pair_plan,
+        gate_queries=reality_queries_alter,
         counter_names=(
             "status_counts",
             "reality_counts",
@@ -1298,6 +1358,7 @@ GRAPHS: dict[str, GraphSpec] = {
         build=build_single_graph,
         serialize=serialize_single,
         plan=single_plan,
+        gate_queries=reality_queries_single,
         counter_names=("status_counts", "reality_counts", "schema_sources", "focus_sources", "focus_kinds"),
         tally=single_tally,
     ),
@@ -1311,6 +1372,7 @@ GRAPHS: dict[str, GraphSpec] = {
         build=build_alter_check_graph,
         serialize=serialize_alter_check,
         plan=alter_check_plan,
+        gate_queries=reality_queries_alter,
         counter_names=(
             "status_counts",
             "reality_counts",
