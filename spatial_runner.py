@@ -56,9 +56,14 @@ message 缓存在各自的 agent 实例里（见 spatial_agents.CACHEABLE_SOURCE
 （键见 spatial_graphs.record_order_key），所以跑完之后两份输出（本图与 all_in_one.py 那边）
 顺序完全一致，可以逐行对账。中途 tail 到的仍是完成顺序——这是刻意保留的取舍。
 
+那份重排后的记录**顺手还导出一份同名 .csv**（成对信息：原句/替换句/图式/同义判断，供 Excel 看，
+列序见 spatial_tools.PAIR_CSV_COLUMNS），默认开启，--no-pairs-csv 可关。两份文件出自同一份排好序的
+记录，行序必然一致；只有 pair 图的记录有这些成对字段，换别的图本就不导，启动时会说明一句。
+
 用法：
     .venv/bin/python spatial_runner.py --limit 5                        # 跑前 5 条（pair 图，方位词）
     .venv/bin/python spatial_runner.py --limit 5 --no-llm               # 只跑纯规则与查表，不花钱
+    .venv/bin/python spatial_runner.py --limit 5 --no-pairs-csv         # 不导成对信息 csv（默认导）
     .venv/bin/python spatial_runner.py --workers 4 --limit 200          # 并发跑
     .venv/bin/python spatial_runner.py --graph single --limit 5         # 换一张图
     .venv/bin/python spatial_runner.py --list-graphs                    # 有哪些图可用
@@ -108,6 +113,7 @@ class ResultWriter:
 
     收尾（finish）会把文件按 (line_no, candidate.index) 重排（见 _sort_records）：
     并发下写进来的顺序是完成顺序，重排后才与 all_in_one.py 的输出同序、可逐行对账。
+    同一份排好序的记录再顺手导出一份同名 .csv（见 __init__ 的 csv_columns），行序与 jsonl 一致。
 
     统计口径由图决定（spatial_graphs.GraphSpec.counter_names / tally）：
     pair 图统计两侧的 schema 来源，单句图只有一句——写死成 pair 的形状会让单句图
@@ -123,6 +129,7 @@ class ResultWriter:
         corpus_type: str | None = None,
         config_tables: dict[str, str] | None = None,
         reality_prefill: dict | None = None,
+        csv_columns: tuple[tuple[str, str], ...] = (),
     ):
         self.corpus_type = corpus_type
         """本次跑批的语料类型；只写进汇总，不进记录（记录形状不随本次改动变）"""
@@ -142,6 +149,12 @@ class ResultWriter:
         模型往返数是花费的直接口径（缓存命中省下的那部分不在这里，单列 cache_hits）；
         没跑到的 agent（--no-llm、或图没走到）报全 0，不是漏记。
         """
+        self.csv_columns = tuple(csv_columns)
+        """成对记录拍平 csv 的列序（见 spatial_graphs.GraphSpec.csv_columns）；空 = 本次不导
+
+        由驱动按图与开关传入（--no-pairs-csv 关掉，非 pair 图本就传空）——writer 不认识图，
+        也不该认识，收尾只照这份列序把已排序的记录导成同名 .csv（见 finish）。
+        """
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.Lock()
@@ -159,7 +172,7 @@ class ResultWriter:
             if self.count % 10 == 0:
                 print(f"  已写出 {self.count} 条", flush=True)
 
-    def _sort_records(self) -> None:
+    def _sort_records(self) -> list[dict]:
         """把已落盘的 jsonl 按 (line_no, candidate.index) 重排（键见 sg.record_order_key）
 
         write() 是各 worker 在 save 节点并发追加（见模块 docstring），落盘顺序 = 完成顺序，
@@ -168,12 +181,16 @@ class ResultWriter:
 
         流式落盘照旧：跑的过程中文件仍是完成顺序，tail 得到进度；只收尾重排一次。
         先写临时文件再原子替换，重排途中被打断也不会把结果文件截断。
+
+        返回排好序的记录（没有文件或文件为空时返回空表）：收尾导 csv 就在这之后、直接拿这份
+        内存里的记录写（见 finish）——csv 的行序于是**必然**等于重排后 jsonl 的行序，不必再读一遍
+        文件，也不会有「两份文件次序不一致」的窗口。
         """
         if not self.path.exists():
-            return
+            return []
         records = st.read_jsonl(self.path)
         if not records:
-            return
+            return []
         if len(records) != self.count:
             # 条数对不上说明文件被中途截断或人工拼接改过；仍照常排，只当场说清楚
             print(f"警告：输出文件里有 {len(records)} 条，本次记录数为 {self.count}，请核对该文件")
@@ -182,9 +199,20 @@ class ResultWriter:
         st.write_jsonl(records, tmp)  # 复用唯一一份 jsonl 写法
         tmp.replace(self.path)  # Path.replace = os.replace，原子替换
         print(f"  输出已按 (line_no, candidate.index) 排序（{len(records)} 条）", flush=True)
+        return records
 
     def finish(self) -> dict:
-        self._sort_records()
+        records = self._sort_records()
+        csv_path = None
+        if self.csv_columns and records:
+            # 成对信息另导一份 csv 供 Excel 看（默认开；--no-pairs-csv 关）：拿刚排好的记录写，
+            # 于是 csv 行序与 jsonl 行序同一份来源（见 _sort_records）
+            csv_path = self.path.with_suffix(".csv")
+            total, judged = st.write_pairs_csv(records, csv_path, self.csv_columns)
+            print(
+                f"  成对信息 csv：{csv_path}（{total} 行，其中 {judged} 行有同义判断）",
+                flush=True,
+            )
         # corpus_type / config_tables 是这次跑批「读的是哪一组表」的唯一凭据：user message
         # 不落盘（记录里只有 node 与耗时），事后要复现或核对口径就得靠这两项
         provenance = {"corpus_type": self.corpus_type} if self.corpus_type else {}
@@ -196,6 +224,8 @@ class ResultWriter:
             provenance["agent_stats"] = self.agent_stats
         summary = {
             "output_file": str(self.path),
+            # csv 也是这次跑批的产物，与 output_file 并列记进汇总；没导（--no-pairs-csv 或非 pair 图）就不写
+            **({"csv_file": str(csv_path)} if csv_path else {}),
             **provenance,
             "count": self.count,
             "elapsed_seconds": round(time.time() - self.started_at, 1),
@@ -268,6 +298,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="feature_agent 用 deep agent（每类特征一个 subagent、主 agent 汇总）；"
         "默认是单次调用直接产出全部特征字段，一次省下约一个数量级的模型往返。"
         "deep 只在需要对照或单次调用抽得不好时开",
+    )
+    parser.add_argument(
+        "--no-pairs-csv",
+        action="store_true",
+        help="不把成对信息（原句/替换句/图式/同义判断）另导一份 csv。"
+        "默认**导出**到与结果 jsonl 同名、同目录的 .csv，行序与 jsonl 一致（收尾排序后同一份记录写就，"
+        "见 ResultWriter.finish），供 Excel 查看；列序见 spatial_tools.PAIR_CSV_COLUMNS。"
+        "只有 pair 图有这些成对字段，换别的图本就不导",
     )
     return parser.parse_args(argv)
 
@@ -468,6 +506,8 @@ def main(argv: list[str] | None = None) -> None:
         tally=spec.tally,
         corpus_type=corpus_type,
         config_tables=_config_tables(agents),
+        # 成对信息 csv：默认导出（--no-pairs-csv 关），列序由图给（只有 pair 图有）
+        csv_columns=spec.csv_columns if not args.no_pairs_csv else (),
     )
     graph = spec.build(agents, writer)
 
@@ -482,6 +522,13 @@ def main(argv: list[str] | None = None) -> None:
     # 关注词表推得出来吗：推不出来（筛选配置改名、取词表的前缀对不上）就该在这里报，
     # 而不是等每条记录都静默回落成 match_tree[0]
     print("关注词表：" + "；".join(f"{kind} {len(words)} 个" for kind, words in st.load_focus_vocab().items()))
+    if args.no_pairs_csv:
+        print("成对信息 csv：本次不导出（--no-pairs-csv）")
+    elif spec.csv_columns:
+        print(f"成对信息 csv：收尾导出到 {out_path.with_suffix('.csv')}（--no-pairs-csv 可关）")
+    else:
+        # 非 pair 图的记录里没有成对字段：默认开着也导不出东西，说清楚而不是静悄悄少一个产物
+        print(f"提示：本图（{spec.name}）的记录不是成对形状，没有可导出的成对列，本次不导 csv")
 
     if not args.no_llm:
         _prefill(records, agents, spec)

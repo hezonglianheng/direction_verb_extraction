@@ -15,9 +15,10 @@
    这两组目录下还各有一份 reality_agent 的提示语（reality.txt，见 CONFIG_PROMPT_FILES）：
    它的判据按词类分，与四张表同一套分组口径，路径与读法见 config_prompt_path /
    utils.read_prompt_path。
-2. 纯规则工具：切片改写 alter_sentence（一个原句按其同义词组产出多个待选句）、词组定位
+2. 纯规则工具：切片改写 alter_sentence（一个原句按命中的规则组产出多个待选句）、词组定位
    find_word_groups、schema 查表 lookup_schema（先按关注词收窄、再按语义特征匹配）、
-   判定查表 lookup_judgement、结果落盘 write_jsonl —— 不调 LLM，可脱离 agent 单独测试
+   判定查表 lookup_judgement、结果落盘 write_jsonl、成对记录拍平 write_pairs_csv —— 不调 LLM，
+   可脱离 agent 单独测试
    （.venv/bin/python spatial_tools.py）。收窄那一步的口径见 _narrowed_groups：一个词条能用
    words 声明它覆盖哪些关注词词形（外面/外边/外头 都归「外」这一类），schema 名仍用组名。
 3. 供 LLM agent 调用的 @tool：parse_sentence 提供分词/词性/依存句法证据，让模型基于
@@ -1523,6 +1524,70 @@ def read_jsonl(path: str | Path) -> list[dict]:
             if line.strip():
                 records.append(json.loads(line))
     return records
+
+
+PAIR_CSV_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("原句", "pair.a.sentence"),
+    ("替换句", "pair.b.sentence"),
+    ("关键词a", "focus_word.word"),
+    ("关键词b", "focus_word_b.word"),
+    ("a的图式", "schema.a.name"),
+    ("b的图式", "schema.b.name"),
+    ("是否同义", "judgement.same_meaning"),
+    ("判断理由", "judgement.reason"),
+    ("判断来源", "judgement.source"),
+    ("查表结果", "judgement.lookup"),
+    ("阶段", "stage"),
+)
+"""成对记录拍平 csv 的列序：表头 -> 记录里的点分路径（形状见 spatial_graphs.serialize_pair）
+
+真源就在这里：跑批收尾（spatial_runner.ResultWriter.finish）与独立的导出脚本
+（export_pairs_csv.py）都用这一份，改列只改这里。只有 pair 图画得成这张表——单句图与
+改写检查图的记录里没有 pair/judgement 两块（见 spatial_graphs.GraphSpec.csv_columns）。
+"""
+
+
+def _dig(record: dict, path: str, default: Any = "") -> Any:
+    """沿点分路径取值；路径上任一段缺失、为 None 或不是字典，就返回 default"""
+    cur = record
+    for key in path.split("."):
+        if not isinstance(cur, dict) or key not in cur or cur[key] is None:
+            return default
+        cur = cur[key]
+    return cur
+
+
+def _csv_cell(record: dict, path: str) -> str:
+    """把一个字段拍成 csv 单元格：布尔转「是/否」，其余原样转字符串，空值留空"""
+    value = _dig(record, path)
+    if isinstance(value, bool):
+        return "是" if value else "否"
+    return "" if value is None else str(value)
+
+
+def write_pairs_csv(
+    records: Iterable[dict], path: str | Path, columns: tuple[tuple[str, str], ...] = PAIR_CSV_COLUMNS
+) -> tuple[int, int]:
+    """把成对记录拍平成 csv，返回（总行数，其中有同义判断的行数）
+
+    只有走到 semantic_ok 的记录才有图式与同义判断（judgement 非空），其余记录
+    （not_spatial、semantic_failed_* 等）这两块是空的，对应格子留空；「阶段」列保留原始
+    stage 值，用来区分有没有判断——semantic_ok 即有判断，其余为空判断。
+
+    输出用 utf-8-sig（带 BOM）写：面向 Excel/记事本，与仓库读 csv 的口径一致
+    （见 load_judge_table 的注释与 utils.read_text 的说明）。
+    """
+    judged = 0
+    total = 0
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([header for header, _ in columns])
+        for record in records:
+            writer.writerow([_csv_cell(record, field) for _, field in columns])
+            total += 1
+            if _dig(record, "judgement.same_meaning", None) is not None:
+                judged += 1
+    return total, judged
 
 
 # --------------------------------------------------------------------------

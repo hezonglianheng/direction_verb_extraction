@@ -1343,6 +1343,12 @@ class GraphSpec(NamedTuple):
     """汇总里输出哪几组计数"""
     tally: Callable[[dict, dict], None]
     """每写一条记录，往 counters 里累加"""
+    csv_columns: tuple[tuple[str, str], ...] = ()
+    """这张图的记录拍平成 csv 的列序（表头 -> 点分路径，见 st.write_pairs_csv）；空 = 不导出
+
+    成对字段只有 pair 图有（见 serialize_pair 与 st.PAIR_CSV_COLUMNS）；单句图与改写检查图的
+    记录里没有 pair/judgement 两块，照着成对列序导只会得到一排空格子，所以留空、由驱动跳过。
+    """
 
 
 GRAPHS: dict[str, GraphSpec] = {
@@ -1368,6 +1374,7 @@ GRAPHS: dict[str, GraphSpec] = {
             "replacement_kinds",
         ),
         tally=pair_tally,
+        csv_columns=st.PAIR_CSV_COLUMNS,
     ),
     "single": GraphSpec(
         name="single",
