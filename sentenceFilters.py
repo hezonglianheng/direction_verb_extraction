@@ -805,7 +805,7 @@ if __name__ == "__main__":
     # 注意：路径基于 __file__ 解析，与运行时 cwd 无关（旧写法用 Windows 反斜杠，在 Linux 下必然失败）
     config_dir = Path(__file__).resolve().parent / "config_files"
     direction_config = config_dir / "direction_expressions.json5"
-    locality_config = config_dir / "locality_expressions.json5"
+    locality_config = config_dir / "localization_expressions.json5"
     failures: list[str] = []
 
     def check(desc: str, condition: bool) -> None:
@@ -881,6 +881,42 @@ if __name__ == "__main__":
         "_link": {"m": {"_syntax": "ATT", "_pos": ["n", "r"]}},
     })
     check("多值 _pos 可用（我们之间 = 代词 + 方位词）", multi_pos.judge("我们之间没有秘密。"))
+
+    # ---- 6. 方位词后缀切分 ----
+    # 该路线默认关闭（config.LOCATIVE_SPLIT_ENABLED = False），这里临时打开验证。
+    # 开关在 _correct_splits 内每次调用时读取，所以运行期改 config 即可生效，不必重建缓存；
+    # 也正因此，下面必须用尚未进过缓存的句子，否则会直接命中关闭时算出的旧结果。
+    print("方位词后缀切分：")
+    config.LOCATIVE_SPLIT_ENABLED = True
+    try:
+        s_cut = "小鸟站在树上。"
+        words = cache.get_task_value(s_cut, config.CWS)
+        pos_tags = cache.get_task_value(s_cut, config.POS)
+        dep = cache.get_task_value(s_cut, config.DEP)
+        check(f"树上 被切开（{words}）", "树上" not in words and "树" in words and "上" in words)
+        check("切分不改变字符序列", "".join(words) == s_cut)
+        # dep/sdp 的 head/label 与词表逐位对齐（长度都等于词数，根节点用 head == 0 表示）
+        check("pos/dep 长度与新分词对齐",
+              len(pos_tags) == len(words) and len(dep["head"]) == len(words))
+
+        check("东西 不被误切", "东西" in cache.get_task_value("他买了一个东西。", config.CWS))
+        check("下午(nt) 不被切", "下午" in cache.get_task_value("下午我们接着开会。", config.CWS))
+
+        # 一长一短两句同批进 rerun：LTP 对批内 padding 过的句子会多吐末尾一格，
+        # 少了消费侧的截断，短的那句四个任务长度就会不一致（规则引擎随后会取 words[idx] 越界）。
+        # 单句测不出这个——padding 只在批内长度不齐时出现，所以必须成对喂、且两句都要被切。
+        pair = ["他站在门外。", "他把画挂在墙上。"]
+        cache.prefill(pair)
+        for sentence in pair:
+            lengths = [
+                len(cache.get_task_value(sentence, config.CWS)),
+                len(cache.get_task_value(sentence, config.POS)),
+                len(cache.get_task_value(sentence, config.DEP)["head"]),
+                len(cache.get_task_value(sentence, config.SDP)["head"]),
+            ]
+            check(f"长短批里四个任务长度一致（{sentence}）", len(set(lengths)) == 1)
+    finally:
+        config.LOCATIVE_SPLIT_ENABLED = False
 
     print()
     if failures:

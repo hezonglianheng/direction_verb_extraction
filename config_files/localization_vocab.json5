@@ -1,4 +1,4 @@
-// 方位词词表（供 config_files/locality_expressions.json5 用 "_vocab_file" 引用）
+// 方位词词表（供 config_files/localization_expressions.json5 用 "_vocab_file" 引用）
 //
 // 说明：
 // 1. 这里的词是「CWS 分词之后需要精确匹配的词」，所以单字与多字形式都要逐一列出
