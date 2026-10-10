@@ -7,7 +7,7 @@
                     引申用法（会上/理论上）、时间用法（三天内）、时体与结果用法
                     （笑起来/看出来）、比喻用法（走出困境）都不再往下跑。
     alter_agent     输入切片（list[str]）与关注词（dict，含 index/word/kind），按 index 定位
-                    该词，用规则表里包含它的同义词组中其他词逐一替换，产出一批待选句
+                    该词，用规则表里收它的那组 words 对应的 replacements 逐一替换，产出一批待选句
                     （一个词能换几个词就有几个）。纯规则、不调 LLM（实现在 spatial_tools.alter_sentence）。
     semantic_agent  输入一个句子，分别判断语法是否通顺（grammar_ok）与空间语义是否异常
                     （spatial_ok）：两项在同一次调用里给出、各带一段理由，合出来的
@@ -277,7 +277,7 @@ _FOCUS_TAIL = {
     # 角色 -> 第二行（以哪个词为准、要判什么）。提示语里那些「紧接着的下一行」就指着它
     FOCUS_ROLE_RECORD: (
         "它是这条语料按筛选规则提取出来的词；本句若经过同义词替换，"
-        "该位置上的词已换成同义词组里的另一个，一律以句子中实际的用词为准。"
+        "该位置上的词已换成规则表里的另一个词，一律以句子中实际的用词为准。"
     ),
     FOCUS_ROLE_ORIGINAL: (
         "它是本次改写在原句里替换掉的那个词，本次要判的就是把它换成改写句里那个词之后"
@@ -1069,10 +1069,14 @@ class RealityAgent(BaseAgent):
 
 
 class AlterAgent(BaseAgent):
-    """按 index 定位切片中的关注词，用同义词组里的其他词逐一替换，得到一批待选句。
+    """按 index 定位切片中的关注词，用规则表里各组的 replacements 逐一替换，得到一批待选句。
+
+    规则表每组形如 {"words": [...], "replacements": [...]}：关注词落在某组的 words 里，
+    就用该组的 replacements 替换（排除关注词本身），见 spatial_tools.alter_sentence。
 
     纯规则，不调 LLM。rules 可由构造参数注入，于是同一个类能按不同规则表建多份供对照实验
-    （spatial_runner.py --alter-rules 走的就是这条路）。
+    （spatial_runner.py --alter-rules 走的就是这条路）。构造时按 st.validate_alter_rules 校验，
+    填错当场抛错。
 
     规则表按语料类型取：config_files/<类型目录>/alter_rules.json5（见 st.config_path），
     由 --corpus-type 决定、构造期注入。不给 --alter-rules 时读的就是本组那张表；
@@ -1097,6 +1101,9 @@ class AlterAgent(BaseAgent):
         else:
             self.table_path = str(rules_path or st.config_path("alter_rules", self.corpus_type))
             self.rules = st.load_alter_rules(self.table_path)
+        # 表填错要在构造 agent（启动）时当场报，不能等跑到某条记录才吞掉——两条分支都走这里，
+        # 默认读表、--alter-rules 注入、verify 注入规则一并覆盖（见 st.validate_alter_rules）。
+        st.validate_alter_rules(self.rules, source=self.table_path)
 
     @property
     def rules_path(self) -> str:
@@ -1119,7 +1126,7 @@ class AlterAgent(BaseAgent):
         每项形如：
             {"candidate_index": 0, "candidate_total": 2, "word": "上", "span": [1, 2],
              "slice": [...], "sentence": "在硬件中说…", "replacement": "中",
-             "source": "groups[0]", "group": ["上", "中", "里"]}
+             "source": "groups[0]", "group": ["上", "中", "里"]}   # group 是该组的 words 命中集
         跑批前的展开（spatial_graphs.alter_init_states）、节点里取自己那一条、预填充清点句子
         三处都走本方法，保证"这条语料展开成几个待选句"与"记录里选中的是哪个候选"不会对不上。
 
@@ -1162,7 +1169,7 @@ class AlterAgent(BaseAgent):
         return {
             "table": "alter_rules",
             "path": self.rules_path,
-            "summary": f"{len(groups)} 组同义词",
+            "summary": f"{len(groups)} 组替换规则",
             "empty": not groups,
             "missing": _table_missing(self.table_path),
             "warnings": [],
@@ -1892,7 +1899,9 @@ def main(argv: list[str] | None = None) -> None:
     print(f"  reality（趋向动词那一组提示语）：{RealityAgent(llm=False, corpus_type='direction').describe()}")
     # 用注入的规则表演示多待选句：默认那张表读的是 config_files/localization/alter_rules.json5，
     # 本地已填内容，跑它验不出空表行为——要验空表看下面 injects 空 dict 那次
-    alter = AlterAgent(rules={"groups": [["上", "中", "里"]]})
+    alter = AlterAgent(
+        rules={"groups": [{"words": ["上", "中", "里"], "replacements": ["上", "中", "里"]}]}
+    )
     candidates, _ = alter.expand(demo_slice, demo_focus)  # expand 返回 (待选句列表, detail)
     for candidate in candidates:
         print(f"  alter：{candidate['sentence']}（{candidate['replacement']}，来自 {candidate['source']}）")

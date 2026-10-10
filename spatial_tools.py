@@ -231,8 +231,14 @@ def _table_path(path: str | Path | None, table: str, corpus_type: str | None) ->
 def load_alter_rules(path: str | Path | None = None, *, corpus_type: str | None = None) -> dict:
     """读替换规则表，文件不存在时返回空表（等价于“不改写”）
 
-    表形如 {"groups": [["上", "中", "里"], ["前", "后"]]}：一串同义词组，
-    组内任意一个词都能换成组内其他词。
+    表形如 {"groups": [{"words": ["上", "中", "里"], "replacements": ["中", "里"]}, ...]}：
+    groups 是一串组，每组是一个对象，两个字段各管一件事——
+
+    - words：命中这一组的关注词（关注词是其中之一，本组的规则才生效）；
+    - replacements：要换成的词，逐个替换原句 index 处的 token，**排除关注词本身**。
+
+    一个词可以出现在多组里，各组产出的替换词并集去重（先出现的组优先）。
+    表填得不对由 validate_alter_rules 在构造 agent 时当场报（见 AlterAgent）。
 
     Args:
         path (str | Path | None): 显式表路径；None 时按 corpus_type 解析
@@ -671,7 +677,7 @@ def focus_kind(
 
 
 def _focus_entry(node: dict, source: str, filter_methods: Iterable[str], vocab: dict[str, set[str]]) -> dict:
-    """把节点收成向下传的那三样：index、词本身、类别（刻意不带 children 与同义词组）"""
+    """把节点收成向下传的那三样：index、词本身、类别（刻意不带 children 与规则组信息）"""
     word = node.get("word")
     return {
         "index": node.get("index"),
@@ -773,7 +779,7 @@ def replacement_focus_word(
     schema 才会收窄到替换词所属的词条（见 _narrowed_groups），判定表里按两组名字写的格子
     （如 上12 × 里1）才对得上；两侧共用一个词的话，b 侧会收窄回原词那一组，判定退化成同组自比。
 
-    index 照搬 a 侧：改写只把切片里 index 处的那个 token 换成同义词组里的另一个（见 alter_sentence），
+    index 照搬 a 侧：改写只把切片里 index 处的那个 token 换成规则表里给的替换词（见 alter_sentence），
     改出来的候选切片长度与其余 token 都没动过，**改写句存在状态里的那份切片**（slice_b）在该下标
     处确实是替换词（实测 5310/5310）。但这个下标说的是原句的分词，不是改写句的：模型手上只有改写句
     字符串，它会自己去 parse_sentence，而重新分词在替换点附近可能并词（下+移 并成「下移」，
@@ -806,19 +812,36 @@ def replacement_focus_word(
 # --------------------------------------------------------------------------
 
 
-def find_word_groups(word: str, rules: dict | None = None) -> list[dict]:
-    """查出规则表里所有包含该词的词组（“待替换的词落在哪些组里”）
+ALTER_WORDS_KEY = "words"
+"""组里声明「哪些关注词命中这一组」的键（与 ALTER_REPLACEMENTS_KEY 同级，两个都必写）"""
+ALTER_REPLACEMENTS_KEY = "replacements"
+"""组里声明「要换成哪些词」的键；生成候选时排除关注词本身（见 alter_sentence）"""
 
-    规则表的 groups 是一串同义词组，组内任意词都能换成组内其他词，所以先要定位待替换词所在的组。
-    返回每组的出处与词表，形如 [{"source": "groups[0]", "group": ["上", "中", "里"]}]。
-    同一个词出现在多组里时全部返回，调用方把各组里的其他词并起来用。
+
+def find_word_groups(word: str, rules: dict | None = None) -> list[dict]:
+    """查出规则表里所有**收这个词**的组（“待替换的词命中哪些组”）
+
+    规则表的 groups 是一串组，每组 {"words": [...], "replacements": [...]}：关注词落在 words 里
+    就命中这一组，按该组的 replacements 替换（见 alter_sentence）。返回每组的出处与两个字段，
+    形如 [{"source": "groups[0]", "words": ["上", "中", "里"], "replacements": ["中", "里"]}]。
+    同一个词出现在多组里时全部返回，调用方把各组的替换词并起来用。
     """
     rules = load_alter_rules() if rules is None else rules
     found: list[dict] = []
     for index, group in enumerate(rules.get("groups") or []):
-        words = [w for w in group if isinstance(w, str)] if isinstance(group, list) else []
+        if not isinstance(group, dict):
+            continue
+        words = [w for w in group.get(ALTER_WORDS_KEY) or [] if isinstance(w, str)]
         if word in words:
-            found.append({"source": f"groups[{index}]", "group": words})
+            found.append(
+                {
+                    "source": f"groups[{index}]",
+                    ALTER_WORDS_KEY: words,
+                    ALTER_REPLACEMENTS_KEY: [
+                        w for w in group.get(ALTER_REPLACEMENTS_KEY) or [] if isinstance(w, str)
+                    ],
+                }
+            )
     return found
 
 
@@ -831,11 +854,13 @@ def alter_sentence(
 
     纯规则实现，不调用 LLM。替换词来源按优先级：
         1. word_info["replacement"]（调用方直接指定，便于按需组织不同改写）：只出一个待选句
-        2. 规则表里包含该词的所有词组中，除该词以外的其他词：每个词各出一个待选句
-    因为一组同义词往往能换好几个词，所以返回的是**候选切片的列表的列表**：
+        2. 规则表里收该词的所有组（见 find_word_groups）的 replacements，**排除该词本身**：
+           每个词各出一个待选句
+    因为一组往往能换好几个词，所以返回的是**候选切片的列表的列表**：
     一个候选切片对应一个待选句，空列表表示没命中任何替换词。
 
-    detail["candidates"] 与返回的切片按下标一一对应，写明每个候选的替换词与它出自哪个词组。
+    detail["candidates"] 与返回的切片按下标一一对应，写明每个候选的替换词与它出自哪个组
+    （source 是 groups[i]，group 是该组的 words 命中集，供留档核对）。
 
     图里传进来的 word_info 是**关注词**（见 pick_focus_word）：含 index / word / kind，
     **不含 children**。因此 detail["span"] 通常只有它自己那一个下标——旧口径传的是 match_tree
@@ -883,19 +908,20 @@ def alter_sentence(
     else:
         seen: set[str] = set()
         for found in find_word_groups(original, rules):
-            for word in found["group"]:
-                # 组里的原词自己不算替换词；同一个替换词出现在多组里时只取先出现的那组
+            for word in found["replacements"]:
+                # 关注词本身不算替换词；同一个替换词出现在多组里时只取先出现的那组
                 if word == original or word in seen:
                     continue
                 seen.add(word)
                 candidates.append(
-                    {"replacement": word, "source": found["source"], "group": found["group"]}
+                    {"replacement": word, "source": found["source"], "group": found["words"]}
                 )
 
     if not candidates:
         # 不点名具体路径：默认那张表不存在，调用方也可能用 --alter-rules 换了别的表
         detail["reason"] = (
-            f"替换规则表里没有包含 {original!r} 的词组，请在本次使用的规则表里补上该组"
+            f"替换规则表里没有收录 {original!r} 或它没有可用替换词的组，"
+            f"请在本次使用的规则表里补上该组"
         )
         return [], detail
 
@@ -1142,6 +1168,78 @@ def is_schema_name(name: str, word: str = "") -> bool:
     if not word:
         return True
     return name.startswith(word) and name[len(word) :].isdigit()
+
+
+def _validate_rule_words(where: str, field: str, listed: Any) -> None:
+    """校验一个组的某个词表字段（words / replacements）
+
+    空列表与「写了等于没写」同属配置问题，一并当场报出来（口径同 _validate_group_words）：
+    words 空则没人命中这一组，replacements 空则命中也没词可换，这一组都是白写。
+    """
+    if not isinstance(listed, (list, tuple)):
+        raise ValueError(f"{where} 的 {field} 要写成词列表，实际是 {listed!r}")
+    if not listed:
+        raise ValueError(f"{where} 的 {field} 是空列表，这一组永远用不上，请填词或删掉这一组")
+    seen: set[str] = set()
+    for word in listed:
+        if not isinstance(word, str) or not word or any(ch.isspace() for ch in word):
+            raise ValueError(
+                f"{where} 的 {field} 里每一项都要是非空且不含空白的字符串，实际有 {word!r}"
+            )
+        if word in seen:
+            raise ValueError(f"{where} 的 {field} 里有重复词 {word!r}")
+
+
+def validate_alter_rules(table: dict, *, source: str | None = None) -> None:
+    """校验替换规则表填得能用；写错当场抛 ValueError
+
+    与 validate_schema_table 同一口径：表填错属于配置问题，应该在构造 agent（启动）时就报，
+    而不是等跑到某条记录才吞掉、把错误混进结果里。
+
+    校验项：
+    1. 顶层是对象，形如 {"groups": [...]}；groups 缺失/None/空都合法（等价空表，走既有降级）。
+    2. 每个组是对象，且**恰好**有 words 与 replacements 两个键（见 ALTER_WORDS_KEY /
+       ALTER_REPLACEMENTS_KEY）——多写一个键没人读，少写一个这一组必有一头落空，都当场报。
+    3. 两个字段都是非空词列表，每项非空、不含空白、组内不重复（见 _validate_rule_words）。
+    4. 组写成词表数组（旧版扁平写法）时单独给一条带迁移提示的错：旧写法早就不认了，
+       只有说清「要改成什么」才不至于让人对着报错猜。
+
+    words 与 replacements 一样是「写错了不报错、只是静默失效」的那类配置
+    （词形写错就永远当不成关注词 / 永远换不出去），所以全部在这里挡住。
+
+    Args:
+        table (dict): 待校验的替换规则表
+        source (str | None): 这张表的路径，只用于报错信息
+    """
+    if not isinstance(table, dict):
+        raise ValueError('替换规则表必须是一个对象，形如 {"groups": [...]}')
+    groups = table.get("groups") or []
+    if not isinstance(groups, (list, tuple)):
+        raise ValueError('替换规则表的 groups 要写成列表，形如 {"groups": [{"words": [...], "replacements": [...]}]}')
+    for index, group in enumerate(groups):
+        where = f"groups[{index}]"
+        if isinstance(group, (list, tuple)):
+            raise ValueError(
+                f"{where} 是旧版扁平词组 {list(group)!r}；新版每组要写成对象，"
+                f'形如 {{"words": ["上", "中", "里"], "replacements": ["中", "里"]}}'
+            )
+        if not isinstance(group, dict):
+            raise ValueError(
+                f'{where} 要写成对象，形如 {{"words": ["上", "中", "里"], "replacements": ["中", "里"]}}'
+            )
+        extra = [key for key in group if key not in (ALTER_WORDS_KEY, ALTER_REPLACEMENTS_KEY)]
+        if extra:
+            raise ValueError(
+                f"{where} 只能有 {ALTER_WORDS_KEY} 与 {ALTER_REPLACEMENTS_KEY} 两个键，"
+                f"多了 {'、'.join(map(repr, extra))}（没人读）"
+            )
+        for field in (ALTER_WORDS_KEY, ALTER_REPLACEMENTS_KEY):
+            if field not in group:
+                raise ValueError(
+                    f"{where} 少了 {field} 键：{ALTER_WORDS_KEY} 定哪些关注词命中、"
+                    f"{ALTER_REPLACEMENTS_KEY} 定换成什么"
+                )
+            _validate_rule_words(where, field, group[field])
 
 
 def validate_schema_table(
@@ -1519,7 +1617,12 @@ if __name__ == "__main__":
     # 纯规则部分的冒烟测试：不调 LLM，也不需要 GPU
     demo_slice = ["在", "硬件", "上", "说", ",", "它", "将", "涉及", "到", "参数", "设置", "。"]
     demo_info = {"index": 2, "word": "上", "children": [{"index": 1, "word": "硬件"}]}
-    demo_rules = {"groups": [["上", "中", "里"], ["前", "后"]]}
+    demo_rules = {
+        "groups": [
+            {"words": ["上", "中", "里"], "replacements": ["上", "中", "里"]},
+            {"words": ["前", "后"], "replacements": ["前", "后"]},
+        ]
+    }
 
     # 关注词：两份词表 + 三级回落（sampled_word -> 按词表 walk match_tree -> match_tree[0]）
     print(f"关注词表：{ {kind: len(words) for kind, words in load_focus_vocab().items()} }")
@@ -1556,8 +1659,8 @@ if __name__ == "__main__":
           f"direction 规则 {focus_kind('上', ['direction_verb_as_center'])}")
 
     print(f"原句: {join_slice(demo_slice)}")
-    print(f"含「上」的词组: {json.dumps(find_word_groups('上', demo_rules), ensure_ascii=False)}")
-    print(f"含「里面」的词组: {find_word_groups('里面', demo_rules)}")
+    print(f"收「上」的组: {json.dumps(find_word_groups('上', demo_rules), ensure_ascii=False)}")
+    print(f"收「里面」的组: {find_word_groups('里面', demo_rules)}")
 
     new_slices, detail = alter_sentence(demo_slice, demo_info, demo_rules)
     print(f"待选句 {len(new_slices)} 个：")

@@ -884,7 +884,7 @@ def _tally_focus(record: dict, counters: dict[str, Counter]) -> None:
     """汇总里记一笔关注词的口径：取到的是哪一级（sampled_word/vocab/match_tree）、属哪一类
 
     这两组计数是排查「这一轮跑的口径对不对」的第一现场：source 全是 match_tree 就说明词表没推出来；
-    kind 里趋向动词占比高时，alter_missed 多多半是替换规则表里还没有趋向动词的同义词组
+    kind 里趋向动词占比高时，alter_missed 多多半是替换规则表里还没有收趋向动词的组
     （规则表缺内容是配置问题，代码不兜底，见 spatial_tools.alter_sentence）。
 
     这里记的是 **a 侧**（原句）的关注词；改写句那侧（替换词）另有一组，见 _tally_replacement。

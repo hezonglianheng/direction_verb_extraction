@@ -43,7 +43,7 @@ message 缓存在各自的 agent 实例里（见 spatial_agents.CACHEABLE_SOURCE
 分词结果上（b 侧是照搬 a 侧的），消息里对 b 侧的措辞已交代不要拿它去数改写句的分词行
 （改写句要重新分词，替换点可能并词，见 spatial_agents.FOCUS_INDEX_NOTE_ALTER）。
 
-一条语料里的方位词往往能换成同义词组里的好几个词（见 spatial_tools.alter_sentence），
+一条语料里的方位词往往能换成规则表里好几个替换词（见 spatial_tools.alter_sentence），
 所以跑批时会先把它展开成多个待选句、每个待选句一个状态：**一条语料通常产出多条记录**，
 记录里的 candidate 块（index/total/word/replacement/group）标明这是第几个待选句。
 --limit / --offset 仍按语料条数算，不按展开后的状态数算。
@@ -342,7 +342,7 @@ def _print_config_tables(agents) -> None:
         # 那文件不空、summary 里也有标签数，印「为空」会与同一行自相矛盾
         print(f"      {level}：{report['table']} 没有已填内容 —— {report['degrade']}")
         if report["table"] == "alter_rules":
-            print(f"            请把同义词组填进 {report['path']}，或用 --alter-rules <路径> 指定另一张表")
+            print(f"            请把替换规则组填进 {report['path']}，或用 --alter-rules <路径> 指定另一张表")
 
 
 def _print_agent_stats(stats: dict[str, dict]) -> None:
