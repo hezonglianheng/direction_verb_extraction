@@ -24,10 +24,14 @@
 3. 供 LLM agent 调用的 @tool：parse_sentence 提供分词/词性/依存句法证据，让模型基于
    结构判断而不是仅凭语感。
 
-另有一处贯穿全流程的口径：**本次需要重点关注的词**（pick_focus_word）。一条语料是为哪个
-方位词/趋向动词抽出来的，改写与五个 LLM agent 都要知道，逐级向下传的只有三样——index、
-词本身、属方位词还是趋向动词。取词口径见 pick_focus_word；词表真源是两张筛选配置，
+另有一处贯穿全流程的口径：**本次需要重点关注的词**（pick_focus_word / pick_focus_words）。
+一条语料是为哪个方位词/趋向动词抽出来的，改写与五个 LLM agent 都要知道，逐级向下传的只有
+三样——index、词本身、属方位词还是趋向动词。取词口径见这两个函数；词表真源是两张筛选配置，
 与抽样（word_sampler.py）共用同一个 derive_vocab。
+
+句内**每个**目标词位置都要参与改写（见 pick_focus_words）：一句「他从山上掉到山谷里」里
+「上」与「里」各出一个位置，改写时逐位置各出一批待选句，但**一条记录仍只改一个位置**——
+所以 pick_focus_word（= pick_focus_words 的首元素）仍是下游读的那个单值关注词。
 
 一对句子里的两侧各有各的关注词：a 侧（原句）看的是记录里那个词，b 侧（改写句）看的是规则表
 换上去的那个词（见 replacement_focus_word，来源记 FOCUS_SOURCE_ALTER）。所以 b 侧的 schema
@@ -691,6 +695,9 @@ def _focus_entry(node: dict, source: str, filter_methods: Iterable[str], vocab: 
 def pick_focus_word(record: dict, vocab: dict[str, set[str]] | None = None) -> dict | None:
     """这条语料「本次需要重点关注的词」——改写与五个 LLM agent 共用的一处口径
 
+    这就是 pick_focus_words 的首元素：本函数只回答"先改哪个"，"句里还有哪些位置要改"
+    见 pick_focus_words（改写逐位置展开，一条记录仍只改一个位置）。
+
     三级回落，取到的是哪一级记在返回值的 source 里：
 
     1. "sampled_word"：语料经 word_sampler.py 抽样而带上的字段，有就直接用。
@@ -734,32 +741,75 @@ def pick_focus_word(record: dict, vocab: dict[str, set[str]] | None = None) -> d
         dict | None: {"index", "word", "kind", "source"}；记录没有 match_tree 时返回 None。
             kind 取 "方位词" / "趋向动词" / ""（判不出来就是空串，不猜）。
     """
+    entries = pick_focus_words(record, vocab)
+    return entries[0] if entries else None
+
+
+def pick_focus_words(record: dict, vocab: dict[str, set[str]] | None = None) -> list[dict]:
+    """这条语料里**全部**要参与改写的词，按"先改哪个"的优先序排列
+
+    与 pick_focus_word 是同一个口径的两种读法：本函数返回全部位置（一条语料里每个目标词
+    各是一个位置，改写时逐位置各出一批候选），pick_focus_word 就是本函数的首元素
+    ——`pick_focus_words(r)[0] == pick_focus_word(r)` 对任何记录都成立，所以老调用点的
+    行为一字不变（含 --candidate-index 0）。
+
+    取词的三个来源（写进每一份返回值的 source 里）与逐级收窄的取舍见 pick_focus_word 的
+    docstring；这里只说与"选一个"不同的两处：
+
+    ① **两道收窄一个过滤、一个排序**，别把它们看成同一类：
+       - 族收窄（_record_family）是**硬过滤**：`上面` 被 _complement 规则当补语收进趋向动词
+         记录的 children 时，它不是这条记录的目标词（见 word_sampler.target_nodes 的第 1 条
+         约束），因此不展开——展开等于替一个"从未按它筛出"的词造样本。本族一个都没命中时
+         退回并集（纯防御，实测触发 0 次），与取一个时一致。
+       - 补语位偏好是**排序**：只在趋向动词族生效，把"排在父节点之后"的位置挪到前面。
+         排序而不是过滤，是为了让动词前面那个位置也照样被替换（取一个时它会被丢掉，这正是
+         本函数要修的东西）；排序后首元素仍是"index 最小的补语位节点"，与取一个时逐字一致。
+    ② **sampled_word 命中的位置排在最前，且不参与族收窄**：抽样记录就是为那个词抽出来的，
+       今天它在该级直接返回、绕过了族收窄；保留这个语义才能保住首元素不变。同一句里其余
+       本族目标词追加在它后面。
+
+    Args:
+        record (dict): 语料记录，需含 match_tree
+        vocab (dict[str, set[str]] | None): 两份词表，默认取 load_focus_vocab()
+
+    Returns:
+        list[dict]: [{"index", "word", "kind", "source"}, ...]，按改写顺序；
+            记录没有可用的 match_tree 时返回空表（不猜）。
+    """
     vocab = load_focus_vocab() if vocab is None else vocab
     filter_methods = record.get("filter_methods") or []
     nodes = word_sampler.target_nodes(record, set().union(*vocab.values()) if vocab else set())
 
     sampled = record.get("sampled_word")
+    matched: list[dict] = []
     if isinstance(sampled, str) and sampled:
         matched = [node for node in nodes if node["word"] == sampled]
-        if matched:
-            return _focus_entry(matched[0], "sampled_word", filter_methods, vocab)
+
+    matched_indices = {node["index"] for node in matched}
+    rest = [node for node in nodes if node["index"] not in matched_indices]
 
     family = _record_family(filter_methods)
     if family and family in vocab:
-        preferred = [node for node in nodes if node["word"] in vocab[family]]
-        nodes = preferred or nodes
-    if len(nodes) > 1 and family == "趋向动词":
-        # 方向补语跟在搭配动词之后：本族候选里优先排在父节点之后的那个（口径见 pre_head_indices）。
+        preferred = [node for node in rest if node["word"] in vocab[family]]
+        rest = preferred or rest
+    if len(rest) > 1 and family == "趋向动词":
+        # 方向补语跟在搭配动词之后：本族候选里把排在父节点之后的挪到前面（口径见 pre_head_indices）。
         # 只在本族生效——方位词的候选多是规则树的根，这条偏好对它们没有意义。
-        after = [node for node in nodes if node["index"] not in word_sampler.pre_head_indices(record)]
-        nodes = after or nodes
-    if nodes:
-        return _focus_entry(nodes[0], "vocab", filter_methods, vocab)
+        # 稳定分区：段内仍按 index 升序，故首元素仍是"index 最小的补语位节点"。
+        before = word_sampler.pre_head_indices(record)
+        after_nodes = [node for node in rest if node["index"] not in before]
+        if after_nodes:
+            rest = after_nodes + [node for node in rest if node["index"] in before]
+
+    entries = [_focus_entry(node, "sampled_word", filter_methods, vocab) for node in matched]
+    entries += [_focus_entry(node, "vocab", filter_methods, vocab) for node in rest]
+    if entries:
+        return entries
 
     node = pick_word_info(record)
     if node is None:
-        return None
-    return _focus_entry(node, "match_tree", filter_methods, vocab)
+        return []
+    return [_focus_entry(node, "match_tree", filter_methods, vocab)]
 
 
 FOCUS_SOURCE_ALTER = "alter"
@@ -1530,6 +1580,7 @@ PAIR_CSV_COLUMNS: tuple[tuple[str, str], ...] = (
     ("原句", "pair.a.sentence"),
     ("替换句", "pair.b.sentence"),
     ("关键词a", "focus_word.word"),
+    ("关键词下标a", "focus_word.index"),
     ("关键词b", "focus_word_b.word"),
     ("a的图式", "schema.a.name"),
     ("b的图式", "schema.b.name"),

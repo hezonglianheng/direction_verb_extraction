@@ -140,7 +140,8 @@ def target_nodes(record: dict, vocab: set[str]) -> list[dict]:
     *_complement 规则的搭配动词在根上、趋向动词在子节点里（见模块 docstring）。
 
     返回的是节点（[{"index": i, "word": w}, ...]）而不是词，因为同一个词可能出现在多个
-    index 上，调用方（spatial_tools.pick_focus_word）要拿这个 index 去定位句子里的词；
+    index 上，调用方（spatial_tools.pick_focus_words）要拿这个 index 去定位句子里的词——
+    句内每个目标词位置各是一个位置，取词与改写都逐位置走；
     只关心有哪些词时用 target_words。
 
     两条约束：
@@ -195,8 +196,9 @@ def pre_head_indices(record: dict) -> set[int]:
     """match_tree 里「排在父节点之前」的子节点下标
 
     与 target_nodes 是两个不同的问题：target_nodes 问「哪些节点是词表里的目标词」，
-    这里问「这个节点在树里排在它的父节点前还是后」。服务于 spatial_tools.pick_focus_word
-    的候选排序（同一句话里有多个目标词时该取哪个）。
+    这里问「这个节点在树里排在它的父节点前还是后」。服务于 spatial_tools.pick_focus_words
+    的位置排序：把补语位（排在父节点之后）排到前面，于是首元素（= pick_focus_word）仍是
+    「index 最小的补语位节点」，而排在动词前的那个位置也照旧留在位置表里参与改写。
 
     *_complement 规则把搭配动词当根、把它满足的各个 link 条件当子节点，而其中的方向补语在
     汉语里一律跟在动词之后；被 has_locative_complement 收进来的另一个词却可以在动词之前。

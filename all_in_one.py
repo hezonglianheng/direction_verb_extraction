@@ -2,8 +2,8 @@
 
 """把 pair 图六步链路压成一次 LLM 调用的对照实现。
 
-spatial_runner.py --graph pair 跑一条记录要六到八次模型往返（reality → semantic 两次 →
-feature 那个 deep agent 还带 subagent 派发 → schema → judge），而且**后一步只能看前一步的
+spatial_runner.py --graph pair 跑一条记录要六次模型往返（reality → semantic 两次 → feature →
+schema → judge），而且**后一步只能看前一步的
 结论**：改写词到底有没有换掉空间关系，是等 schema 定了才在 judge 里被比较的。本脚本是它的
 单次调用对照版：一条记录只发**一次**请求，把五个 LLM 判断一起答出来，纯规则的改写与两张
 查表仍在本地做，最后落一条**与 pair 图逐字段同形**的记录（同形靠直接调 sg.serialize_pair，
@@ -12,7 +12,7 @@ feature 那个 deep agent 还带 subagent 派发 → schema → judge），而�
 
 其中 reality 那一问在 pair 侧是**按原句共享**的：闸门判的只是原句，而一条语料会展开成多个
 候选，所以那边在跑批前把要判的原句一次判完、候选之间共用一份判定（见 sr._prefill_reality），
-不再是「每个候选各问一遍」。收尾的对照下界照此扣掉重复的那几次。
+不再是「每个候选各问一遍」。收尾打印的对照数正是按每状态累加、不计这边的复用（见 PAIR_CALLS_PER_STEP）。
 
 一次调用到底指什么：一次 agent.invoke、一次消息往返。两道不需要模型的闸门在最前面短路，
 连这一次也不发——
@@ -32,7 +32,8 @@ feature 那个 deep agent 还带 subagent 派发 → schema → judge），而�
 像是模型偶尔一次吐出多个并发工具调用），strict 下同样会出现。它不带走整批，记进 error、
 收尾连语料行号一起打出来，好按行重跑。
 
-收尾还会打印一个对照下界：同样这些记录，pair 图至少要发几次请求。
+收尾还会打印一个对照数：同样这些状态，pair 图按每状态走到哪一步累加要发几次请求（不计它按句/
+按消息的复用，故是上界；精确数看 pair 产物 summary 里的 agent_stats.roundtrips）。
 
 为什么不给 parse_sentence 工具：工具调用就是又一次 API 请求，六次往返正是要消掉的东西。
 句法证据由本地 st.parse_sentence_text 算好塞进消息（--no-syntax 可以省掉，但那样就与
@@ -67,7 +68,6 @@ sentenceTable.get_task_value），装不下缓存时启动会像 runner 那样�
 """
 
 import argparse
-import json
 import threading
 import time
 import warnings
@@ -102,14 +102,13 @@ DEFAULT_LIMIT = 1
 """默认只处理 1 条：本脚本是单次调用的诊断入口，不是跑批工具（runner 那边默认 100）"""
 
 PAIR_CALLS_PER_STEP = {"reality": 1, "semantic": 2, "feature": 1, "schema": 1, "judgement": 1}
-"""pair 图走到某一步**至少**要发几次请求（两侧各判一次语法与空间语义，所以 semantic 是 2）
+"""pair 图走到某一步要发几次请求（两侧各判一次语法与空间语义，所以 semantic 是 2）
 
-**下界，不是精确值**：feature 那个 deep agent 还要给每个特征类别派一次 subagent（方位词那套是
-4 类，即 +4），派几次随句子而定，这里只数它自己那一次。它的用途是给「一次调用省了多少」一个
-可核对的口径——收尾打印的数就是这么算出来的，不是估的。alter 不在表里：它是纯规则，0 次。
-
-reality 那一项是**每个走到闸门的状态**记一次，而 pair 侧实际按原句去重（候选之间共享一份判定，
-见 sr._prefill_reality）：收尾打印时会按 (原句, 关注词) 把重复的那几次扣掉，扣法见 main。
+**不计缓存的上界**：按「每个走到这一步的状态各算一份」累加。pair 侧实际的按句/按消息复用一律
+不计——reality 按原句去重（见 sr._prefill_reality），semantic 的 a 侧、feature 与 schema 的 a 侧
+输入逐字相同也只问一次——所以真实往返数只会更低。它的用途是给「一次调用省了多少」一个可核对的
+**朴素口径**，既不是精确值也不是下界；要精确数就去读 pair 产物 summary 里的 agent_stats.roundtrips。
+alter 不在表里：它是纯规则，0 次。
 """
 
 
@@ -195,53 +194,40 @@ def _build_verdict_model(feature_classes: list[dict]) -> type:
 # --------------------------------------------------------------------------
 
 
-def _feature_roster(feature_classes: list[dict]) -> tuple[str, str]:
-    """渲染 {{n}} 与 {{roster}} 两个占位符的值：类别表的规模说明 + 逐类一行
+def _feature_roster(feature_agent) -> tuple[str, str]:
+    """渲染 {{n}} 与 {{roster}} 两个占位符的值：类别表的规模说明 + 逐类那一段
 
-    与 spatial_agents._render_feature_prompts 的 roster 同一口径（键名、中文名、判据、
-    可选取值都给全），只是那边是给 subagent 派活、这里是给一次作答用。
+    类别段直接复用 sa.render_class_blocks（与 pair flat 的 {{classes}} 同一份渲染：取值按「、」
+    拼接、逐字照抄规则与 flat 用法段随块带入），于是两处的类别段逐字一致，不会各自演化——这正是
+    不在本脚本里另写一套的原因。模板从已建好的 feature agent 取（它构造期就把这几份读进来了）。
     """
+    feature_classes = feature_agent.feature_classes
     if not feature_classes:
         return "尚未填写（还是空表），没有既定类别可依", ""
     n = f"已填写，共 {len(feature_classes)} 类；features.a 与 features.b 各有这几个字段，字段名用键名"
-    roster_lines: list[str] = []
-    for feature_class in feature_classes:
-        roster_lines.append(
-            f"    {feature_class['key']}（{feature_class.get('name') or feature_class['key']}）："
-            f"{feature_class.get('description') or '（未写说明，按这一类的名称理解）'}"
-            + (
-                # 取值渲染成 JSON 字符串数组而不是「A、B、C」：查表是逐字比对字符串，模型照抄这串
-                # 引号里的内容比从顿号列表里誊抄更不容易漏掉 [+ ] 这类记号（实测顿号列表下会掉方括号）
-                "；可选取值（原样照抄，含方括号）："
-                + json.dumps([str(v) for v in feature_class["values"]], ensure_ascii=False)
-                if feature_class.get("values")
-                else "；取值开放，自行概括"
-            )
-        )
-        # 示例挂在本类那一行下面，缩进再深两级；渲染口径与 feature_agent 共用（见 spatial_agents），
-        # 这边只是把缩进调深，免得和 roster 行左对齐、看不出从属关系
-        examples = sa.render_example_lines(feature_class, indent="      ")
-        if examples:
-            roster_lines.append("      示例：")
-            roster_lines.append(examples)
-    return n, "\n".join(roster_lines)
+    blocks = sa.render_class_blocks(
+        feature_classes,
+        feature_agent.prompts[sa.FEATURE_CLASS_PROMPT_FILE],
+        usage=feature_agent.prompts[sa.FEATURE_CLASS_USAGE_FLAT_FILE],
+    )
+    return n, "\n\n".join(blocks)
 
 
-def build_system_prompt(feature_classes: list[dict], *, reality_criteria: str) -> str:
+def build_system_prompt(feature_agent, *, reality_criteria: str) -> str:
     """渲染 system_prompt/all_in_one.txt
 
     渲染放**启动期**（--no-llm、--print-prompt 也渲染）：占位符写错、文件缺失属于配置错，
     该启动就报，与 BaseAgent.__init__ 同一口径。
 
-    reality_criteria 由调用方从 reality agent 的 system_prompt 取（见 build_context）：
-    那份判据按语料类型分两份、放在 config_files/<类型>/reality.txt 下，此处不再自己读一遍文件
-    ——读法与路径的单一真源在 spatial_agents（PROMPT_SOURCE_CONFIG）那边。
+    reality_criteria 由调用方从 reality agent 的 system_prompt 取、类别段从 feature agent 取
+    （见 build_context）：那两份判据分别按语料类型分档，读法与路径的单一真源在 spatial_agents 那边，
+    此处不再自己读一遍文件。
 
     注意渲染是单次扫描（utils.render_prompt）：reality_criteria 里若含 {{...}} 不会被再替换一遍，
     注入的顺序因此无关紧要。
     """
     template = utils.read_prompt(PROMPT_FILE)
-    n, roster = _feature_roster(feature_classes)
+    n, roster = _feature_roster(feature_agent)
     return utils.render_prompt(
         template,
         {"reality_criteria": reality_criteria, "n": n, "roster": roster},
@@ -320,14 +306,15 @@ def build_user_message(
 ) -> str:
     """拼这次的 user message
 
-    前 5 行逐字节用 sa.pair_head_block（原句侧关注词 2 行 + 改写句侧 2 行 + 语料类型行）。
-    这套措辞是必须沿用的：b 侧的 schema 要收窄到**替换词**所属的词条，判定表里 上12 × 里1
-    这类跨组格子才对得上；两侧共用一个词会退化成同组自比。corpus_type 恒不为 None
-    （同 runner：先规范化再传），所以第 5 行恒在、行数恒为 5。
+    前 5 行用 sa.pair_head_block（a 侧关注词 2 行 + b 侧 2 行 + 语料类型行）。a 侧按
+    FOCUS_ROLE_RECORD 说——与 reality/semantic/feature/schema 四个 agent 一致，注入的 reality
+    判据也说「第二行交代了这个词是怎么被提取出来的」；b 侧仍是 FOCUS_ROLE_REPLACEMENT：它的 schema
+    要收窄到**替换词**所属的词条，判定表里 上12 × 里1 这类跨组格子才对得上（两侧共用一个词会退化
+    成同组自比）。corpus_type 恒不为 None（同 runner：先规范化再传），所以第 5 行恒在、行数恒为 5。
 
     第 6 行起一律走行首标签（句法证据本身是多行，不能按行号数）：
 
-        1-5  pair_head_block 原样（含末行「本次跑批的语料类型：方位词。」）
+        1-5  pair_head_block(a, b, role_a=RECORD)（含末行「本次跑批的语料类型：方位词。」）
         6    （空行）
         7    原句：<sentence_a>
         8    原句句法证据：<st.parse_sentence_text(sentence_a)>   ← 多行，--no-syntax 时整段省掉
@@ -377,7 +364,7 @@ def prepare(state: dict, ctx: "_Context", args: argparse.Namespace) -> _Prepared
 
     return _Prepared(
         message=build_user_message(
-            sa.pair_head_block(focus_a, focus_b, corpus_type=ctx.corpus_type),
+            sa.pair_head_block(focus_a, focus_b, corpus_type=ctx.corpus_type, role_a=sa.FOCUS_ROLE_RECORD),
             sentence_a,
             sentence_b,
             syntax_a=syntax_a,
@@ -870,14 +857,15 @@ def build_context(args: argparse.Namespace, corpus_type: str, out_path: Path) ->
         corpus_type=corpus_type,
     )
     reality_agent = agents.need("reality")
-    feature_classes = list(agents.need("feature").feature_classes)
+    feature_agent = agents.need("feature")
+    feature_classes = list(feature_agent.feature_classes)
     return _Context(
         agents=agents,
         corpus_type=corpus_type,
         model_key=args.model,
         llm=not args.no_llm,
         out_path=out_path,
-        system_prompt=build_system_prompt(feature_classes, reality_criteria=reality_agent.system_prompt),
+        system_prompt=build_system_prompt(feature_agent, reality_criteria=reality_agent.system_prompt),
         verdict_model=build_verdict_model(feature_classes),
         feature_classes=feature_classes,
         prompt_path=str(utils.prompt_path(PROMPT_FILE)),
@@ -954,12 +942,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--candidate-index",
         type=int,
         default=0,
-        help="该语料展开出的第几个待选句（默认第 0 个）；越界时如实记 alter_missed，不悄悄换成别的",
+        help="该语料展开出的第几个待选句（默认第 0 个，即句内首个位置的首个替换词）；"
+        "序号在**全位置展开**上数，所以 0 之后的候选可能落在句内另一个位置；"
+        "越界时如实记 alter_missed，不悄悄换成别的",
     )
     parser.add_argument(
         "--all-candidates",
         action="store_true",
-        help="跑遍每条语料展开出的全部待选句（有几条待选句就几次调用；收尾打印总次数）",
+        help="跑遍每条语料展开出的全部待选句，含句内每个目标词位置各自那批"
+        "（有几条待选句就几次调用；收尾打印总次数）",
     )
     parser.add_argument("--model", default=sa.DEFAULT_MODEL, help="model_config/api_keys.json 里的配置名")
     parser.add_argument(
@@ -997,6 +988,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="结构化输出不合法时允许框架补发一次请求（handle_errors=True）。默认**不允许**：补发就是"
         "第二次调用，与「只调一次」冲突，而且那条补发请求实测会被 API 拒掉",
     )
+    parser.add_argument(
+        "--no-pairs-csv",
+        action="store_true",
+        help="不导出成对信息 csv（默认导出，列与行序跟 pair 图一致；与 spatial_runner 同名同义）",
+    )
     return parser.parse_args(argv)
 
 
@@ -1017,6 +1013,8 @@ def main(argv: list[str] | None = None) -> None:
     print("单次调用版（all_in_one）：一次请求答完 pair 图的五个 LLM 判断")
     print(f"语料类型：{corpus_type}（{'--corpus-type' if args.corpus_type else '默认'}）")
     print(f"配置目录：config_files/{st.CORPUS_TYPE_DIRS[corpus_type]}/")
+    # 与 runner 同一道提醒：语料文件名像另一类语料时出声（类型只由 --corpus-type 决定，不按文件名推断）
+    sr._warn_corpus_type_mismatch(corpus_path, corpus_type)
     ctx = build_context(args, corpus_type, out_path)
     print(f"模型：{args.model}（{'--no-llm：不建、不调' if not ctx.llm else '每条记录至多一次调用'}）")
     print(f"输入语料：{corpus_path}（{len(records)} 条）")
@@ -1069,18 +1067,21 @@ def main(argv: list[str] | None = None) -> None:
         tally=sg.pair_tally,
         corpus_type=corpus_type,
         config_tables=sr._config_tables(ctx.agents),
+        # 成对信息 csv：默认导出（--no-pairs-csv 关），列与行序跟 pair 图一致（用 pair 图那套列）
+        csv_columns=sg.GRAPHS["pair"].csv_columns if not args.no_pairs_csv else (),
     )
     counter = CallCounter()
     suppressed: Counter = Counter()
     failed = 0
     failed_lines: list[int] = []
     pair_calls = 0
-    gate_states = 0
-    """走到了 reality 闸门的状态数（每条给 pair 侧记 1 次调用）"""
-    gate_keys: set = set()
-    """这些状态问的原句：同一条语料的几个候选问的是同一句，pair 侧按它去重（见下面的修正）"""
+    """按每状态走到哪一步累加的 pair 侧朴素调用数（不计其按句/按消息的复用，见收尾打印）"""
     started = time.time()
     print(f"输出文件：{out_path}")
+    if args.no_pairs_csv:
+        print("成对信息 csv：本次不导出（--no-pairs-csv）")
+    else:
+        print(f"成对信息 csv：收尾导出到 {out_path.with_suffix('.csv')}（--no-pairs-csv 可关）")
     # 落盘与统计都留在主线程：pool.map 按输入顺序产出，于是输出文件与串行跑逐字节同序
     # （line_no 升序、同句再按 candidate.index）。pair 图那边是各 worker 在 save 节点并发落盘、
     # 顺序是完成顺序，但两侧收尾都由 ResultWriter.finish 按同一个键重排，所以两份文件最终同序、
@@ -1099,15 +1100,9 @@ def main(argv: list[str] | None = None) -> None:
                 failed += 1
                 failed_lines.append(record["line_no"])
             pair_calls += record["all_in_one"]["pair_llm_calls"]
-            if record.get("reality"):
-                # 走到了闸门（serialize_pair 对没走到的那批写 {}）。问的是哪一句原话：拿 a 侧句子
-                # 与关注词定位，与 pair 侧预填充的缓存键同源
-                gate_states += 1
-                focus = record.get("focus_word") or {}
-                gate_keys.add(
-                    (record["pair"]["a"]["sentence"], focus.get("index"), focus.get("word"), focus.get("kind"))
-                )
 
+    # 各 agent 的调用账：本脚本的 agent 一律 llm=False，数值恒为全零，但 summary 的形状与 pair 图一致
+    writer.agent_stats = {name: agent.stats() for name, agent in ctx.agents.items()}
     summary = writer.finish()
     print(
         f"\n完成 {summary['count']} 条记录（{len(records)} 条语料，{len(states)} 个状态）"
@@ -1116,13 +1111,13 @@ def main(argv: list[str] | None = None) -> None:
     # 对照数是按**逐条实际走到哪一步**累加的，不是「记录数 × 换算系数」：停在 reality 闸门的记录
     # 本来只要一次调用，一律按整条链路算会把这批语料说得比实际贵。
     #
-    # 闸门那一项还要再按原句去重：pair 图在跑批前把要判的原句一次判完、候选之间共用一份判定
-    # （见 sr._prefill_reality），所以同一条语料的几个候选只算一次。调用失败的不入缓存、会在各自
-    # 候选上重试，扣掉的是「本该共享却被重复问」的那部分，所以这个数照旧是下界。
+    # 但它**不计 pair 侧的任何复用**：reality 按原句去重、semantic/feature/schema 的 a 侧消息逐字
+    # 相同也只问一次（见 PAIR_CALLS_PER_STEP），所以这只是个上界——只扣 reality 那一半反而不成立。
+    # 要精确数就去读 pair 产物 summary 里的 agent_stats.roundtrips。
     print(
-        f"对照：同样这些状态，pair 图至少要 {pair_calls - (gate_states - len(gate_keys))} 次调用"
-        f"（下界；已按原句扣掉闸门的 {gate_states - len(gate_keys)} 次重复；"
-        "feature 那一环还要给每个特征类别各派一次 subagent，未计入）"
+        f"对照（不计缓存）：这些状态按每状态走到哪一步累加是 {pair_calls} 次调用；"
+        "pair 侧还会按句/按消息复用，实际往返数更低——以 pair 产物 summary 里的 "
+        "agent_stats.roundtrips 为准"
     )
     if failed:
         # 给出语料行号与重跑办法：这类失败多半是模型偶发地吐出并发工具调用，deepseek 那边直接回

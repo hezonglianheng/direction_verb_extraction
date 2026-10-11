@@ -25,17 +25,20 @@ pair 图（默认，--graph pair）的数据流：
 （判不好的记录也留着，好回头查是被哪条判据挡下的）；判不出来时一律放行，理由见
 spatial_graphs.reality_gate —— 闸门的错法只能是漏掉几句引申用法，不能是把整批记录挡在门外。
 
-这道闸门判的只是**原句**（a 侧那个词，与改写句换上去的词无关），而一条语料会展开出多个候选
-状态、每个状态都要过一遍——问的是逐字相同的一句原话。所以它在跑批前就按原句判完、去重
-（见 _prefill_reality）：节点位置与产物形状都不变（仍在 alter 之后，改写未命中的记录照旧没有
-reality 块），省下的是这几倍的重复调用（实测 1782 条记录只对应 200 个原句）。这份去重账写进
-.summary.json 的 reality_prefill——事后核对调用数时先看它。
+这道闸门判的只是**原句、且只是本记录要替换的那个位置上的词**（a 侧的 focus_word，与改写句
+换上去的词无关）。一条语料会展开出多个候选状态、每个状态都要过一遍：**同一位置**的几个候选
+问的是逐字相同的一句原话，**不同位置**（如「上@5」与「上@3」）问的却是不同的问题。所以它在
+跑批前判完并按整条 user message（含位置词）去重（见 _prefill_reality）：节点位置与产物形状都
+不变（仍在 alter 之后，改写未命中的记录照旧没有 reality 块），省下的是同位置那几个候选的重复
+调用（实测 1782 条记录只对应 200 个原句）。这份去重账写进 .summary.json 的 reality_prefill
+——事后核对调用数时先看它。
 
 semantic / feature / schema 三个节点都是**原句与改写句各跑一遍**（两侧各一份结果，落盘时记在 a/b
 两个键下），judge 是两侧合并的地方：它一份记录只跑一次，同时读两侧的 schema 与关注词。
-这三者的 a 侧输入只由语料决定（同一条语料的所有候选问的是逐字相同的一句），所以结果按 user
-message 缓存在各自的 agent 实例里（见 spatial_agents.CACHEABLE_SOURCES）——第一次问过之后，
-同一句不再重复发请求；每次跑批各 agent 的往返数与命中数写进 .summary.json 的 agent_stats。
+这三者的 a 侧输入只由语料与本记录那个位置决定（同一句原话、**同一位置**上的候选问的是逐字相同的
+一条消息），所以结果按 user message 缓存在各自的 agent 实例里（见 spatial_agents.CACHEABLE_SOURCES）——第一次问过之后，同一条消息不再重复发请求；每次跑批各 agent 的往返数与命中数写进
+.summary.json 的 agent_stats。同一句原话若有两个位置（上@5 与 上@3），那是两条不同的 a 侧消息，
+各问一次。
 两侧**各看各的关注词**——原句那侧看语料记录里那个词（focus_word），改写句那侧看规则表换上去的
 那个词（focus_word_b，由 alter 节点算出）。所以 b 侧的 schema 收窄到的是**替换词**所属的词组，
 判定表里 上12 × 里1 这样按两组名字写的格子才对得上；两侧共用一个词的话 b 侧会收窄回原词那一组，
@@ -44,8 +47,10 @@ message 缓存在各自的 agent 实例里（见 spatial_agents.CACHEABLE_SOURCE
 （改写句要重新分词，替换点可能并词，见 spatial_agents.FOCUS_INDEX_NOTE_ALTER）。
 
 一条语料里的方位词往往能换成规则表里好几个替换词（见 spatial_tools.alter_sentence），
-所以跑批时会先把它展开成多个待选句、每个待选句一个状态：**一条语料通常产出多条记录**，
-记录里的 candidate 块（index/total/word/replacement/group）标明这是第几个待选句。
+而且句内**每个**目标词位置都要参与改写（「他从山上掉到山谷里」的「上」与「里」各是一个位置，
+见 spatial_tools.pick_focus_words）。所以跑批时会先把它展开成多个待选句、每个待选句一个状态：
+**一条语料通常产出多条记录**，记录里的 candidate 块（index/total/focus_index/word/replacement/
+group）标明这是第几个待选句、改的是句内哪个位置（一条记录只改一个位置，其余目标词原样保留）。
 --limit / --offset 仍按语料条数算，不按展开后的状态数算。
 
 每跑一次产出一个 jsonl，一条记录就是一条完整链路的结果（两个句子、各自的语义特征、
@@ -428,6 +433,8 @@ def _prefill_reality(records: list[dict], agents, spec: sg.GraphSpec, workers: i
     与 _prefill 同一套路、同一个理由：同一件判定的重复请求应当在进线程池之前去掉。闸门判的
     只是原句（a 侧那个词），而一条语料按规则表能展开出 9~11 个候选状态、每个状态都要过一遍
     ——不去重就是几倍的调用（实测 1782 条记录只对应 200 个原句，其中 1283 条记录只对应 157 个）。
+    注意「原句」这里要读成「原句 + 本位置那个词」：句内两个位置（上@5 与 上@3）同一句原话
+    但是两个问题，prefill 按整条 user message 去重，不会把它们并掉。
 
     哪些原句会走到闸门由图自己声明（spec.gate_queries）：改写未命中的记录不经过闸门，
     也就不在这里判（规则表为空时正是整批都这样，那批一条都不该发）。
@@ -536,7 +543,8 @@ def main(argv: list[str] | None = None) -> None:
         # 去重账补写到 writer 上，与语料类型、配置表一并进汇总（见 ResultWriter.reality_prefill）
         writer.reality_prefill = _prefill_reality(records, agents, spec, args.workers)
 
-    # 一条语料能改出好几个待选句，每个待选句一个状态、一条记录，所以状态数一般多于语料条数
+    # 一条语料的每个目标词位置各能改出好几个待选句，每个待选句一个状态、一条记录，
+    # 所以状态数一般多于语料条数
     states = spec.init_states(records, agents, str(out_path))
     print(f"展开待选句：{len(records)} 条语料 → {len(states)} 个状态（每个状态落一条记录）")
     started = time.time()

@@ -28,11 +28,14 @@ reality_queries_alter / reality_queries_single 与 spatial_runner._prefill_reali
 时间上一批原句先判完、节点按 message 读缓存（见 spatial_agents.RealityAgent.prefill）。
 实测一条语料能展开出 9~11 个候选，不去重就是几倍的调用。
 
-图内一律是"一对句子"（a 原句 / b 改写句），可一个原句能改出好几个待选句（见 spatial_tools.alter_sentence）：
-**有几个待选句就展开成几条记录**，每条记录仍是完整的一对句子，用 candidate 块标明是第几个待选句。
+图内一律是"一对句子"（a 原句 / b 改写句），可一个原句能改出好几个待选句。待选句来自**句内每个
+目标词位置**上的每个替换词（见 spatial_tools.pick_focus_words 与 alter_sentence）：
+**有几个待选句就展开成几条记录**，每条记录仍是完整的一对句子——一条记录只改一个位置，句里其余
+目标词原样保留作参照，candidate 块用 focus_index 标明改的是哪个位置、用 index 标明是第几个待选句。
 展开放在跑批前一次算好（见 GraphSpec.init_states），所以图本身、serialize 与统计口径的形状都不用变。
 
-一对句子的两侧**各看各的关注词**：a 侧看记录里那个词（focus_word），b 侧看规则表换上去的那个词
+一对句子的两侧**各看各的关注词**：a 侧看**本记录改的那个位置**上的词（focus_word，由 alter_node
+从选中候选里取），b 侧看规则表换上去的那个词
 （focus_word_b，由 alter_node 用 spatial_tools.replacement_focus_word 算出）。所以 semantic / feature /
 schema 三个节点传下去的关注词是**按侧取**的（inputs 里写 {"a": ..., "b": ...}，见 _resolve），
 而不是两侧共用一个字段。这样 b 侧的 schema 才会收窄到替换词所属的词组，判定表里
@@ -96,6 +99,17 @@ class BaseState(TypedDict, total=False):
     它是 record 的纯函数，三张图都要用（single 图也拿它标注这一句是为哪个词抽的），
     所以由 init_state 统一写入；alter_node / single_entry_node 再按 record 复算一次写回，
     图被单独 invoke（状态里没这个字段）时也不会退化成 None。
+
+    pair / alter_check 里它是**本记录要改的那个位置**上的词：句内每个目标词各展开一批候选，
+    alter_node 按选中的候选把它换成那一批对应的词（改写没命中时仍是最靠前的那个位置）。
+    """
+
+    focus_words: list[dict]
+    """句内要参与改写的**全部**位置，按改写顺序排列（见 spatial_tools.pick_focus_words）
+
+    focus_word 是它的首元素。由 init_state 写入、alter_node 取用，为的是不让每个状态都重算
+    一遍取词（一条语料展开成多个状态，取词是 record 的纯函数）。**不落进记录**：每条记录只改
+    一个位置，记录里的 focus_word 就够说明改的是哪个词了。
     """
 
     reality: dict
@@ -133,6 +147,7 @@ def init_state(record: dict, output_file: str) -> BaseState:
         "record": record,
         "output_file": str(output_file),
         "focus_word": st.pick_focus_word(record),
+        "focus_words": st.pick_focus_words(record),
         "stage": "unknown",
         "status_reason": "",
         "history": [],
@@ -294,9 +309,11 @@ def agent_node(
 def alter_init_states(records: list[dict], agents, output_file: str) -> list[dict]:
     """pair / alter_check 两张图的展开：一条语料按它的待选句展开成多个初始状态
 
-    改写在跑批前先算一遍（纯规则、无副作用，见 AlterAgent.expand）：一个原句有几个待选句，
-    就展开成几个状态，每个状态跑一条完整链路、落一条记录。没有待选句（规则表没命中）或
-    sentence 字段本身不合法时仍展开一个状态，好让 alter 节点照旧如实记下 alter_missed / bad_record。
+    改写在跑批前先算一遍（纯规则、无副作用，见 AlterAgent.expand_positions）：句内每个目标词
+    位置各出一批候选、位置之间不组合，所以"一个原句有几个待选句"= 各位置候选数之和，就展开成
+    几个状态，每个状态跑一条完整链路、落一条记录（一条记录只改一个位置）。没有待选句
+    （规则表没收录句内任何目标词）或 sentence 字段本身不合法时仍展开一个状态，好让 alter 节点
+    照旧如实记下 alter_missed / bad_record。
 
     节点里还会再调一次同一个纯函数（微秒级），换来的是图能脱离本函数单独 invoke。
     """
@@ -306,7 +323,7 @@ def alter_init_states(records: list[dict], agents, output_file: str) -> list[dic
         sentence_slice = record.get("sentence") or []
         candidates = []
         if isinstance(sentence_slice, list) and sentence_slice:
-            candidates, _ = alter.expand(sentence_slice, st.pick_focus_word(record) or {})
+            candidates, _ = alter.expand_positions(sentence_slice, st.pick_focus_words(record))
 
         if not candidates:
             # 展开不出待选句也得跑一个状态，否则这条语料不会留下任何记录
@@ -329,14 +346,16 @@ def single_init_states(records: list[dict], agents, output_file: str) -> list[di
 def reality_queries_alter(records: list[dict], agents) -> list[tuple[str, dict | None]]:
     """pair / alter_check 两张图会让 reality 闸门判哪些原句：[(原句, 关注词), ...]
 
-    与 alter_init_states 同源：用同一个纯函数（AlterAgent.expand）算出这条语料有没有待选句，
-    **有候选才产出**——没有候选的状态在 alter 节点就停下、经 save 收尾（见 route_after_alter），
-    闸门根本不会跑。照抄这个条件而不是「每条语料都判」，是为了让预填充与图真正发出的请求严格
-    一致：多判的那些既没人读，又白花钱（规则表为空时正好整批都是这样）。
+    与 alter_init_states 同源：用同一个纯函数（AlterAgent.expand_positions）算出这条语料有没有
+    待选句，**有候选才产出**——没有候选的状态在 alter 节点就停下、经 save 收尾（见
+    route_after_alter），闸门根本不会跑。照抄这个条件而不是「每条语料都判」，是为了让预填充与图
+    真正发出的请求严格一致：多判的那些既没人读，又白花钱（规则表为空时正好整批都是这样）。
 
-    一条语料展开出几个候选，就有几个状态过闸门，但它们问的是**逐字相同**的一句原话，所以这里
-    **逐候选各出一项**（与 alter_init_states 展开出的状态一一对应），去重交给 prefill——返回的
-    是「闸门总共会被问几次」，不是「有几个问题」；两个数都进跑批那行打印（见 _prefill_reality）。
+    一条语料展开出几个候选，就有几个状态过闸门：它们共用同一句原话，但**各问各的位置词**
+    （闸门判的就是"这个词在这一句里是不是说现实空间"，同一位置的候选问的是同一个问题，不同位置
+    问的是不同的问题）。所以这里**逐候选各出一项**（与 alter_init_states 展开出的状态一一对应），
+    去重交给 prefill——返回的是「闸门总共会被问几次」，不是「有几个问题」；两个数都进跑批那行
+    打印（见 _prefill_reality）。
     """
     alter = agents.need("alter")
     queries: list[tuple[str, dict | None]] = []
@@ -344,12 +363,11 @@ def reality_queries_alter(records: list[dict], agents) -> list[tuple[str, dict |
         sentence_slice = record.get("sentence") or []
         if not isinstance(sentence_slice, list) or not sentence_slice:
             continue  # bad_record：a 侧句子都拼不出来，闸门无从判起
-        focus_word = st.pick_focus_word(record)
-        candidates, _ = alter.expand(sentence_slice, focus_word or {})
+        candidates, _ = alter.expand_positions(sentence_slice, st.pick_focus_words(record))
         if not candidates:
             continue
         sentence = st.join_slice(sentence_slice)  # 同一条语料只拼一次，几个候选共用同一份
-        queries.extend((sentence, focus_word) for _ in candidates)
+        queries.extend((sentence, candidate["focus_word"]) for candidate in candidates)
     return queries
 
 
@@ -412,8 +430,9 @@ def reality_node(agent, *, sentence: str, state_type) -> Callable[[dict], dict]:
     alter 成功与否都写下了它），single 读 sentence（read 节点拼好的）。三张图的位置一致
     ——各自的入口节点之后、五个 LLM agent 之前（理由见模块 docstring）。
 
-    只看 a 侧：闸门判的是这条语料自己的那个关注词，与改写句那侧换上去的词无关，
-    所以它接的 focus_word 是原词，不按侧取（见 pair_head_block 那一路只管 judge）。
+    只看 a 侧：闸门判的是**本记录要替换的那个位置**上的词（alter 节点已把 focus_word 换成
+    选中候选自己那一份），与改写句那侧换上去的词无关，所以它接的 focus_word 是原词、不按侧取
+    （见 pair_head_block 那一路只管 judge）。句内另一个位置在本记录里没被选中，也就不进闸门。
     """
 
     def update(state: dict, value: dict) -> dict:
@@ -482,17 +501,33 @@ class PairState(BaseState):
     """
 
 
+def _position_detail(details: list[dict], focus_index) -> dict:
+    """取某个位置那份改写详情（AlterAgent.expand_positions 的 details 按位置排列）
+
+    匹配下标而不是按次序取：details 是"每个位置一份"，而候选是"每个位置好几条"，
+    两者一一对不上。找不到（下标缺失、或该位置没进 details）时退到第一份——
+    调用方要的只是一个能写进 reason 的详情，返回空字典会让下游读 detail["reason"] 时炸掉。
+    """
+    for item in details:
+        if (item.get("focus_word") or {}).get("index") == focus_index:
+            return item["detail"]
+    return details[0]["detail"] if details else {}
+
+
 def alter_node(agent) -> Callable[[dict], dict]:
-    """alter 节点：原句切片 + 关注词 -> 待选句里由本状态负责的那一条。纯规则
+    """alter 节点：原句切片 + 句内各位置 -> 待选句里由本状态负责的那一条。纯规则
 
     这一步不走适配器：它的入口是 record 而不是某个 sentence_* 字段，还要判 bad_record、
     把结果拆成 a/b 两侧、并从展开出的多个待选句里取出自己那一个——这些是"一对句子"
     这个概念固有的逻辑，不是 agent 的输入契约。pair 图与 alter_check 图共用这一个节点。
 
     candidate_index 由跑批前的展开写进状态（见 alter_init_states），本节点只按它取一条。
+    句内每个目标词位置各出一批候选（见 AlterAgent.expand_positions），所以"第几个待选句"
+    是在**整条语料的全位置展开**上数的——一条记录只改一个位置。
 
-    改写成功时顺手把 b 侧的关注词换成规则表换上去的那个词（focus_word_b）：这件事只有这里做得成，
-    选中的替换词是这里才知道的。三个分支都会写 focus_word_b（改写没命中则是 None），
+    改写成功时顺手把 a 侧关注词换成"选中那条候选自己那个位置"上的词、b 侧的换成规则表换上去的
+    那个词（focus_word_b）：这两件事只有这里做得成，选中了哪个位置、哪个替换词是这里才知道的。
+    三个分支都会写 focus_word / focus_word_b（改写没命中则 focus_word_b 是 None），
     好让下游按侧取词时总能取到"确定没有"而不是"忘了写"。
     """
 
@@ -513,23 +548,25 @@ def alter_node(agent) -> Callable[[dict], dict]:
                 ],
             }
 
-        # 状态里没有（图被单独 invoke）就按 record 复算一次。这里不是「唯一入口」：
-        # 这一行与 init_state、alter_init_states、pair_plan、single_entry_node、
-        # reality_queries_alter、reality_queries_single 是**七处并列**的调用点
-        # （grep st.pick_focus_word 就能数全），口径之所以不会分叉，全靠它们都走同一个
-        # 纯函数 st.pick_focus_word(record)。改取词口径要改那个函数，别只改 init_state。
-        focus_word = state.get("focus_word") or st.pick_focus_word(record)
+        # 状态里没有（图被单独 invoke）就按 record 复算一次。取词只有一处真源：
+        # st.pick_focus_words（focus_word 是它的首元素）——init_state / alter_init_states /
+        # pair_plan / single_entry_node / reality_queries_* 都走它，口径不会分叉。
+        focus_words = st.pick_focus_words(record) if state.get("focus_words") is None else state["focus_words"]
+        # 还没选定位置时（本题记 bad_record、或候选下标越界）用最靠前的那个位置：
+        # alter_missed 的记录也照常带一份关注词，落盘口径与正常记录一致
+        focus_word = state.get("focus_word") or (focus_words[0] if focus_words else None)
         sentence_a = st.join_slice(sentence_slice)
         elapsed = round(time.perf_counter() - started, 2)
 
-        # 与展开同源（同一个纯函数），只是这里只挑一条
-        candidates, detail = agent.expand(sentence_slice, focus_word or {})
+        # 与展开同源（同一个纯函数），句内每个位置各一批候选，这里只挑本状态那一条
+        candidates, details = agent.expand_positions(sentence_slice, focus_words)
         index = state.get("candidate_index") or 0
         chosen = candidates[index] if 0 <= index < len(candidates) else None
         if chosen is None:
-            # 没有待选句（规则表没命中）或 index 越界（图被单独 invoke 时才会出现）：
-            # 产不出一对句子，如实记下原因后直接收尾，不往下走
-            detail["reason"] = detail["reason"] or f"待选句下标 {index} 越界（共 {len(candidates)} 个）"
+            # 没有待选句（规则表没收录句内任何目标词）或 index 越界（图被单独 invoke 时才会
+            # 出现）：产不出一对句子，如实记下原因后直接收尾，不往下走
+            detail = _position_detail(details, (focus_word or {}).get("index"))
+            detail["reason"] = detail.get("reason") or f"待选句下标 {index} 越界（共 {len(candidates)} 个）"
             # 与改写成功那条分支同形状：alter 块里都带 kind，免得下游按 alter["kind"] 读时
             # 在 alter_missed 的记录上取到缺失值
             detail["kind"] = (focus_word or {}).get("kind")
@@ -556,6 +593,12 @@ def alter_node(agent) -> Callable[[dict], dict]:
                     )
                 ],
             }
+
+        # 本记录改的是**选中那条候选自己那个位置**：a 侧关注词、改写详情都换成该位置的
+        # （展开时每个位置各一份 detail / focus_word）。其余位置只是没被这条记录选中，
+        # 不是失败——它们的候选在 candidates 里供对照。
+        focus_word = chosen["focus_word"]
+        detail = _position_detail(details, chosen["focus_index"])
 
         # alter 里既有选中的那个替换词（顶层，方便直接读），也留着全部候选词供对照
         alter = {
@@ -597,6 +640,7 @@ def alter_node(agent) -> Callable[[dict], dict]:
                     candidate={
                         "index": chosen["candidate_index"],
                         "total": chosen["candidate_total"],
+                        "focus_index": chosen["focus_index"],
                         "replacement": chosen["replacement"],
                         "source": chosen["source"],
                     },
@@ -773,9 +817,12 @@ def pair_final_status(state: PairState) -> str:
 
 
 def _candidate_block(state: dict) -> dict | None:
-    """结果记录里的 candidate 块：这条记录是哪个待选句、共几个、换成哪个词、来自哪个词组
+    """结果记录里的 candidate 块：这条记录是哪个待选句、共几个、改的哪个位置、换成哪个词
 
-    一个原句有几个待选句就落几条记录，靠这个块区分它们；没展开出待选句（alter_missed）时为 None。
+    一条语料有几个待选句就落几条记录，靠这个块区分它们；没展开出待选句（alter_missed）时为 None。
+
+    focus_index 是"本记录改的是句内第几个 token"：句内可能有同一个词的多个位置（上@3 与 上@5），
+    光看 word 分不开；index 是待选句的序号（整条语料的全位置展开上数的），两者不是一回事。
     """
     chosen = state.get("candidate")
     if not chosen:
@@ -783,6 +830,7 @@ def _candidate_block(state: dict) -> dict | None:
     return {
         "index": chosen.get("candidate_index"),
         "total": chosen.get("candidate_total"),
+        "focus_index": chosen.get("focus_index"),
         "word": chosen.get("word"),
         "replacement": chosen.get("replacement"),
         "source": chosen.get("source"),
@@ -864,10 +912,10 @@ def serialize_pair(state: PairState) -> dict:
 def pair_plan(records: list[dict], agents) -> list[str]:
     """这张图会让模型看到的全部句子：原句 + 规则算出的全部待选句
 
-    待选句由 alter_agent.plan_all 算（纯规则、无副作用），与节点里真正用到的句子同源。
+    待选句由 alter_agent.plan_all_positions 算（纯规则、无副作用），与节点里真正用到的句子同源。
     没有它，待选句就会在节点里第一次遇到时才做句法分析——那是在线程池里，而推理在锁外，
     多线程下就是并发调同一份 LTP 模型（见 sentenceTable.SentenceTaskCache.get_task_value）。
-    一个都不能漏：这条记录展开出几个待选句，这里就得算出几个。
+    一个都不能漏：这条记录展开出几个待选句，这里就得算出几个（句内每个目标词位置各一批）。
     """
     alter = agents.need("alter")
     sentences = []
@@ -876,7 +924,7 @@ def pair_plan(records: list[dict], agents) -> list[str]:
         if not sentence_slice:
             continue
         sentences.append(st.join_slice(sentence_slice))
-        sentences.extend(alter.plan_all(sentence_slice, st.pick_focus_word(record) or {}))
+        sentences.extend(alter.plan_all_positions(sentence_slice, st.pick_focus_words(record)))
     return sentences
 
 

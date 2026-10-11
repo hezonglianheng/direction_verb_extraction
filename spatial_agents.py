@@ -22,8 +22,9 @@
     judge_agent     输入两个句子及其 schema，先查判定表（CSV 矩阵）；表里直接给了结论（√/×）
                     就用它，标了 ○、格子留空非法、或这一对没收录进表（未命中）才交 LLM 判断。
 
-六个 agent 的输入里都有 focus_word：这一句是**为哪个方位词/趋向动词**抽出来的（index、词本身、
-属哪一类），由 spatial_tools.pick_focus_word 从语料记录里取，图从第一个 agent 开始逐级往下传。
+六个 agent 的输入里都有 focus_word：**本记录要替换的那个位置**上的方位词/趋向动词（index、
+词本身、属哪一类），由 spatial_tools.pick_focus_words 从语料记录里取（一家语料可能有好几个
+位置，每个位置各出几条记录，一条记录只认一个），图从第一个 agent 开始逐级往下传。
 它是 user message 的第一行（措辞见 focus_line），五个 LLM agent 都按它展开判断——一句里有多个
 方位词/趋向动词时，模型否则无从知道该看哪一个。
 
@@ -435,14 +436,23 @@ def head_block(focus_word: dict | None, *, corpus_type: str | None = None) -> st
 
 
 def pair_head_block(
-    focus_word: dict | None, focus_word_b: dict | None, *, corpus_type: str | None = None
+    focus_word: dict | None,
+    focus_word_b: dict | None,
+    *,
+    corpus_type: str | None = None,
+    role_a: str = FOCUS_ROLE_ORIGINAL,
 ) -> str:
-    """judge 的 user message 开头块：原句那份关注词 + 改写句那份 + 语料类型行（有类型时）
+    """两侧关注词的开头块：a 侧那份 + b 侧那份 + 语料类型行（有类型时）
 
-    比其余三个 agent 多一段（各 2 行 + 类型行）：judge 同时拿着原句与改写句，而两侧的关注词
-    是两个词——原句里被替换掉的那个，与改写句里换上去的那个（见 st.replacement_focus_word）。
-    第 1 行仍是「原句里被替换掉的那个词」：四份提示语的条件句都按「第一行点名了本次要关注的词」
-    写，judge.txt 也照这个说。
+    比其余三个 agent 多一段（各 2 行 + 类型行）：这里同时拿着原句与改写句的两份关注词——原句里
+    被替换掉的那个，与改写句里换上去的那个（见 st.replacement_focus_word）。第 1 行仍是关注词
+    那一行：四份提示语的条件句都按「第一行点名了本次要关注的词」写。
+
+    role_a 决定 a 侧那句怎么说，默认 FOCUS_ROLE_ORIGINAL——judge 走这条：它同时拿着两句，
+    第 2 行要点明「本次要判的就是把原句这个词换成改写句那个词之后是否同义」。all_in_one 一次
+    作答五个判断，a 侧按 FOCUS_ROLE_RECORD 说（与 reality/semantic/feature/schema 四个 agent
+    一致，注入的 reality 判据也说「第二行交代了这个词是怎么被提取出来的」）。b 侧恒为
+    FOCUS_ROLE_REPLACEMENT：两侧的关注词是两个词，一侧说错措辞就丢掉可比性。
 
     两侧各自没有关注词时用 FOCUS_A_ABSENT / FOCUS_B_ABSENT 占位（原句取不到词、没走到改写、
     状态是手工拼的），**行数不变**：focus_line 对空关注词只回一行中性说明，让它顶上去整体就少一行，
@@ -451,7 +461,7 @@ def pair_head_block(
     return "\n".join(
         part
         for part in (
-            focus_line(focus_word, role=FOCUS_ROLE_ORIGINAL)
+            focus_line(focus_word, role=role_a)
             if isinstance(focus_word, dict) and focus_word.get("word")
             else FOCUS_A_ABSENT,
             focus_line(focus_word_b, role=FOCUS_ROLE_REPLACEMENT)
@@ -591,6 +601,22 @@ def _subagent_specs(feature_classes: list[dict]) -> list[dict]:
     ]
 
 
+def render_class_blocks(feature_classes: list[dict], class_template: str, *, usage: str) -> list[str]:
+    """flat 提示语里的类别段：每类一段 `### 名称（key：key）` + feature_class.txt 的渲染
+
+    单次调用（flat）要把各类的判据、可选取值与逐字照抄规则一并塞进同一份系统提示语，模型靠每段
+    开头这行标题把取值填进正确的字段（deep 时归属由 roster 交代，不需要这行）。
+
+    all_in_one 的 {{roster}} 占位符也复用这一份：两处的类别段（含取值按「、」拼接的口径、
+    逐字照抄规则）因此逐字一致，不会各自演化——这正是不必在那边另写一套渲染的原因。
+    """
+    return [
+        f"### {feature_class.get('name') or feature_class['key']}（key：{feature_class['key']}）\n"
+        f"{_class_prompt(class_template, feature_class, usage=usage)}"
+        for feature_class in feature_classes
+    ]
+
+
 def _render_feature_prompts(
     feature_classes: list[dict],
     head_template: str,
@@ -606,15 +632,11 @@ def _render_feature_prompts(
     mode="flat"（默认，单次调用）的主提示语用 feature_flat.txt（占位符 {{n}}/{{classes}}），
     mode="deep" 用 feature.txt（占位符 {{n}}/{{roster}}，各类的提示语给对应 subagent）。
 
-    flat 的每个类块前加一行标题（类名 + key）：单次调用时模型要靠它把取值填进正确的字段，
-    deep 时 subagent 的归属由 roster 交代，不需要这一行。
+    flat 的类别段（{{classes}}）由 render_class_blocks 拼（每类前加一行标题），all_in_one 复用同一份。
     """
     class_prompts = [_class_prompt(class_template, feature_class, usage=usage) for feature_class in feature_classes]
     if mode == "flat":
-        blocks = [
-            f"### {spec['label']}（key：{spec['key']}）\n{prompt}"
-            for spec, prompt in zip(_subagent_specs(feature_classes), class_prompts, strict=True)
-        ]
+        blocks = render_class_blocks(feature_classes, class_template, usage=usage)
         head = utils.render_prompt(
             head_template,
             {"n": len(feature_classes), "classes": "\n\n".join(blocks)},
@@ -1074,6 +1096,9 @@ class AlterAgent(BaseAgent):
     规则表每组形如 {"words": [...], "replacements": [...]}：关注词落在某组的 words 里，
     就用该组的 replacements 替换（排除关注词本身），见 spatial_tools.alter_sentence。
 
+    句内**每个**目标词位置各出一批候选（见 expand_positions）：一条记录只改一个位置，其余目标词
+    原样保留作参照。哪个词算目标词由 spatial_tools.pick_focus_words 定；位置之间不组合。
+
     纯规则，不调 LLM。rules 可由构造参数注入，于是同一个类能按不同规则表建多份供对照实验
     （spatial_runner.py --alter-rules 走的就是这条路）。构造时按 st.validate_alter_rules 校验，
     填错当场抛错。
@@ -1111,7 +1136,11 @@ class AlterAgent(BaseAgent):
         return self.table_path
 
     def run(self, sentence_slice: list[str], focus_word: dict) -> dict:
-        """改写出全部待选句：slices 是"词的列表的列表"，sentences 是对应的句子字符串"""
+        """按**一个**位置改写出全部待选句：slices 是"词的列表的列表"，sentences 是对应的句子字符串
+
+        句内多个位置各出一批候选是 expand_positions 的事，本方法只管一个位置（口径见
+        spatial_tools.alter_sentence：只动 index 处的那个 token）。
+        """
         slices, detail = st.alter_sentence(sentence_slice, focus_word or {}, self.rules)
         return {
             "slices": slices,
@@ -1120,45 +1149,84 @@ class AlterAgent(BaseAgent):
             "detail": detail,
         }
 
-    def expand(self, sentence_slice: list[str], focus_word: dict) -> tuple[list[dict], dict]:
-        """把改写结果摊成一条待选句一项，连同改写详情一起返回 (待选句列表, detail)
+    def expand_positions(
+        self, sentence_slice: list[str], focus_words: list[dict]
+    ) -> tuple[list[dict], list[dict]]:
+        """把句内**每个**目标词位置各展开成一批待选句，摊平成一条待选句一项
+
+        位置之间**不组合**：一条记录只改一个位置，句里其余目标词原样保留作参照。所以
+        "一条语料展开成几个待选句"= 各位置的候选数之和，`candidate_index` 在这份**全展开**上
+        连续编号——排序键 (line_no, candidate.index) 要求同一行内唯一（见
+        spatial_graphs.record_order_key），按位置重新从 0 编号会撞键。
 
         每项形如：
-            {"candidate_index": 0, "candidate_total": 2, "word": "上", "span": [1, 2],
+            {"candidate_index": 0, "candidate_total": 4, "word": "上", "span": [2],
+             "focus_index": 2, "focus_word": {"index": 2, "word": "上", "kind": "方位词", ...},
              "slice": [...], "sentence": "在硬件中说…", "replacement": "中",
              "source": "groups[0]", "group": ["上", "中", "里"]}   # group 是该组的 words 命中集
+
+        focus_index / focus_word 标明"这一条改的是哪个位置上的哪个词"：同一条语料里
+        `上@3` 与 `上@5` 会有各自的一批候选，只有带着位置才分得开（见 spatial_graphs.alter_node）。
+
+        returns 的 details 与**位置**一一对应（不是与候选一一对应），形如
+        [{"focus_word": ..., "detail": ...}]，detail 是 spatial_tools.alter_sentence 的原样
+        改写详情；某位置展开不出候选时它照样在 details 里（调用方靠 detail["reason"] 记原因），
+        只是不进候选表——它没有可写的记录，一个坏位置不连坐其它位置。
+
         跑批前的展开（spatial_graphs.alter_init_states）、节点里取自己那一条、预填充清点句子
         三处都走本方法，保证"这条语料展开成几个待选句"与"记录里选中的是哪个候选"不会对不上。
-
-        没有待选句时列表为空，原因在 detail["reason"]（applied=False）。
         """
-        result = self.run(sentence_slice, focus_word)
-        detail = result["detail"]
-        candidates = [
-            {
-                "candidate_index": index,
-                "candidate_total": len(result["slices"]),
-                "word": detail["word"],
-                "span": detail["span"],
-                "slice": slice_,
-                "sentence": sentence,
-                **candidate,
-            }
-            for index, (candidate, slice_, sentence) in enumerate(
-                zip(detail["candidates"], result["slices"], result["sentences"])
-            )
-        ]
-        return candidates, detail
+        candidates: list[dict] = []
+        details: list[dict] = []
+        for focus_word in focus_words or []:
+            if not isinstance(focus_word, dict):
+                continue
+            result = self.run(sentence_slice, focus_word)
+            detail = result["detail"]
+            details.append({"focus_word": focus_word, "detail": detail})
+            for candidate, slice_, sentence in zip(
+                detail["candidates"], result["slices"], result["sentences"]
+            ):
+                candidates.append(
+                    {
+                        "candidate_index": len(candidates),
+                        # 全展开完才知道总数，循环后统一回填（只此一处，免得就地算错）
+                        "candidate_total": None,
+                        "word": detail["word"],
+                        "span": detail["span"],
+                        "focus_index": focus_word.get("index"),
+                        "focus_word": focus_word,
+                        "slice": slice_,
+                        "sentence": sentence,
+                        **candidate,
+                    }
+                )
+        for candidate in candidates:
+            candidate["candidate_total"] = len(candidates)
+        return candidates, details
 
-    def plan_all(self, sentence_slice: list[str], focus_word: dict) -> list[str]:
-        """只算出全部待选句、无任何副作用
+    def expand(self, sentence_slice: list[str], focus_word: dict) -> tuple[list[dict], dict]:
+        """只按一个位置改写（expand_positions 的单位置薄包装）
+
+        保留给"只关心一个关注词"的调用点；跑批链路走 expand_positions（句内每个位置各一批）。
+        返回 (待选句列表, 该位置的 detail)；没有待选句时列表为空，原因在 detail["reason"]。
+        """
+        candidates, details = self.expand_positions(sentence_slice, [focus_word or {}])
+        return candidates, (details[0]["detail"] if details else {})
+
+    def plan_all_positions(self, sentence_slice: list[str], focus_words: list[dict]) -> list[str]:
+        """只算出全部位置的全部待选句、无任何副作用
 
         供图在跑批之前统计"整批会出现哪些句子"，以便一次性预填充 LTP（见 spatial_graphs.*_plan）。
-        与 run()/expand() 同源，保证预填充的句子和图里真正会用到的一致：漏掉任何一个待选句，
-        它就会在线程池里第一次遇到时才做句法分析，而推理在锁外，多线程下就是并发调同一份 LTP。
+        与 run()/expand_positions() 同源，保证预填充的句子和图里真正会用到的一致：漏掉任何一个
+        待选句，它就会在线程池里第一次遇到时才做句法分析，而推理在锁外，多线程下就是并发调同一份 LTP。
         """
-        candidates, _ = self.expand(sentence_slice, focus_word)
+        candidates, _ = self.expand_positions(sentence_slice, focus_words)
         return [candidate["sentence"] for candidate in candidates]
+
+    def plan_all(self, sentence_slice: list[str], focus_word: dict) -> list[str]:
+        """只算出一个位置的全部待选句（plan_all_positions 的单位置薄包装）"""
+        return self.plan_all_positions(sentence_slice, [focus_word or {}])
 
     def describe(self) -> str:
         groups = self.rules.get("groups") or []
