@@ -7,8 +7,10 @@
 （列序见 spatial_tools.PAIR_CSV_COLUMNS，改列只改那里）。
 
 结果 jsonl（spatial_runner.py / all_in_one.py 的输出，记录形状见 spatial_graphs.serialize_pair）
-里每条记录是一对「原句 vs 替换句」，关键信息散在几个嵌套块里：
+里每条记录是一对「原句 vs 替换句」，关键信息除了顶层 id 外散在几个嵌套块里：
 
+    id                         记录标识（顶层字段）：语料行号-第几个目标词-第几个替换句；无
+                               替换句记「行号-0-0」（见 spatial_graphs._record_id），旧记录留空
     pair.a/b.sentence          原句、替换句
     focus_word / focus_word_b  关键词 a、关键词 b
     schema.a/b.name            a、b 的图式

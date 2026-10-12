@@ -1172,12 +1172,20 @@ class AlterAgent(BaseAgent):
 
         每项形如：
             {"candidate_index": 0, "candidate_total": 4, "word": "上", "span": [2],
-             "focus_index": 2, "focus_word": {"index": 2, "word": "上", "kind": "方位词", ...},
+             "focus_index": 2, "focus_order": 1, "candidate_order": 3,
+             "focus_word": {"index": 2, "word": "上", "kind": "方位词", ...},
              "slice": [...], "sentence": "在硬件中说…", "replacement": "中",
              "source": "groups[0]", "group": ["上", "中", "里"]}   # group 是该组的 words 命中集
 
         focus_index / focus_word 标明"这一条改的是哪个位置上的哪个词"：同一条语料里
         `上@3` 与 `上@5` 会有各自的一批候选，只有带着位置才分得开（见 spatial_graphs.alter_node）。
+
+        focus_order / candidate_order 是拼记录 id 用的两个**从 1 起**的层级序号（见
+        spatial_graphs._record_id）：前者数"句内第几个展开出候选的目标词"（按本方法的循环顺序，
+        展开不出候选的位置不占号），后者数"该词自己的第几个替换句"（按规则表顺序）。
+        四个编号各是各的口径，别混：candidate_index 是全展开上从 0 起的连续号（排序键用），
+        focus_index 是句内第几个 token（0 基下标，"是不是同一位置"看它）——后两个只用来拼
+        id（候选 dict 上的这两个键不直接落盘，落盘的是它们拼出的顶层 id）。
 
         returns 的 details 与**位置**一一对应（不是与候选一一对应），形如
         [{"focus_word": ..., "detail": ...}]，detail 是 spatial_tools.alter_sentence 的原样
@@ -1189,14 +1197,20 @@ class AlterAgent(BaseAgent):
         """
         candidates: list[dict] = []
         details: list[dict] = []
+        focus_order = 0
         for focus_word in focus_words or []:
             if not isinstance(focus_word, dict):
                 continue
             result = self.run(sentence_slice, focus_word)
             detail = result["detail"]
             details.append({"focus_word": focus_word, "detail": detail})
-            for candidate, slice_, sentence in zip(
-                detail["candidates"], result["slices"], result["sentences"]
+            if not detail["candidates"]:
+                # 这个位置展开不出候选：不进候选表、也不占 focus_order 的号——没有记录会用到它，
+                # 同一原句的 id 第二段于是连续（日后要改成"每个位置都占号"就动这一处）
+                continue
+            focus_order += 1
+            for candidate_order, (candidate, slice_, sentence) in enumerate(
+                zip(detail["candidates"], result["slices"], result["sentences"]), start=1
             ):
                 candidates.append(
                     {
@@ -1206,6 +1220,9 @@ class AlterAgent(BaseAgent):
                         "word": detail["word"],
                         "span": detail["span"],
                         "focus_index": focus_word.get("index"),
+                        # 从 1 起的两个层级序号，只用来拼记录 id（见 spatial_graphs._record_id）
+                        "focus_order": focus_order,
+                        "candidate_order": candidate_order,
                         "focus_word": focus_word,
                         "slice": slice_,
                         "sentence": sentence,

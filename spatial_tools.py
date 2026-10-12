@@ -1577,6 +1577,9 @@ def read_jsonl(path: str | Path) -> list[dict]:
 
 
 PAIR_CSV_COLUMNS: tuple[tuple[str, str], ...] = (
+    # 记录标识「语料行号-第几个目标词-第几个替换句」（见 spatial_graphs._record_id）：
+    # 没有替换句的记录是「行号-0-0」；id 之前产出的旧记录没有这个字段，这一格留空
+    ("id", "id"),
     ("原句", "pair.a.sentence"),
     ("替换句", "pair.b.sentence"),
     ("关键词a", "focus_word.word"),
@@ -1595,6 +1598,8 @@ PAIR_CSV_COLUMNS: tuple[tuple[str, str], ...] = (
 真源就在这里：跑批收尾（spatial_runner.ResultWriter.finish）与独立的导出脚本
 （export_pairs_csv.py）都用这一份，改列只改这里。只有 pair 图画得成这张表——单句图与
 改写检查图的记录里没有 pair/judgement 两块（见 spatial_graphs.GraphSpec.csv_columns）。
+首列 id 是记录标识（语料行号-第几个目标词-第几个替换句，口径见 spatial_graphs._record_id），
+在记录里就是顶层一个字段、点分路径只有一段；旧记录缺它时这一格留空。
 """
 
 

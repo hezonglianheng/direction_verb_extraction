@@ -865,6 +865,30 @@ def pair_final_status(state: PairState) -> str:
     return "ok" if stage == "semantic_ok" else "ok_no_semantic_gate"
 
 
+def _record_id(state: dict) -> str | None:
+    """记录 id：语料行号-第几个目标词-该词第几个替换句（三段从 1 起；没有替换句记 0-0）
+
+    三段都取自记录里能直接读到的东西：line_no 是语料文件里的真实行号（st.read_corpus 写入，
+    不受 --offset/--limit 影响）；后两段是展开时写在候选上的 focus_order / candidate_order
+    （见 AlterAgent.expand_positions）——前者是"句内第几个展开出候选的目标词"，后者是"该词
+    自己的第几个替换句"。与 focus_index（0 基 token 下标）不是一回事：同句两处同一个词
+    （上@3 与 上@5）各有各的 focus_order，光看词分不开。
+
+    没有替换句的记录（bad_record / alter_missed，candidate 为 None）记成 `行号-0-0`：这类
+    记录每行至多一条（见 alter_init_states），同一份输出里 id 于是不撞。它是拼出来的**字符串**，
+    字典序不等于数值序，别拿它当排序键（排序仍走 record_order_key）。
+
+    line_no 缺失（手工拼的坏记录）时返回 None，落盘为 null、csv 留空——不编造行号。
+    """
+    line_no = (state.get("record") or {}).get("line_no")
+    if not isinstance(line_no, int):
+        return None
+    chosen = state.get("candidate")
+    if not chosen:
+        return f"{line_no}-0-0"
+    return f"{line_no}-{chosen.get('focus_order')}-{chosen.get('candidate_order')}"
+
+
 def _candidate_block(state: dict) -> dict | None:
     """结果记录里的 candidate 块：这条记录是哪个待选句、共几个、改的哪个位置、换成哪个词
 
@@ -916,9 +940,13 @@ def serialize_pair(state: PairState) -> dict:
 
     focus_word（a 侧）与 focus_word_b（b 侧）都落盘：两侧的 schema 是各按自己那侧的关注词收窄出来的，
     事后要核对"这一对落在判定表哪一格、为什么"就得两份都在。
+
+    id（见 _record_id）刻意放在第一个键上：它同时是成对信息 csv 的首列（st.PAIR_CSV_COLUMNS），
+    事后按 id 认记录、回查不用再拼 (line_no, candidate.index)。
     """
     record = state["record"]
     return {
+        "id": _record_id(state),
         "status": pair_final_status(state),
         "stage": state.get("stage", "unknown"),
         "status_reason": state.get("status_reason", ""),
