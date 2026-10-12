@@ -15,6 +15,7 @@ import time
 
 import config
 import sentenceFilters
+from file_paths import collect_jsonl_inputs
 
 
 _WORKER_FILTERS: list[tuple[str, Any]] = []
@@ -159,19 +160,14 @@ def iter_jsonl_file_sentences(input_file: str, position: int = 0, vocabs: list[s
 	print(f"从文件 {input_file} 中提取了 {extracted_count} 个句子")
 
 
-def iter_path_sentences(src_path: str, vocabs: list[str] = None):
-	input_path = Path(src_path)
-	if input_path.is_file():
-		yield from iter_jsonl_file_sentences(src_path, position=0, vocabs=vocabs)
-		return
-
-	if input_path.is_dir():
-		files = list(input_path.glob("*.jsonl"))
-		for i, file in enumerate(files):
-			yield from iter_jsonl_file_sentences(str(file), position=i, vocabs=vocabs)
-		return
-
-	raise ValueError(f"输入路径 {src_path} 既不是文件也不是目录")
+def iter_path_sentences(src_path: str, vocabs: list[str] = None, *, output_paths=()):
+	# 此函数不能自身包含 yield：路径检查和目录扫描必须在打开输出文件前完成。
+	files = collect_jsonl_inputs(src_path, output_paths)
+	return (
+		sentence
+		for i, file in enumerate(files)
+		for sentence in iter_jsonl_file_sentences(str(file), position=i, vocabs=vocabs)
+	)
 
 
 def filter_sentences_streaming(
@@ -271,7 +267,7 @@ def run(src_path: str, filter_config_paths: Any, output_paths: Any, vocabs: list
 	if len(filter_config_paths) != len(paths):
 		raise ValueError(f"规则套数（{len(filter_config_paths)}）与输出文件数（{len(paths)}）不一致")
 
-	sentences = iter_path_sentences(src_path, vocabs=vocabs)
+	sentences = iter_path_sentences(src_path, vocabs=vocabs, output_paths=paths)
 
 	with ExitStack() as stack:
 		out_files = [stack.enter_context(open(path, "w", encoding="utf-8")) for path in paths]

@@ -162,11 +162,6 @@ def main(
     else:
         print("[筛选计划] 未使用初筛")
 
-    # 输出落在输入目录里时，生成的 jsonl 会被下一轮当作输入读入（届时因缺 content 字段报错）
-    src = Path(src_path)
-    if src.is_dir() and any(output_path.parent == src for output_path in output_paths):
-        print(f"[警告] 输出目录与输入目录相同（{src}），新生成的 jsonl 会被下一次运行的输入扫描读到")
-
     if sys.platform.startswith("win"):
         run_windows_entry(src_path, filter_configs, output_paths, vocabs)
     else:

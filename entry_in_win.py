@@ -2,13 +2,15 @@ from ltp import StnSplit
 import jsonlines
 from tqdm import tqdm
 
+from contextlib import ExitStack
 from pathlib import Path
 import re
-from typing import Any
+from typing import Any, Iterable
 import json
 
 import config
 import sentenceFilters
+from file_paths import collect_jsonl_inputs
 
 
 _WORKER_FILTERS: list[tuple[str, Any]] = []
@@ -95,108 +97,118 @@ def get_sentences_list(article: str, vocabs: list[str] = None) -> list[str]:
 	return [s for s in sentences if s]
 
 
-def load_jsonl_file_sentences_in_memory(input_file: str, position: int = 0, vocabs: list[str] = None) -> list[dict[str, Any]]:
+def iter_jsonl_file_sentences(input_file: str, vocabs: list[str] = None):
+	"""逐条读入、逐条切分并产出句子
+
+	与整文件读入版（历史实现）的区别：jsonlines 本身是流式读的，这里不再把整份文件
+	一次性 list() 进内存——大语料下内存占用只随单条文章的大小增长。
+	"""
 	extracted_count = 0
-	extracted_sentences: list[dict[str, Any]] = []
 	with jsonlines.open(input_file) as reader:
-		records = list(reader)
-		for obj in tqdm(
-			records,
-			total=len(records),
-			desc=f"Processing {Path(input_file).name}",
-			position=position,
-			leave=True,
-			dynamic_ncols=True,
-		):
+		for obj in reader:
 			article: str = obj["content"]
-			sentence_list = get_sentences_list(article, vocabs)
-			for sentence in sentence_list:
+			for sentence in get_sentences_list(article, vocabs):
 				extracted_count += 1
-				extracted_sentences.append({"sentence": sentence, "source_file": input_file})
+				yield {"sentence": sentence, "source_file": input_file}
 	print(f"从文件 {input_file} 中提取了 {extracted_count} 个句子")
-	return extracted_sentences
 
 
-def load_path_sentences_in_memory(src_path: str, vocabs: list[str] = None) -> list[dict[str, Any]]:
-	input_path = Path(src_path)
-	all_sentences: list[dict[str, Any]] = []
+def iter_path_sentences(src_path: str, vocabs: list[str] = None, *, output_paths=()):
+	"""目录（或单文件）下的 jsonl 逐文件流式产出句子
 
-	if input_path.is_file():
-		return load_jsonl_file_sentences_in_memory(src_path, position=0, vocabs=vocabs)
-
-	if input_path.is_dir():
-		files = list(input_path.glob("*.jsonl"))
-		for i, file in enumerate(files):
-			all_sentences.extend(load_jsonl_file_sentences_in_memory(str(file), position=i, vocabs=vocabs))
-		return all_sentences
-
-	raise ValueError(f"输入路径 {src_path} 既不是文件也不是目录")
+	此函数不能自身包含 yield：路径检查和目录扫描必须在打开输出文件前完成
+	（与 entry_in_linux.iter_path_sentences 同一理由）。
+	"""
+	files = collect_jsonl_inputs(src_path, output_paths)
+	return (
+		sentence
+		for file in files
+		for sentence in iter_jsonl_file_sentences(str(file), vocabs=vocabs)
+	)
 
 
-def filter_sentences_windows_in_memory(sentences: list[dict[str, Any]], filter_config_paths: Any) -> list[list[dict[str, Any]]]:
-	"""一次遍历、多套规则，各自把命中句累积在一个列表里
+def filter_sentences_streaming(
+	sentences: Iterable[dict[str, Any]],
+	filter_config_paths: Any,
+	out_files: list[Any],
+):
+	"""一次遍历、多套规则，命中即按批落盘
 
-	Returns:
-		list[list[dict[str, Any]]]: 与 filter_config_paths 同序的命中结果
+	与 filter_sentences_windows_in_memory 同一套规则与 LTP 预填充口径，差别只在
+	不把全量候选句与全部命中结果留在内存里：句子边读边筛，每批（FILTER_BATCH_SIZE）
+	筛完立即把命中行写进打开好的输出文件——内存占用不随语料规模增长。
+
+	Args:
+		sentences (Iterable[dict[str, Any]]): 备选句子流
+		filter_config_paths (Any): 一套或多套筛选规则配置文件路径
+		out_files (list[Any]): 与 filter_config_paths 同序的可写文件对象
 	"""
 	families = [Path(path).stem for path in _as_list(filter_config_paths)]
-	filtered_sentences: list[list[dict[str, Any]]] = [[] for _ in families]
+	if len(families) != len(out_files):
+		raise ValueError(f"规则套数（{len(families)}）与输出文件数（{len(out_files)}）不一致")
+
+	_init_filter_worker(filter_config_paths)
 	candidate_count = 0
 	hit_counts: dict[str, int] = {ANY_HIT: 0}
 	hit_counts.update({family: 0 for family in families})
-
-	_init_filter_worker(filter_config_paths)
 	batch_size = max(1, int(config.FILTER_BATCH_SIZE))
+
+	def _filter_batch(batch: list[dict[str, Any]], pbar: tqdm) -> None:
+		"""整批预填充 LTP → 逐句走规则引擎 → 本批命中立即写盘"""
+		nonlocal candidate_count
+		# 分块「先整批预填充 LTP 结果，再逐句走规则引擎」：逐句调用 pipeline 实测慢约 4 倍。
+		# 必须分块而不能一次性预填充，否则整批会被 LRU 在读取前淘汰。
+		# 多套规则共用这份缓存，故 prefill 每批只做一次，不会重复推理。
+		sentenceFilters.cache.prefill(item.get("sentence", "") for item in batch)
+
+		for sentence_item in batch:
+			candidate_count += 1
+			item_results = _filter_sentence(sentence_item)
+			if any(result is not None for result in item_results):
+				hit_counts[ANY_HIT] += 1
+			for idx, family in enumerate(families):
+				if item_results[idx] is not None:
+					hit_counts[family] += 1
+					out_files[idx].write(json.dumps(item_results[idx], ensure_ascii=False) + "\n")
+			pbar.update(1)
+			pbar.set_postfix(
+				_build_progress_postfix(
+					candidate_count,
+					hit_counts,
+				),
+				refresh=False,
+			)
+
 	with tqdm(
-		total=len(sentences),
-		desc="Filtering sentences (Windows memory)",
-		position=1,
+		desc="Filtering sentences (Windows streaming)",
 		leave=True,
 		dynamic_ncols=True,
 		unit="sentence",
 	) as pbar:
-		# 分块「先整批预填充 LTP 结果，再逐句走规则引擎」：逐句调用 pipeline 实测慢约 4 倍。
-		# 必须分块而不能一次性预填充，否则整批会被 LRU 在读取前淘汰。
-		# 多套规则共用这份缓存，故 prefill 每批只做一次，不会重复推理。
-		for start in range(0, len(sentences), batch_size):
-			batch = sentences[start : start + batch_size]
-			sentenceFilters.cache.prefill(item.get("sentence", "") for item in batch)
-
-			for sentence_item in batch:
-				candidate_count += 1
-				item_results = _filter_sentence(sentence_item)
-				if any(result is not None for result in item_results):
-					hit_counts[ANY_HIT] += 1
-				for idx, family in enumerate(families):
-					if item_results[idx] is not None:
-						hit_counts[family] += 1
-						filtered_sentences[idx].append(item_results[idx])
-				pbar.update(1)
-				pbar.set_postfix(
-					_build_progress_postfix(
-						candidate_count,
-						hit_counts,
-					),
-					refresh=False,
-				)
+		batch: list[dict[str, Any]] = []
+		for sentence_item in sentences:
+			batch.append(sentence_item)
+			if len(batch) >= batch_size:
+				_filter_batch(batch, pbar)
+				batch = []
+		if batch:
+			_filter_batch(batch, pbar)
 
 	print(f"从 {candidate_count} 个备选句子中筛选出了 {hit_counts[ANY_HIT]} 个符合条件的句子")
 	for family in families:
 		print(f"    {family}：{hit_counts[family]} 个句子")
-	return filtered_sentences
 
 
 def run_windows_entry(src_path: str, filter_config_paths: Any, output_paths: Any, vocabs: list[str] = None):
-	print("[运行模式] Windows: 整文件读入内存处理")
+	print("[运行模式] Windows: 流式处理（分批读取、筛选、落盘）")
 	filter_config_paths = _as_list(filter_config_paths)
 	paths = [Path(p) for p in _as_list(output_paths)]
 	if len(filter_config_paths) != len(paths):
 		raise ValueError(f"规则套数（{len(filter_config_paths)}）与输出文件数（{len(paths)}）不一致")
 
-	sentences = load_path_sentences_in_memory(src_path, vocabs)
-	filtered_sentences = filter_sentences_windows_in_memory(sentences, filter_config_paths)
-
-	for path, rows in zip(paths, filtered_sentences):
-		with open(path, "w", encoding="utf-8") as f:
-			for row in rows:
-				f.write(json.dumps(row, ensure_ascii=False) + "\n")
+	# 输入清单与路径校验在打开任何输出之前完成（见 iter_path_sentences），
+	# 随后输出文件保持打开，命中按批直接写入，收尾不必再统一写盘。
+	sentences = iter_path_sentences(src_path, vocabs, output_paths=paths)
+	with ExitStack() as stack:
+		out_files = [stack.enter_context(open(path, "w", encoding="utf-8")) for path in paths]
+		filter_sentences_streaming(sentences, filter_config_paths, out_files)

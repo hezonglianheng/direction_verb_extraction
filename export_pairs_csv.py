@@ -34,6 +34,7 @@ import argparse
 from pathlib import Path
 
 import spatial_tools as st
+from file_paths import validate_output_paths
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -53,6 +54,10 @@ def main(argv: list[str] | None = None) -> int:
     if not in_path.exists():
         raise SystemExit(f"找不到输入文件：{in_path}")
     out_path = Path(args.out) if args.out else in_path.with_suffix(".csv")
+    try:
+        validate_output_paths([in_path], [out_path])
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
     records = st.read_jsonl(in_path)
     total, judged = st.write_pairs_csv(records, out_path)

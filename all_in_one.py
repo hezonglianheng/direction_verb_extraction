@@ -2,12 +2,12 @@
 
 """把 pair 图六步链路压成一次 LLM 调用的对照实现。
 
-spatial_runner.py --graph pair 跑一条记录要六次模型往返（reality → semantic 两次 → feature →
-schema → judge），而且**后一步只能看前一步的
+spatial_runner.py --graph pair 跑一条记录要八次模型调用（reality 一次 → semantic 两次 →
+feature 两次 → schema 两次 → judge 一次），而且**后一步只能看前一步的
 结论**：改写词到底有没有换掉空间关系，是等 schema 定了才在 judge 里被比较的。本脚本是它的
 单次调用对照版：一条记录只发**一次**请求，把五个 LLM 判断一起答出来，纯规则的改写与两张
 查表仍在本地做，最后落一条**与 pair 图逐字段同形**的记录（同形靠直接调 sg.serialize_pair，
-不是照着抄一遍字段名）。于是两件事同时成立：用一次调用换到原来六次调用的结论；两份 jsonl
+不是照着抄一遍字段名）。于是两件事同时成立：用一次调用换到原来八次调用的结论；两份 jsonl
 可以直接逐字段对账，看单次调用掉了多少精度、省了多少次往返。
 
 其中 reality 那一问在 pair 侧是**按原句共享**的：闸门判的只是原句，而一条语料会展开成多个
@@ -27,6 +27,8 @@ schema → judge），而且**后一步只能看前一步的
 （ToolStrategy(handle_errors=True)），那是第二次 API 调用，与「只调一次」冲突，所以默认关掉
 （想放宽用 --allow-retry），解析不出来就如实记 all_in_one.error。实测这一次 invoke 对应
 **一次**真实 chat 请求（回调计数器量的，不是推断的：强制工具调用一返回就结束，不再有第二次往返）。
+这个回调计数现在挂在每条记录上（all_in_one.requests，见 CallCounter / _RequestProbe）：
+补发若真的发生会如实多算一次请求，收尾打印的「实际请求 − 模型轮次」就是补发过的次数。
 
 仍有一类失败是躲不掉的：deepseek 偶发地回 400（assistant 消息里的 tool_calls 没有被逐条回应，
 像是模型偶尔一次吐出多个并发工具调用），strict 下同样会出现。它不带走整批，记进 error、
@@ -35,7 +37,7 @@ schema → judge），而且**后一步只能看前一步的
 收尾还会打印一个对照数：同样这些状态，pair 图按每状态走到哪一步累加要发几次请求（不计它按句/
 按消息的复用，故是上界；精确数看 pair 产物 summary 里的 agent_stats.roundtrips）。
 
-为什么不给 parse_sentence 工具：工具调用就是又一次 API 请求，六次往返正是要消掉的东西。
+为什么不给 parse_sentence 工具：工具调用就是又一次 API 请求，八次往返正是要消掉的东西。
 句法证据由本地 st.parse_sentence_text 算好塞进消息（--no-syntax 可以省掉，但那样就与
 六 agent 那条路不可比了——那边同样把句法证据内联进消息，只是没有这个开关）。
 
@@ -77,6 +79,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from langchain.agents.structured_output import ToolStrategy
+from langchain_core.callbacks import BaseCallbackHandler
 from pydantic import Field, create_model
 
 import agents as agent_factory
@@ -101,14 +104,15 @@ DEFAULT_OUT_PREFIX = "all_in_one"
 DEFAULT_LIMIT = 1
 """默认只处理 1 条：本脚本是单次调用的诊断入口，不是跑批工具（runner 那边默认 100）"""
 
-PAIR_CALLS_PER_STEP = {"reality": 1, "semantic": 2, "feature": 1, "schema": 1, "judgement": 1}
-"""pair 图走到某一步要发几次请求（两侧各判一次语法与空间语义，所以 semantic 是 2）
+PAIR_CALLS_PER_STEP = {"reality": 1, "semantic": 2, "feature": 2, "schema": 2, "judgement": 1}
+"""pair 图走到某一步要发几次请求（semantic / feature / schema 三个节点都按原句、改写句两侧各跑一次，所以各是 2）
 
-**不计缓存的上界**：按「每个走到这一步的状态各算一份」累加。pair 侧实际的按句/按消息复用一律
-不计——reality 按原句去重（见 sr._prefill_reality），semantic 的 a 侧、feature 与 schema 的 a 侧
-输入逐字相同也只问一次——所以真实往返数只会更低。它的用途是给「一次调用省了多少」一个可核对的
-**朴素口径**，既不是精确值也不是下界；要精确数就去读 pair 产物 summary 里的 agent_stats.roundtrips。
-alter 不在表里：它是纯规则，0 次。
+整条链路在无缓存、每步都问模型时是 1+2+2+2+1 = 8 次。**不计缓存的上界**：按「每个走到这一步的
+状态各算一份」累加。pair 侧实际的按句/按消息复用一律不计——reality 按原句去重（见
+sr._prefill_reality），semantic 的 a 侧、feature 与 schema 的 a 侧输入逐字相同也只问一次，
+schema 查表命中（含兜底条目）一问都不发——所以真实往返数只会更低。它的用途是给「一次调用省了
+多少」一个可核对的**朴素口径**，既不是精确值也不是下界；要精确数就去读 pair 产物 summary 里的
+agent_stats.roundtrips。alter 不在表里：它是纯规则，0 次。
 """
 
 
@@ -358,9 +362,12 @@ def prepare(state: dict, ctx: "_Context", args: argparse.Namespace) -> _Prepared
     syntax_a = syntax_b = None
     errors: list[str] = []
     if not args.no_syntax:
-        syntax_a, error_a = _syntax_block(sentence_a)
-        syntax_b, error_b = _syntax_block(sentence_b)
-        errors = [error for error in (error_a, error_b) if error]
+        if ctx.syntax_error:
+            errors = [ctx.syntax_error]
+        else:
+            syntax_a, error_a = _syntax_block(sentence_a)
+            syntax_b, error_b = _syntax_block(sentence_b)
+            errors = [error for error in (error_a, error_b) if error]
 
     return _Prepared(
         message=build_user_message(
@@ -382,43 +389,78 @@ def prepare(state: dict, ctx: "_Context", args: argparse.Namespace) -> _Prepared
 # --------------------------------------------------------------------------
 
 
-class CallCounter:
-    """本次跑批真发出去的请求数
+class _RequestProbe(BaseCallbackHandler):
+    """一次 invoke 里真发出几次 chat 请求的回调计数器
 
-    只在 call_once 里 +1：这是「只调一次」这句承诺唯一可核对的地方（收尾打印它）。
-
-    --workers 下 call_once 会从各个 worker 并发调到这来，故 self.count 用锁串起来
-    （与 ResultWriter 同一口径）；收尾是等池子跑完再读，读到的是终值。
+    由 call_once 挂在**本次 invoke** 的 config 上，而不是挂在 agent 上：worker 并发下
+    每条记录各带各的探针，请求数才按记录归账。on_chat_model_start 在模型每次真正开始
+    一次请求时触发——ToolStrategy(handle_errors=True) 的补发是同一个 invoke 里的第二次
+    模型请求，会再触发一次（「模型轮次」数不到、这里数得到）。底层 HTTP 连接层的自动
+    重试（langchain-openai 的 max_retries）发生在一次模型请求内部，不会再触发本回调，
+    不在本口径里。
     """
 
     def __init__(self) -> None:
         self.count = 0
         self.lock = threading.Lock()
 
-    def bump(self) -> None:
+    def on_chat_model_start(self, *args, **kwargs) -> None:
         with self.lock:
             self.count += 1
 
 
+class CallCounter:
+    """本次跑批的调用账：模型轮次与真实请求数
+
+    rounds   外层调用数（模型轮次）：只在 call_once 里 +1——「每条记录至多一次调用」
+             这句承诺唯一可核对的地方；agent 内部的补发不经过 call_once，数不到；
+    requests 实际请求数（含内部补发）：call_once 按每条记录的回调探针（_RequestProbe）
+             累加。收尾打印的两数之差就是被内部补发掉的次数。
+
+    --workers 下 call_once 会从各个 worker 并发调到这来，故两个计数都用锁串起来
+    （与 ResultWriter 同一口径）；收尾是等池子跑完再读，读到的是终值。
+    """
+
+    def __init__(self) -> None:
+        self.rounds = 0
+        self.requests = 0
+        self.lock = threading.Lock()
+
+    def bump(self) -> None:
+        with self.lock:
+            self.rounds += 1
+
+    def add_requests(self, count: int) -> None:
+        with self.lock:
+            self.requests += count
+
+
 def call_once(agent, content: str, counter: CallCounter) -> tuple:
-    """发一次请求，返回 (结构化输出, 出错原因)
+    """发一次请求，返回 (结构化输出, 出错原因, 本次真实请求数)
 
     本函数自己不重试：重试就是第二次请求，与「只调一次」直接冲突。单条记录失败不带走整批，
     原因如实记进 all_in_one.error，下游按 source="error" 诚实记录（闸门由此落到 semantic_error）。
 
     注意 agent 内部还藏着一条补发路径（ToolStrategy 的 handle_errors，见 build_call_agent）——
-    这里管不到它，所以那边默认也是关的。两处一起才构成「这一次就是唯一一次」。
+    这里管不到它，所以那边默认也是关的。两处一起才构成「这一次就是唯一一次」。补发若真的
+    发生，会如实落进返回的请求数里（见 _RequestProbe），收尾打印的两数之差即补发次数。
     """
 
     counter.bump()
+    probe = _RequestProbe()
     try:
-        result = agent.invoke({"messages": [{"role": "user", "content": content}]})
+        result = agent.invoke(
+            {"messages": [{"role": "user", "content": content}]},
+            config={"callbacks": [probe]},
+        )
     except Exception as e:
-        return None, f"调用失败：{e!r}"
+        counter.add_requests(probe.count)
+        return None, f"调用失败：{e!r}", probe.count
+    counter.add_requests(probe.count)
     response = result.get("structured_response") if isinstance(result, dict) else None
     if response is None:
-        return None, "模型这次没有给出结构化输出（structured_response 为空）"
-    return response.model_dump(), None
+        return None, "模型这次没有给出结构化输出（structured_response 为空）", probe.count
+    return response.model_dump(), None, probe.count
 
 
 def build_call_agent(model_key: str, system_prompt: str, verdict_model: type, *, allow_retry: bool):
@@ -611,6 +653,7 @@ class _Outcome(NamedTuple):
     semantic: dict
     features: dict
     features_source: str | None
+    features_detail: dict
     schema: dict
     judgement: dict
     reached: dict
@@ -652,6 +695,7 @@ def assemble(state: dict, ctx: "_Context", *, dumps: dict | None, error: str | N
     semantic: dict = {}
     features: dict = {}
     features_source: str | None = None
+    features_detail: dict = {}
     schema: dict = {}
     judgement: dict = {}
     if stage in sg.REALITY_CONTINUE:
@@ -675,15 +719,27 @@ def assemble(state: dict, ctx: "_Context", *, dumps: dict | None, error: str | N
         feature_agent = ctx.agents.need("feature")
         if not llm_used:
             local = feature_agent.run(sentences[0], focus_a)  # llm=False ⇒ 恒回 no_llm
-            features = {side: dict(local["features"]) for side in ("a", "b")}
-            features_source = local["source"]
+            feature_results = {side: {**local, "features": dict(local["features"])} for side in ("a", "b")}
         elif error or dumps is None:
             # 调用失败 / 没给出结构化输出：与 FeatureAgent.run 的 error 分支同形
-            features = {side: {} for side in ("a", "b")}
-            features_source = "error"
+            feature_results = {
+                side: {"features": {}, "source": "error", "reason": error or "未返回结构化输出"}
+                for side in ("a", "b")
+            }
         else:
-            features = {side: (dumps.get("features") or {}).get(side) or {} for side in ("a", "b")}
-            features_source = feature_agent.table_source
+            feature_results = {
+                side: {
+                    "features": (dumps.get("features") or {}).get(side) or {},
+                    "source": feature_agent.table_source,
+                    "reason": "",
+                }
+                for side in ("a", "b")
+            }
+        feature_fields = sg.pair_feature_update({"status_reason": reason}, feature_results)
+        features = feature_fields["features"]
+        features_source = feature_fields["features_source"]
+        features_detail = feature_fields["features_detail"]
+        reason = feature_fields.get("status_reason", reason)
 
         schema_dumps = (dumps or {}).get("schema", {}) if dumps else {}
         schema = {
@@ -709,7 +765,7 @@ def assemble(state: dict, ctx: "_Context", *, dumps: dict | None, error: str | N
             error=error,
         )
 
-    return _Outcome(stage, reason, reality, semantic, features, features_source, schema, judgement, reached)
+    return _Outcome(stage, reason, reality, semantic, features, features_source, features_detail, schema, judgement, reached)
 
 
 def _lookups(outcome: _Outcome) -> dict:
@@ -733,7 +789,7 @@ def process_state(state: dict, *, ctx: "_Context", args: argparse.Namespace, cal
     started = time.perf_counter()
     state = _apply(state, sg.alter_node(ctx.agents.need("alter"))(state))
 
-    prepared, dumps, error = None, None, None
+    prepared, dumps, error, requests = None, None, None, 0
     if state.get("stage") == "altered" and (ctx.llm or args.print_prompt):
         prepared = prepare(state, ctx, args)
         if args.print_prompt:
@@ -742,7 +798,7 @@ def process_state(state: dict, *, ctx: "_Context", args: argparse.Namespace, cal
                 prepared.message,
             )
         elif ctx.llm:
-            dumps, error = call_once(call_agent, prepared.message, counter)
+            dumps, error, requests = call_once(call_agent, prepared.message, counter)
 
     outcome = assemble(state, ctx, dumps=dumps, error=error, llm_used=ctx.llm)
     state = _apply(state, {"stage": outcome.stage, "status_reason": outcome.status_reason})
@@ -763,6 +819,7 @@ def process_state(state: dict, *, ctx: "_Context", args: argparse.Namespace, cal
     }
     if outcome.reached["feature"]:
         blocks["features_source"] = outcome.features_source
+        blocks["features_detail"] = outcome.features_detail
     state = _apply(state, blocks)
     answered = dumps is not None
     state = _apply(
@@ -793,7 +850,11 @@ def process_state(state: dict, *, ctx: "_Context", args: argparse.Namespace, cal
     record = sg.serialize_pair(state)
     record["all_in_one"] = {
         "model": ctx.model_key,
+        # 三个调用口径：pair_llm_calls 是理论调用数（每状态按走到哪一步累加、不计缓存与复用），
+        # llm_calls 是模型轮次（外层调用，每条记录至多 1 次），requests 是实际请求数
+        # （回调实测，含框架内部补发，见 CallCounter）
         "llm_calls": 1 if (answered or error is not None) else 0,
+        "requests": requests,
         "corpus_type": ctx.corpus_type,
         "feature_classes": [feature_class["key"] for feature_class in ctx.feature_classes],
         "prompt": {"name": PROMPT_FILE, "path": ctx.prompt_path, "reality_path": ctx.reality_path},
@@ -835,6 +896,8 @@ class _Context(NamedTuple):
     feature_classes: list
     prompt_path: str
     reality_path: str
+    syntax_error: str | None = None
+    """预填充失败的原因；本轮省略句法证据，避免每条记录再次尝试不可用的 LTP。"""
 
 
 def build_context(args: argparse.Namespace, corpus_type: str, out_path: Path) -> _Context:
@@ -1036,18 +1099,23 @@ def main(argv: list[str] | None = None) -> None:
         # --no-syntax 时消息里根本不放句法证据，预填充就是白算一遍（prepare 那边同样跳过）
         unique = [s for s in dict.fromkeys(plan_sentences(states)) if s]
         if unique:
-            filled = st.prefill_ltp(unique)
-            print(f"LTP 预填充：本次需 {len(unique)} 句，实际送入模型 {filled} 句（其余命中缓存）")
-            # 与 spatial_runner._prefill 同一套自检：推理是在锁外做的（见 sentenceTable.get_task_value），
-            # 预填充没兜住的句子会由 worker 线程现场补算，那正是「多线程并发调同一份模型」的窗口
-            missing = [s for s in unique if not st.cache_ready(s)]
-            if missing:
-                print(f"警告：预填充后仍有 {len(missing)} 句不在缓存里，--workers 大于 1 时可能并发推理")
-            if len(unique) > config.CACHE_MAX_SIZE:
-                print(
-                    f"警告：本次需 {len(unique)} 句，超过缓存容量 {config.CACHE_MAX_SIZE}，"
-                    "多线程下可能边填边淘汰；建议减小 --limit 或调大 config.CACHE_MAX_SIZE"
-                )
+            try:
+                filled = st.prefill_ltp(unique)
+            except Exception as e:
+                ctx = ctx._replace(syntax_error=f"LTP 预填充失败：{e!r}")
+                print(f"警告：{ctx.syntax_error}；本轮省略句法证据，继续处理。")
+            else:
+                print(f"LTP 预填充：本次需 {len(unique)} 句，实际送入模型 {filled} 句（其余命中缓存）")
+                # 与 spatial_runner._prefill 同一套自检：推理是在锁外做的（见 sentenceTable.get_task_value），
+                # 预填充没兜住的句子会由 worker 线程现场补算，那正是「多线程并发调同一份模型」的窗口
+                missing = [s for s in unique if not st.cache_ready(s)]
+                if missing:
+                    print(f"警告：预填充后仍有 {len(missing)} 句不在缓存里，--workers 大于 1 时可能并发推理")
+                if len(unique) > config.CACHE_MAX_SIZE:
+                    print(
+                        f"警告：本次需 {len(unique)} 句，超过缓存容量 {config.CACHE_MAX_SIZE}，"
+                        "多线程下可能边填边淘汰；建议减小 --limit 或调大 config.CACHE_MAX_SIZE"
+                    )
 
     if args.print_prompt:
         print_numbered("system prompt（all_in_one.txt 渲染后）", ctx.system_prompt)
@@ -1105,8 +1173,13 @@ def main(argv: list[str] | None = None) -> None:
     writer.agent_stats = {name: agent.stats() for name, agent in ctx.agents.items()}
     summary = writer.finish()
     print(
-        f"\n完成 {summary['count']} 条记录（{len(records)} 条语料，{len(states)} 个状态）"
-        f"；LLM 调用 {counter.count} 次（每条记录至多 1 次）"
+        f"\n完成 {summary['count']} 条记录（{len(records)} 条语料，{len(states)} 个状态）；"
+        f"模型轮次 {counter.rounds} 次（每条记录至多 1 次外层调用）"
+    )
+    retried = counter.requests - counter.rounds
+    print(
+        f"实际请求 {counter.requests} 次（回调实测，含框架内部补发 {retried} 次；"
+        "底层 HTTP 连接层重试不在此列）"
     )
     # 对照数是按**逐条实际走到哪一步**累加的，不是「记录数 × 换算系数」：停在 reality 闸门的记录
     # 本来只要一次调用，一律按整条链路算会把这批语料说得比实际贵。
@@ -1115,7 +1188,7 @@ def main(argv: list[str] | None = None) -> None:
     # 相同也只问一次（见 PAIR_CALLS_PER_STEP），所以这只是个上界——只扣 reality 那一半反而不成立。
     # 要精确数就去读 pair 产物 summary 里的 agent_stats.roundtrips。
     print(
-        f"对照（不计缓存）：这些状态按每状态走到哪一步累加是 {pair_calls} 次调用；"
+        f"对照（理论调用数，不计缓存）：这些状态按每状态走到哪一步累加是 {pair_calls} 次调用；"
         "pair 侧还会按句/按消息复用，实际往返数更低——以 pair 产物 summary 里的 "
         "agent_stats.roundtrips 为准"
     )

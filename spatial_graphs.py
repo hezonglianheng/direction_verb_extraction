@@ -491,6 +491,9 @@ class PairState(BaseState):
     features: dict
     """{"a": {特征对象}, "b": {特征对象}}"""
     features_source: str
+    """兼容旧记录的汇总来源；任一侧失败为 error，两侧来源不同时为 mixed"""
+    features_detail: dict
+    """{"a": {status, source, reason}, "b": {status, source, reason}}"""
     schema: dict
     """{"a": {...}, "b": {...}}"""
     judge: dict
@@ -701,23 +704,62 @@ def pair_semantic_node(agent, state_type=PairState) -> Callable[[dict], dict]:
     )
 
 
+def _feature_detail(result: dict) -> dict:
+    """保留抽取结果的来源和原因；空特征本身不能证明失败。"""
+    source = result.get("source")
+    return {
+        "status": "error" if source == "error" else "skipped" if source == "no_llm" else "ok",
+        "source": source,
+        "reason": result.get("reason", ""),
+    }
+
+
+def _pair_feature_failure(state: dict) -> tuple[str, str]:
+    """从两侧元数据取失败状态和原因，兼容尚未记录元数据的旧状态。"""
+    details = state.get("features_detail") or {}
+    failed = [side for side in ("a", "b") if (details.get(side) or {}).get("source") == "error"]
+    if failed:
+        return (
+            "feature_error_" + ("both" if len(failed) == 2 else failed[0]),
+            "；".join(
+                f"{'原句' if side == 'a' else '改写句'}特征提取失败："
+                f"{details[side].get('reason') or '未提供原因'}"
+                for side in failed
+            ),
+        )
+    if state.get("features_source") == "error":
+        return "feature_error", "特征提取失败（旧状态未保存各侧原因）"
+    return "", ""
+
+
+def pair_feature_update(state: dict, value: dict) -> dict:
+    """pair 图与 all_in_one 共用的特征装配，保留两侧状态及失败原因。"""
+    sources = {result["source"] for result in value.values()}
+    changes = {
+        "features": {side: result["features"] for side, result in value.items()},
+        "features_source": "error" if "error" in sources else next(iter(sources)) if len(sources) == 1 else "mixed",
+        "features_detail": {side: _feature_detail(result) for side, result in value.items()},
+    }
+    _, reason = _pair_feature_failure(changes)
+    if reason:
+        changes["status_reason"] = "；".join(filter(None, (state.get("status_reason"), reason)))
+    return changes
+
+
 def pair_feature_node(agent, state_type=PairState) -> Callable[[dict], dict]:
     """feature 节点：对原句与改写句各抽一次语义特征
 
-    写进状态的是特征本身（不是 agent 的整个返回值），所以不用 output，由 update 写两个字段。
+    特征与抽取元数据分开保存，供下游抽取使用，同时保证单侧失败也能在历史和最终状态中看见。
     """
 
-    def update(state: dict, value: dict) -> dict:
-        return {
-            "features": {side: result["features"] for side, result in value.items()},
-            "features_source": value["a"]["source"],
-        }
-
     def detail(state: dict, value: dict, wrote: dict) -> dict:
+        statuses = [item["status"] for item in wrote["features_detail"].values()]
+        errors = statuses.count("error")
         return {
-            "status": "ok",
-            "features": {side: result["features"] for side, result in value.items()},
-            "source": value["a"]["source"],
+            "status": "error" if errors == 2 else "partial_error" if errors else "skipped" if "skipped" in statuses else "ok",
+            "features": wrote["features"],
+            "source": wrote["features_source"],
+            "details": wrote["features_detail"],
         }
 
     return agent_node(
@@ -726,7 +768,7 @@ def pair_feature_node(agent, state_type=PairState) -> Callable[[dict], dict]:
         # 同 semantic：两侧各看各的词，改写句那侧看的是换上去的那个词
         inputs={"sentence": "sentence_{side}", "focus_word": {"a": "focus_word", "b": "focus_word_b"}},
         sides=("a", "b"),
-        update=update,
+        update=pair_feature_update,
         detail=detail,
         state_type=state_type,
     )
@@ -806,11 +848,15 @@ def pair_final_status(state: PairState) -> str:
         ok                       语义闸门通过、judge 也给出了判定，一条完整链路
         ok_no_semantic_gate      --no-llm 下跳过语义闸门但走完了后续查表
         judgement_unknown        走到了 judge 却没能判定（无 LLM 或调用失败）
+        feature_error_a|b|both    特征提取失败，即使下游给出判定也不能算完整成功
         alter_missed 等其余取值   等于停下时的 stage，原因见 status_reason
     """
     stage = state.get("stage", "unknown")
     if stage not in ("semantic_ok", "semantic_skipped"):
         return stage
+    feature_status, _ = _pair_feature_failure(state)
+    if feature_status:
+        return feature_status
     if (state.get("judge") or {}).get("same_meaning") is None:
         return "judgement_unknown"
     return "ok" if stage == "semantic_ok" else "ok_no_semantic_gate"
@@ -901,6 +947,7 @@ def serialize_pair(state: PairState) -> dict:
         "semantic": state.get("semantic", {}),
         "features": state.get("features", {}),
         "features_source": state.get("features_source"),
+        "features_detail": state.get("features_detail", {}),
         "schema": state.get("schema", {}),
         "judgement": state.get("judge", {}),
         "context": {
@@ -1058,6 +1105,8 @@ class SingleSentenceState(BaseState):
     """{is_fluent, grammar_ok, spatial_ok, reason, grammar_reason, spatial_reason, source}"""
     features: dict
     features_source: str
+    features_detail: dict
+    """{status, source, reason}，与成对图每侧的元数据同形"""
     schema: dict
     """{name, source, reason}"""
 
@@ -1127,10 +1176,18 @@ def single_feature_node(agent, state_type=SingleSentenceState) -> Callable[[dict
     """feature 节点：抽这一句的语义特征"""
 
     def update(state: dict, value: dict) -> dict:
-        return {"features": value["features"], "features_source": value["source"]}
+        changes = {
+            "features": value["features"],
+            "features_source": value["source"],
+            "features_detail": _feature_detail(value),
+        }
+        if value["source"] == "error":
+            reason = f"特征提取失败：{value.get('reason') or '未提供原因'}"
+            changes["status_reason"] = "；".join(filter(None, (state.get("status_reason"), reason)))
+        return changes
 
     def detail(state: dict, value: dict, wrote: dict) -> dict:
-        return {"status": "ok", "features": value["features"], "source": value["source"]}
+        return {**wrote["features_detail"], "features": value["features"]}
 
     return agent_node(
         agent,
@@ -1163,6 +1220,8 @@ def single_final_status(state: SingleSentenceState) -> str:
     stage = state.get("stage", "unknown")
     if stage not in ("semantic_ok", "semantic_skipped"):
         return stage
+    if state.get("features_source") == "error":
+        return "feature_error"
     if (state.get("schema") or {}).get("name") is None:
         return "schema_unknown"
     return "ok" if stage == "semantic_ok" else "ok_no_semantic_gate"
@@ -1189,6 +1248,7 @@ def serialize_single(state: SingleSentenceState) -> dict:
         "semantic": state.get("semantic", {}),
         "features": state.get("features", {}),
         "features_source": state.get("features_source"),
+        "features_detail": state.get("features_detail", {}),
         "schema": state.get("schema", {}),
         "context": {
             "history": state.get("history", []),
