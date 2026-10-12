@@ -5,7 +5,7 @@
 本模块只做"谁接谁"：agent 做什么在 spatial_agents.py，跑批与落盘在 spatial_runner.py。
 三个模块的依赖方向是单向的：spatial_runner → spatial_graphs → spatial_agents → spatial_tools。
 
-现有的三张图（GRAPHS）：
+现有的四张图（GRAPHS）：
 
     pair         六个 agent 全用：alter → reality → semantic → feature → schema → judge → save
                  改写未命中、或 reality 判为「不是现实空间用法」则直接 save 收尾。产出前缀 spatial_pairs。
@@ -14,10 +14,13 @@
     alter_check  改写检查：alter → reality → semantic（两句各判一次语法与空间语义），语义那一步不做闸门路由
                  （两侧都判、不通顺也照样落盘），目的就是看改写句与原句各自是否通顺。
                  前缀 spatial_alter_check。
+    synonym      独立同义判断：alter → reality → semantic → synonym → save。
+                 前三步与 pair 图共用节点和闸门，直接由 synonym agent 比较两句。
+                 提示语留在 system_prompt/synonym.txt 供用户填写，前缀 spatial_synonym。
 
-三张图的第一道闸门都是 reality（见 spatial_agents.RealityAgent）：判这一句里的关注词是不是在说
+四张图的第一道闸门都是 reality（见 spatial_agents.RealityAgent）：判这一句里的关注词是不是在说
 现实世界中的空间场景，判为 False 的记录就此收尾，后面几步的模型调用一概不发生。它排在各自的
-入口节点（alter / read）**之后**、五个 LLM agent 之前：那两个入口都是纯规则（不调模型、不花钱），
+入口节点（alter / read）**之后**、后续 LLM agent 之前：那两个入口都是纯规则（不调模型、不花钱），
 先跑它们，停下来的记录里才带着句子与切片，事后能看到被滤掉的是哪一句。判不出来时一律放行
 （见 reality_gate）：闸门只拦明确判为 False 的，不拿「没问过模型」当「不是空间用法」。
 
@@ -40,7 +43,7 @@ reality_queries_alter / reality_queries_single 与 spatial_runner._prefill_reali
 schema 三个节点传下去的关注词是**按侧取**的（inputs 里写 {"a": ..., "b": ...}，见 _resolve），
 而不是两侧共用一个字段。这样 b 侧的 schema 才会收窄到替换词所属的词组，判定表里
 上12 × 里1 这种跨组的格子才对得上；两侧共用原词的话 b 侧会收窄回原词组，判定退化成同组自比。
-judge 是唯一要同时看到两份关注词的节点——它的 user message 开头两份、各占 2 行，就是这两份
+judge 与 synonym 都要同时看到两份关注词——它们的 user message 开头两份、各占 2 行，就是这两份
 （见 pair_head_block）。
 
 b 侧那份的 index 是照搬 a 侧的（改写只动了切片里那一个 token）：改出来的切片（slice_b）上它指的就是
@@ -96,7 +99,7 @@ class BaseState(TypedDict, total=False):
     focus_word: dict | None
     """本次需要重点关注的词 {"index", "word", "kind", "source"}，见 spatial_tools.pick_focus_word
 
-    它是 record 的纯函数，三张图都要用（single 图也拿它标注这一句是为哪个词抽的），
+    它是 record 的纯函数，各图都要用（single 图也拿它标注这一句是为哪个词抽的），
     所以由 init_state 统一写入；alter_node / single_entry_node 再按 record 复算一次写回，
     图被单独 invoke（状态里没这个字段）时也不会退化成 None。
 
@@ -115,7 +118,7 @@ class BaseState(TypedDict, total=False):
     reality: dict
     """第一道闸门的判定 {"is_spatial_scene", "reason", "source"}，见 spatial_agents.RealityAgent
 
-    三张图都有它，位置也一致：各自的入口节点之后、五个 LLM agent 之前。
+    各图都有它，位置也一致：各自的入口节点之后、后续 LLM agent 之前。
     没走到这一步的记录（bad_record、改写未命中）里是空的。
     """
 
@@ -142,7 +145,7 @@ def _step(node: str, **fields) -> dict:
 
 
 def init_state(record: dict, output_file: str) -> BaseState:
-    """把一条语料记录转成图的初始状态（三张图通用，各自的字段由节点自己写）"""
+    """把一条语料记录转成图的初始状态（各图通用，各自的字段由节点自己写）"""
     return {
         "record": record,
         "output_file": str(output_file),
@@ -386,7 +389,7 @@ def reality_queries_single(records: list[dict], agents) -> list[tuple[str, dict 
 
 
 # --------------------------------------------------------------------------
-# 四、reality 闸门：三张图共用的第一道关卡
+# 四、reality 闸门：各图共用的第一道关卡
 # --------------------------------------------------------------------------
 
 
@@ -426,9 +429,9 @@ def reality_gate(value: dict) -> tuple[str, str]:
 def reality_node(agent, *, sentence: str, state_type) -> Callable[[dict], dict]:
     """闸门节点：判这一句里的关注词是不是在说现实空间，并按下闸门
 
-    sentence 是「这一句」在哪：pair / alter_check 读 sentence_a（语料记录里那个句子，
-    alter 成功与否都写下了它），single 读 sentence（read 节点拼好的）。三张图的位置一致
-    ——各自的入口节点之后、五个 LLM agent 之前（理由见模块 docstring）。
+    sentence 是「这一句」在哪：pair / alter_check / synonym 读 sentence_a（语料记录里那个句子，
+    alter 成功与否都写下了它），single 读 sentence（read 节点拼好的）。各图的位置一致
+    ——各自的入口节点之后、后续 LLM agent 之前（理由见模块 docstring）。
 
     只看 a 侧：闸门判的是**本记录要替换的那个位置**上的词（alter 节点已把 focus_word 换成
     选中候选自己那一份），与改写句那侧换上去的词无关，所以它接的 focus_word 是原词、不按侧取
@@ -522,7 +525,7 @@ def alter_node(agent) -> Callable[[dict], dict]:
 
     这一步不走适配器：它的入口是 record 而不是某个 sentence_* 字段，还要判 bad_record、
     把结果拆成 a/b 两侧、并从展开出的多个待选句里取出自己那一个——这些是"一对句子"
-    这个概念固有的逻辑，不是 agent 的输入契约。pair 图与 alter_check 图共用这一个节点。
+    这个概念固有的逻辑，不是 agent 的输入契约。pair、alter_check 与 synonym 图共用这一个节点。
 
     candidate_index 由跑批前的展开写进状态（见 alter_init_states），本节点只按它取一条。
     句内每个目标词位置各出一批候选（见 AlterAgent.expand_positions），所以"第几个待选句"
@@ -808,7 +811,7 @@ def pair_schema_node(agent, state_type=PairState) -> Callable[[dict], dict]:
 def pair_judge_node(agent, state_type=PairState) -> Callable[[dict], dict]:
     """judge 节点：先查表，未命中再由 LLM 判断两句意义是否相同
 
-    这是唯一**同时**看到两份关注词的节点，也是两侧合并的地方：查表要的是两侧的 schema 名，
+    这是 pair 图中**同时**看到两份关注词的节点，也是两侧合并的地方：查表要的是两侧的 schema 名，
     而 schema 是各自按自己那侧的关注词收窄出来的，所以 LLM 分支也得知道两侧各在看哪个词
     （user message 开头两份、各占 2 行，见 spatial_agents.pair_head_block）。这里不按侧跑，
     两份关注词各接一条线、各是一个形参。
@@ -1414,7 +1417,99 @@ def build_alter_check_graph(agents, writer: "ResultWriter"):
 
 
 # --------------------------------------------------------------------------
-# 八、图注册表
+# 八、synonym 图：复用改写与检查，由独立 agent 判断同义
+# --------------------------------------------------------------------------
+
+
+class SynonymState(AlterCheckState):
+    """原句与改写句通过既有检查后，直接保存独立 agent 的同义判定。"""
+
+    synonym: dict
+    """{same_meaning: bool | None, reason: str, source: str}，不依赖特征或 schema。"""
+
+
+def pair_synonym_node(agent, state_type=SynonymState) -> Callable[[dict], dict]:
+    """把两个句子与各自的关注词一次交给独立的同义 agent。"""
+
+    def update(state: dict, value: dict) -> dict:
+        if value.get("same_meaning") is not None:
+            return {}
+        reason = value.get("reason") or "同义 agent 未给出判定"
+        return {"status_reason": "；".join(filter(None, (state.get("status_reason"), reason)))}
+
+    def detail(state: dict, value: dict, wrote: dict) -> dict:
+        return {
+            "source": value.get("source"),
+            "same_meaning": value.get("same_meaning"),
+            "reason": value.get("reason", ""),
+        }
+
+    return agent_node(
+        agent,
+        node="synonym",
+        inputs={
+            "sentence_a": "sentence_a",
+            "sentence_b": "sentence_b",
+            "focus_word_a": "focus_word",
+            "focus_word_b": "focus_word_b",
+        },
+        output="synonym",
+        update=update,
+        detail=detail,
+        state_type=state_type,
+    )
+
+
+def synonym_final_status(state: SynonymState) -> str:
+    """保留前三步的早停状态；未填提示语或未得到结论时记为未知。"""
+    stage = state.get("stage", "unknown")
+    if stage not in ("semantic_ok", "semantic_skipped"):
+        return stage
+    if (state.get("synonym") or {}).get("same_meaning") is None:
+        return "judgement_unknown"
+    return "ok" if stage == "semantic_ok" else "ok_no_semantic_gate"
+
+
+def serialize_synonym(state: SynonymState) -> dict:
+    """沿用改写检查的成对记录，增加独立 agent 的同义判定。"""
+    return {
+        **serialize_alter_check(state),
+        "status": synonym_final_status(state),
+        "judgement": state.get("synonym", {}),
+    }
+
+
+def synonym_tally(record: dict, counters: dict[str, Counter]) -> None:
+    """沿用前三步的统计，并区分同义、不同义和未判定及其来源。"""
+    alter_check_tally(record, counters)
+    judgement = record.get("judgement") or {}
+    same_meaning = judgement.get("same_meaning")
+    label = "unknown" if same_meaning is None else "same" if same_meaning else "different"
+    counters["synonym_counts"][label] += 1
+    counters["synonym_sources"][judgement.get("source") or "absent"] += 1
+
+
+def build_synonym_graph(agents, writer: "ResultWriter"):
+    """alter → reality → semantic → synonym → save，前三步与 pair 图相同。"""
+    graph = StateGraph(SynonymState)
+    graph.add_node("alter", alter_node(agents.need("alter")))
+    graph.add_node("reality", reality_node(agents.need("reality"), sentence="sentence_a", state_type=SynonymState))
+    graph.add_node("semantic", pair_semantic_node(agents.need("semantic"), state_type=SynonymState))
+    graph.add_node("synonym", pair_synonym_node(agents.need("synonym")))
+    graph.add_node("save", _save_node(serialize_synonym, writer))
+
+    graph.add_edge(START, "alter")
+    graph.add_conditional_edges("alter", route_after_alter, {"reality": "reality", "save": "save"})
+    graph.add_conditional_edges("reality", route_after_reality, {"semantic": "semantic", "save": "save"})
+    # 复用 pair 的语义闸门；它的放行分支在本图直接接到 synonym。
+    graph.add_conditional_edges("semantic", route_after_semantic, {"feature": "synonym", "save": "save"})
+    graph.add_edge("synonym", "save")
+    graph.add_edge("save", END)
+    return graph.compile()
+
+
+# --------------------------------------------------------------------------
+# 九、图注册表
 # --------------------------------------------------------------------------
 
 
@@ -1518,6 +1613,29 @@ GRAPHS: dict[str, GraphSpec] = {
             "replacement_kinds",
         ),
         tally=alter_check_tally,
+    ),
+    "synonym": GraphSpec(
+        name="synonym",
+        prefix="spatial_synonym",
+        doc="独立同义判断：alter → reality → semantic → synonym，前三步与 pair 图相同，提示语由用户填写",
+        state=SynonymState,
+        needs=("alter", "reality", "semantic", "synonym"),
+        init_states=alter_init_states,
+        build=build_synonym_graph,
+        serialize=serialize_synonym,
+        plan=pair_plan,
+        gate_queries=reality_queries_alter,
+        counter_names=(
+            "status_counts",
+            "reality_counts",
+            "semantic_counts",
+            "synonym_counts",
+            "synonym_sources",
+            "focus_sources",
+            "focus_kinds",
+            "replacement_kinds",
+        ),
+        tally=synonym_tally,
     ),
 }
 

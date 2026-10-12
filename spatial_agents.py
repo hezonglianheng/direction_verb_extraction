@@ -1,6 +1,6 @@
 # encoding: utf8
 
-"""空间语义改写-判定用到的六个 agent，每个都独立构造、独立调用。
+"""空间语义改写-判定用到的七个 agent，每个都独立构造、独立调用。
 
     reality_agent   输入一个句子与它的关注词，判断这个词是不是用于表达现实世界中的空间场景
                     （is_spatial_scene）。全流程的第一道闸门：判为 False 的记录就此收尾，
@@ -21,11 +21,15 @@
                     时才退化为自由命名，名字也按组名起）。
     judge_agent     输入两个句子及其 schema，先查判定表（CSV 矩阵）；表里直接给了结论（√/×）
                     就用它，标了 ○、格子留空非法、或这一对没收录进表（未命中）才交 LLM 判断。
+    synonym_agent   输入两个句子与两侧各自的关注词，直接由独立 LLM 判断是否同义；
+                    不抽特征、不查 schema 或判定表。system_prompt/synonym.txt 由用户填写，
+                    正文未填写时不调模型，返回 same_meaning=None、source=unfilled_prompt。
 
-六个 agent 的输入里都有 focus_word：**本记录要替换的那个位置**上的方位词/趋向动词（index、
+七个 agent 的输入里都有关注词（focus_word 或成对的 focus_word_a / focus_word_b）：
+**本记录要替换的那个位置**上的方位词/趋向动词（index、
 词本身、属哪一类），由 spatial_tools.pick_focus_words 从语料记录里取（一家语料可能有好几个
 位置，每个位置各出几条记录，一条记录只认一个），图从第一个 agent 开始逐级往下传。
-它是 user message 的第一行（措辞见 focus_line），五个 LLM agent 都按它展开判断——一句里有多个
+它是 user message 的第一行（措辞见 focus_line），六个 LLM agent 都按它展开判断——一句里有多个
 方位词/趋向动词时，模型否则无从知道该看哪一个。
 
 一对句子的**两侧各看各的词**：a 侧（原句）看语料记录里那个词，b 侧（改写句）看规则表换上去的
@@ -58,7 +62,7 @@ agent 据此选目录；同一条信息也会写进 user message（见 head_bloc
 类型分，那份提示语与四张表同目录（config_files/<类型目录>/reality.txt，见 PROMPT_SOURCE_CONFIG）。
 
 用法：
-    .venv/bin/python spatial_agents.py --list        # 打印六个 agent 的输入输出契约，不调模型
+    .venv/bin/python spatial_agents.py --list        # 打印七个 agent 的输入输出契约，不调模型
     .venv/bin/python spatial_agents.py               # 纯规则冒烟测试（不调模型，不需要 GPU）
 """
 
@@ -92,7 +96,7 @@ class StructuredOutputMissing(RuntimeError):
     而各 agent 的 run() 只兜异常（try 包住 _invoke，返回值却在 try 之外解引用），真让
     _invoke 返回 None 的话 except 永远等不到：AttributeError 会穿透图节点、经 pool.map
     冒回跑批入口，一条记录出事带走整批（见 BaseAgent._invoke）。所以在 _invoke 这一处把它
-    转成异常，五个 agent 既有的兜底路径就都生效了——reality 记 error 后放行、semantic 记
+    转成异常，各个 agent 既有的兜底路径就都生效了——reality 记 error 后放行、semantic 记
     error 后被 semantic 闸门拦下、schema/judge 记 error，各自的下游都早已按 None 处理。
     """
 
@@ -208,6 +212,13 @@ class JudgeVerdict(BaseModel):
     reason: str = Field(description="判断依据，需说明替换词带来的语义差别")
 
 
+class SynonymVerdict(BaseModel):
+    """synonym_agent 的独立结构化输出；判断标准由用户填写的提示语决定。"""
+
+    same_meaning: bool = Field(description="两句话是否同义")
+    reason: str = Field(description="判断理由")
+
+
 class FreeFeatures(BaseModel):
     """特征类别表未填写时 feature_agent 的兜底输出"""
 
@@ -226,7 +237,7 @@ class FreeFeatures(BaseModel):
 # --------------------------------------------------------------------------
 
 PROMPT_SOURCE_SYSTEM = "system"
-"""提示语在 system_prompt/ 下（默认，六个 agent 里五个都在那儿，见 BaseAgent.PROMPT_SOURCE）"""
+"""提示语在 system_prompt/ 下（默认，见 BaseAgent.PROMPT_SOURCE）"""
 PROMPT_SOURCE_CONFIG = "config"
 """提示语与配置表同目录：config_files/<语料类型>/ 下（唯一一份 reality_agent 的提示语）
 
@@ -348,8 +359,8 @@ FOCUS_B_ABSENT = (
 def focus_role(focus_word: dict | None) -> str:
     """这份关注词是哪一侧的：由它的 source 判——改写句那一侧的来源固定是 alter
 
-    角色只决定措辞（见 focus_line）。由数据自己推、而不是让五个 agent 各接一个形参：同一份
-    关注词在五个 agent 的 user message 里必须说成同一回事，而 agent 手上就只有这个 dict。
+    角色只决定措辞（见 focus_line）。由数据自己推、而不是让各个 agent 各接一个形参：同一份
+    关注词在各个 agent 的 user message 里必须说成同一回事，而 agent 手上就只有这个 dict。
     手写的关注词（没有 source）一律按 record 算。
     """
     if (focus_word or {}).get("source") == st.FOCUS_SOURCE_ALTER:
@@ -358,7 +369,7 @@ def focus_role(focus_word: dict | None) -> str:
 
 
 def focus_line(focus_word: dict | None, *, role: str = FOCUS_ROLE_RECORD) -> str:
-    """把关注词渲染成 user message 的首行（五个 LLM agent 共用这一处措辞）
+    """把关注词渲染成 user message 的首行（LLM agent 共用这一处措辞）
 
     focus_word 是关注词（{"index", "word", "kind", "source"}，见 spatial_tools.pick_focus_word
     与 replacement_focus_word）；没有关注词（None 或取不到词）时给一句中性说明，让 agent 按整句判断。
@@ -372,7 +383,7 @@ def focus_line(focus_word: dict | None, *, role: str = FOCUS_ROLE_RECORD) -> str
 
     措辞为什么这么绕，两条都要照顾到：
 
-    - 五个 agent 的 system_prompt 在几张图之间共用，所以措辞里不能出现只对某一张图成立的说法，
+    - 各个 agent 的 system_prompt 在几张图之间共用，所以措辞里不能出现只对某一张图成立的说法，
       只能用条件句交代，并给出 index 这个可核对锚点（句法证据的分词行里每个 token 前都
       打了下标，能直接对上）。唯一的例外是 replacement：那个下标是原句上的，模型只能按下标
       核对**原句**，改写句上要按词本身找（FOCUS_INDEX_NOTE_ALTER 与 _FOCUS_TAIL 里都说了）。
@@ -714,7 +725,7 @@ def _build_deep_feature_agent(
 
 
 class BaseAgent:
-    """六个 agent 的公共骨架：输入契约、llm 开关、惰性建模型。
+    """七个 agent 的公共骨架：输入契约、llm 开关、惰性建模型。
 
     子类要给出 NAME / INPUTS / OUTPUTS，并实现 run() 与 _build()。
     INPUTS 是 run() 的形参名，图的节点适配器拿它与接线声明逐一比对（见 spatial_graphs.agent_node），
@@ -845,7 +856,7 @@ class BaseAgent:
     def _invoke(self, content: str):
         """跑一次底层 agent 并取结构化输出。异常不吞，由 run() 决定怎么如实记 source
 
-        取不到结构化输出时抛 StructuredOutputMissing 而不是返回 None——这一处是五个 agent
+        取不到结构化输出时抛 StructuredOutputMissing 而不是返回 None——这一处是 LLM agent
         共用的关口，理由见该异常类。顺带把模型的原始回复带进异常：它平时落不了盘，出岔子时
         是事后唯一能查的东西（见 _reply_digest）。
 
@@ -945,7 +956,7 @@ class BaseAgent:
 
 
 # --------------------------------------------------------------------------
-# 四、六个 agent
+# 四、七个 agent
 # --------------------------------------------------------------------------
 
 
@@ -1665,10 +1676,87 @@ class SchemaAgent(BaseAgent):
         }
 
 
+class SynonymAgent(BaseAgent):
+    """直接比较两句是否同义，不依赖特征抽取、图式或判定表。
+
+    提示语只从 system_prompt/synonym.txt 读取，正文留给用户填写。读取空文件沿用
+    utils.read_prompt_path 的规则（返回空字符串）；空提示语下 run() 不调用模型，
+    warm() 不预热，返回 same_meaning=None、source=unfilled_prompt。
+
+    两侧各带自己的关注词，消息开头复用 pair_head_block 的定位信息；后面只附两句文本。
+    成功的判定按完整 user message 缓存，失败不缓存，沿用 BaseAgent 的并发保护与调用统计。
+    """
+
+    NAME = "synonym"
+    INPUTS = ("sentence_a", "sentence_b", "focus_word_a", "focus_word_b")
+    OUTPUTS = ("same_meaning", "reason", "source")
+    CONFIG_NOTE = "无配置表；system_prompt/synonym.txt 由用户填写，空提示语不调模型"
+    PROMPT_FILES = ("synonym",)
+    CACHEABLE_SOURCES = ("llm",)
+
+    def _build(self):
+        if not self.system_prompt.strip():
+            raise ValueError(f"同义判断提示语尚未填写：{self.prompt_paths['synonym']}")
+        return agent_factory.get_agent(
+            self.model_key, self.tools(), self.system_prompt, response_format=ToolStrategy(SynonymVerdict)
+        )
+
+    def warm(self) -> None:
+        if self.system_prompt.strip():
+            super().warm()
+
+    def _content(
+        self, sentence_a: str, sentence_b: str, focus_word_a: dict, focus_word_b: dict
+    ) -> str:
+        head = pair_head_block(focus_word_a, focus_word_b, corpus_type=self.corpus_type)
+        # 保留两侧首行的定位信息，去掉旧 agent 的任务说明，判断标准全部留给用户提示语。
+        for role in (FOCUS_ROLE_ORIGINAL, FOCUS_ROLE_REPLACEMENT):
+            head = head.replace(_FOCUS_TAIL[role], "")
+        head = head.replace(FOCUS_A_ABSENT, "原句关注词：未提供。")
+        head = head.replace(FOCUS_B_ABSENT, "改写句关注词：未提供。")
+        head = "\n".join(line for line in head.splitlines() if line)
+        return (
+            f"{head}\n"
+            f"原句：{sentence_a}\n"
+            f"改写句：{sentence_b}"
+        )
+
+    def _ask(self, content: str) -> dict:
+        try:
+            verdict: SynonymVerdict = self._invoke(content)
+            return {"same_meaning": verdict.same_meaning, "reason": verdict.reason, "source": "llm"}
+        except Exception as e:
+            return {"same_meaning": None, "reason": f"调用失败：{e!r}", "source": "error"}
+
+    def run(
+        self, sentence_a: str, sentence_b: str, focus_word_a: dict, focus_word_b: dict
+    ) -> dict:
+        if not self.llm:
+            return {"same_meaning": None, "reason": "未调用 LLM（--no-llm）", "source": "no_llm"}
+        if not self.system_prompt.strip():
+            return {
+                "same_meaning": None,
+                "reason": f"同义判断提示语尚未填写：{self.prompt_paths['synonym']}，未调用 LLM",
+                "source": "unfilled_prompt",
+            }
+        return self._cached_or_ask(
+            self._content(sentence_a, sentence_b, focus_word_a, focus_word_b), self._ask
+        )
+
+    def describe(self) -> str:
+        if not self.llm:
+            status = "未调用 LLM（--no-llm）"
+        elif not self.system_prompt.strip():
+            status = "提示语尚未填写，未调用 LLM"
+        else:
+            status = f"独立同义判断，模型 {self.model_key}"
+        return f"synonym：{status}（{self.prompt_paths['synonym']}）"
+
+
 class JudgeAgent(BaseAgent):
     """判断两句意义是否相同：先查判定表，表里没给出结论的再由 LLM 判断
 
-    这是唯一一个同时拿到两句的 agent（也是唯一一个要两份关注词的）：两侧的句子、schema、
+    两侧的句子、schema、
     特征、关注词由 graph 合并后一起传进来，判的就是「把 a 侧那个词换成 b 侧那个词之后，
     两句意义是否还相同」。b 侧的 schema 是拿替换词重新收窄、重新定的（见 st.replacement_focus_word），
     所以判定表里 上12 × 里1 这样的格子才对得上——两侧若共用一个关注词，b 侧会退回收窄回原词
@@ -1833,7 +1921,7 @@ class JudgeAgent(BaseAgent):
 AGENTS: dict[str, type[BaseAgent]] = {
     # 顺序即 --list 的打印顺序，也即流水线的先后（reality 是第一步的闸门）
     cls.NAME: cls
-    for cls in (RealityAgent, AlterAgent, SemanticAgent, FeatureAgent, SchemaAgent, JudgeAgent)
+    for cls in (RealityAgent, AlterAgent, SemanticAgent, FeatureAgent, SchemaAgent, JudgeAgent, SynonymAgent)
 }
 
 
@@ -1927,11 +2015,11 @@ def _describe_prompt_files(cls: type[BaseAgent]) -> str:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="六个独立的空间语义 agent：列出契约，或跑一次纯规则冒烟测试",
+        description="七个独立的空间语义 agent：列出契约，或跑一次纯规则冒烟测试",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__.split("用法：")[-1],
     )
-    parser.add_argument("--list", action="store_true", help="打印六个 agent 的输入/输出契约，不调模型")
+    parser.add_argument("--list", action="store_true", help="打印七个 agent 的输入/输出契约，不调模型")
     return parser.parse_args(argv)
 
 
@@ -1939,7 +2027,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
 
     if args.list:
-        print("六个 agent（* = 会调模型；输入是 run() 的形参名）：")
+        print("七个 agent（* = 会调模型；输入是 run() 的形参名）：")
         for name, cls in AGENTS.items():
             mark = "*" if cls.NEEDS_LLM else " "
             print(f"  [{mark}] {name:<9} 输入({', '.join(cls.INPUTS)})")
