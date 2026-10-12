@@ -183,6 +183,15 @@ class SyntaxFallbackTests(unittest.TestCase):
         self.call_agent.invoke.assert_not_called()
         self.assertTrue(all(record["all_in_one"]["syntax"] is None for record in records))
 
+    def test_call_failure_before_model_callback_reports_no_retries(self):
+        self.call_agent.invoke.side_effect = RuntimeError("模型启动前失败")
+        records = self.run_main()
+        self.assertEqual(len(records), 2)
+        self.assertTrue(all(record["all_in_one"]["requests"] == 0 for record in records))
+        self.assertTrue(all("模型启动前失败" in record["all_in_one"]["error"] for record in records))
+        self.assertIn("模型轮次 2 次", self.output.getvalue())
+        self.assertIn("实际请求 0 次（回调实测，含框架内部补发 0 次；", self.output.getvalue())
+
     def test_print_prompt_continues_after_prefill_failure_without_calls_or_writes(self):
         self.aio.st.prefill_ltp.side_effect = FileNotFoundError("模型不存在")
         self.run_main("--print-prompt", "--no-llm", llm=False)

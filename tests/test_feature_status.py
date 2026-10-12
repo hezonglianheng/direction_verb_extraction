@@ -225,6 +225,7 @@ class AllInOneFeatureTests(unittest.TestCase):
         self.assertEqual(requests, 1)
         self.assertEqual(counter.rounds, 1)
         self.assertEqual(counter.requests, 1)
+        self.assertEqual(counter.retried, 0)
 
     def test_call_once_failure_still_counts_rounds_and_requests(self):
         class FailingAgent:
@@ -240,6 +241,51 @@ class AllInOneFeatureTests(unittest.TestCase):
         self.assertEqual(requests, 1)
         self.assertEqual(counter.rounds, 1)
         self.assertEqual(counter.requests, 1)
+        self.assertEqual(counter.retried, 0)
+
+    @staticmethod
+    def agent_with_requests(count, *, fail=False):
+        def invoke(input, config=None):
+            for _ in range(count):
+                for handler in (config or {}).get("callbacks") or []:
+                    handler.on_chat_model_start()
+            if fail:
+                raise RuntimeError("request failed")
+            return {"structured_response": SimpleNamespace(model_dump=lambda: {"x": 1})}
+
+        return SimpleNamespace(invoke=invoke)
+
+    def test_failure_before_model_callback_does_not_count_retries(self):
+        counter = self.aio.CallCounter()
+        dumps, error, requests = self.aio.call_once(
+            self.agent_with_requests(0, fail=True), "消息", counter
+        )
+        self.assertIsNone(dumps)
+        self.assertIn("request failed", error)
+        self.assertEqual(requests, 0)
+        self.assertEqual((counter.rounds, counter.requests, counter.retried), (1, 0, 0))
+
+    def test_multiple_model_callbacks_count_retries_on_success_and_failure(self):
+        for fail in (False, True):
+            with self.subTest(fail=fail):
+                counter = self.aio.CallCounter()
+                dumps, error, requests = self.aio.call_once(
+                    self.agent_with_requests(3, fail=fail), "消息", counter
+                )
+                if fail:
+                    self.assertIsNone(dumps)
+                    self.assertIn("request failed", error)
+                else:
+                    self.assertEqual(dumps, {"x": 1})
+                    self.assertIsNone(error)
+                self.assertEqual(requests, 3)
+                self.assertEqual((counter.rounds, counter.requests, counter.retried), (1, 3, 2))
+
+    def test_early_failure_does_not_cancel_retries_from_other_rounds(self):
+        counter = self.aio.CallCounter()
+        for count, fail in ((0, True), (3, False), (1, False)):
+            self.aio.call_once(self.agent_with_requests(count, fail=fail), "消息", counter)
+        self.assertEqual((counter.rounds, counter.requests, counter.retried), (3, 4, 2))
 
 
 if __name__ == "__main__":

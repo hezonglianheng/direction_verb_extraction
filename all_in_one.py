@@ -28,7 +28,8 @@ feature 两次 → schema 两次 → judge 一次），而且**后一步只能�
 （想放宽用 --allow-retry），解析不出来就如实记 all_in_one.error。实测这一次 invoke 对应
 **一次**真实 chat 请求（回调计数器量的，不是推断的：强制工具调用一返回就结束，不再有第二次往返）。
 这个回调计数现在挂在每条记录上（all_in_one.requests，见 CallCounter / _RequestProbe）：
-补发若真的发生会如实多算一次请求，收尾打印的「实际请求 − 模型轮次」就是补发过的次数。
+补发若真的发生会如实多算一次请求，补发次数按每次调用中首个请求之后的请求数累计；
+未发出请求就失败的调用不计补发，也不会抵消其他调用的补发次数。
 
 仍有一类失败是躲不掉的：deepseek 偶发地回 400（assistant 消息里的 tool_calls 没有被逐条回应，
 像是模型偶尔一次吐出多个并发工具调用），strict 下同样会出现。它不带走整批，记进 error、
@@ -410,20 +411,21 @@ class _RequestProbe(BaseCallbackHandler):
 
 
 class CallCounter:
-    """本次跑批的调用账：模型轮次与真实请求数
+    """本次跑批的调用账：模型轮次、真实请求数与补发次数
 
     rounds   外层调用数（模型轮次）：只在 call_once 里 +1——「每条记录至多一次调用」
              这句承诺唯一可核对的地方；agent 内部的补发不经过 call_once，数不到；
-    requests 实际请求数（含内部补发）：call_once 按每条记录的回调探针（_RequestProbe）
-             累加。收尾打印的两数之差就是被内部补发掉的次数。
+    requests 实际请求数（含内部补发）：call_once 按每条记录的回调探针（_RequestProbe）累加；
+    retried  补发次数：每次调用按 max(0, 请求数 - 1) 累加，未发请求的失败调用不计补发。
 
-    --workers 下 call_once 会从各个 worker 并发调到这来，故两个计数都用锁串起来
+    --workers 下 call_once 会从各个 worker 并发调到这来，故三个计数都用锁串起来
     （与 ResultWriter 同一口径）；收尾是等池子跑完再读，读到的是终值。
     """
 
     def __init__(self) -> None:
         self.rounds = 0
         self.requests = 0
+        self.retried = 0
         self.lock = threading.Lock()
 
     def bump(self) -> None:
@@ -433,6 +435,7 @@ class CallCounter:
     def add_requests(self, count: int) -> None:
         with self.lock:
             self.requests += count
+            self.retried += max(0, count - 1)
 
 
 def call_once(agent, content: str, counter: CallCounter) -> tuple:
@@ -443,7 +446,7 @@ def call_once(agent, content: str, counter: CallCounter) -> tuple:
 
     注意 agent 内部还藏着一条补发路径（ToolStrategy 的 handle_errors，见 build_call_agent）——
     这里管不到它，所以那边默认也是关的。两处一起才构成「这一次就是唯一一次」。补发若真的
-    发生，会如实落进返回的请求数里（见 _RequestProbe），收尾打印的两数之差即补发次数。
+    发生，会如实落进返回的请求数里（见 _RequestProbe），并由 CallCounter 按本次请求数累计补发。
     """
 
     counter.bump()
@@ -1176,9 +1179,8 @@ def main(argv: list[str] | None = None) -> None:
         f"\n完成 {summary['count']} 条记录（{len(records)} 条语料，{len(states)} 个状态）；"
         f"模型轮次 {counter.rounds} 次（每条记录至多 1 次外层调用）"
     )
-    retried = counter.requests - counter.rounds
     print(
-        f"实际请求 {counter.requests} 次（回调实测，含框架内部补发 {retried} 次；"
+        f"实际请求 {counter.requests} 次（回调实测，含框架内部补发 {counter.retried} 次；"
         "底层 HTTP 连接层重试不在此列）"
     )
     # 对照数是按**逐条实际走到哪一步**累加的，不是「记录数 × 换算系数」：停在 reality 闸门的记录
