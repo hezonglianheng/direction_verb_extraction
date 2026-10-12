@@ -1592,6 +1592,7 @@ PAIR_CSV_COLUMNS: tuple[tuple[str, str], ...] = (
     ("判断来源", "judgement.source"),
     ("查表结果", "judgement.lookup"),
     ("阶段", "stage"),
+    ("模型名称", "model_name"),
 )
 """成对记录拍平 csv 的列序：表头 -> 记录里的点分路径（形状见 spatial_graphs.serialize_pair）
 
@@ -1600,6 +1601,7 @@ PAIR_CSV_COLUMNS: tuple[tuple[str, str], ...] = (
 改写检查图的记录里没有 pair/judgement 两块（见 spatial_graphs.GraphSpec.csv_columns）。
 首列 id 是记录标识（语料行号-第几个目标词-第几个替换句，口径见 spatial_graphs._record_id），
 在记录里就是顶层一个字段、点分路径只有一段；旧记录缺它时这一格留空。
+末列「模型名称」来自顶层 model_name，记录本次 --model 的配置名；--no-llm 模式或旧记录缺该字段时留空。
 """
 
 

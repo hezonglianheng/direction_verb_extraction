@@ -135,7 +135,10 @@ class ResultWriter:
         config_tables: dict[str, str] | None = None,
         reality_prefill: dict | None = None,
         csv_columns: tuple[tuple[str, str], ...] = (),
+        model_name: str | None = None,
     ):
+        self.model_name = model_name
+        """本次 --model 指定的模型配置名，追加到结果与汇总末尾；--no-llm 模式下为 None"""
         self.corpus_type = corpus_type
         """本次跑批的语料类型；只写进汇总，不进记录（记录形状不随本次改动变）"""
         self.config_tables = dict(config_tables or {})
@@ -170,6 +173,7 @@ class ResultWriter:
         self.started_at = time.time()
 
     def write(self, record: dict) -> None:
+        record = {**record, "model_name": self.model_name}
         with self.lock:
             st.append_jsonl(record, self.path)
             self.count += 1
@@ -235,6 +239,7 @@ class ResultWriter:
             "count": self.count,
             "elapsed_seconds": round(time.time() - self.started_at, 1),
             **{name: dict(counter) for name, counter in self.counters.items()},
+            "model_name": self.model_name,
         }
         summary_path = self.path.with_suffix(".summary.json")
         summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -515,6 +520,7 @@ def main(argv: list[str] | None = None) -> None:
         config_tables=_config_tables(agents),
         # 成对信息 csv：默认导出（--no-pairs-csv 关），列序由图给（只有 pair 图有）
         csv_columns=spec.csv_columns if not args.no_pairs_csv else (),
+        model_name=args.model if not args.no_llm else None,
     )
     graph = spec.build(agents, writer)
 

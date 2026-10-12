@@ -1145,6 +1145,7 @@ def main(argv: list[str] | None = None) -> None:
         config_tables=sr._config_tables(ctx.agents),
         # 成对信息 csv：默认导出（--no-pairs-csv 关），列与行序跟 pair 图一致（用 pair 图那套列）
         csv_columns=sg.GRAPHS["pair"].csv_columns if not args.no_pairs_csv else (),
+        model_name=args.model if ctx.llm else None,
     )
     counter = CallCounter()
     suppressed: Counter = Counter()
