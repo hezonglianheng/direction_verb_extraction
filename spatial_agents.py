@@ -84,6 +84,13 @@ import utils
 DEFAULT_MODEL = "deepseek-flash"
 """默认模型配置名（model_config/api_keys.json 里的键）"""
 
+_FIRST_ERROR_CHARS = 200
+"""调用失败时留给第一个例外 repr 的字符数（见 BaseAgent._invoke）
+
+与 _reply_digest 同一个口径：够认出是哪一类失败（403 区域限制、超时、连不上……），
+又不至于把整个响应头搬进汇总。完整的那份仍在各条记录的 status_reason 里。
+"""
+
 
 class StructuredOutputMissing(RuntimeError):
     """模型这一轮没给出结构化输出，拿不到可用的判定
@@ -806,8 +813,10 @@ class BaseAgent:
         没有这把锁就会同时 miss、各发一次——去重的收益被并发吃掉一半。
         """
         self._flight_guard = threading.Lock()  # 保护 _flight 自身的建表
-        # 本次跑批的调用统计：模型往返数（含工具往返）与缓存命中数，跑批入口收尾时汇总
-        self._stats = {"roundtrips": 0, "cache_hits": 0}
+        # 本次跑批的调用统计：模型往返数（含工具往返）、发出去但没成的调用数、缓存命中数，
+        # 跑批入口收尾时汇总。三者缺一不可——只数成功的那部分，会把「整批被接口挡下」显示成
+        # 0 次往返，读起来正是一个请求都没发出去（见 _invoke 的失败分支）
+        self._stats = {"roundtrips": 0, "failed": 0, "cache_hits": 0}
         self._stats_lock = threading.Lock()
 
     # -- 子类实现 ----------------------------------------------------------
@@ -869,8 +878,23 @@ class BaseAgent:
 
         注意这是**本层可见**的往返数：deep agent 的 subagent 在 task 工具调用内部各跑各的，
         它们的往返不在主 agent 的 messages 里，这里数不到（deep 路径的数字因此偏小）。
+
+        失败（请求抛异常）另外记一次 failed：往返数只数拿到了回复的那些，而抛异常说明这一问
+        发出去了、没成（403、超时、连不上都算）。漏记这一笔的话，一整批被接口挡下时 stats 会
+        报「0 次往返」，与事实正好相反——收尾的调用账要能一眼分出「没发过请求」与「发过、
+        全被拒」，见 spatial_runner._print_agent_stats。首次失败的原因也留一份（截断），
+        免得为了看这一句还得去翻某条记录的 status_reason。
         """
-        result = self._model().invoke({"messages": [{"role": "user", "content": content}]})
+        try:
+            result = self._model().invoke({"messages": [{"role": "user", "content": content}]})
+        except Exception as e:  # 记账后原样抛出：怎么处理失败由各 run() 决定（见 RealityAgent._ask）
+            with self._stats_lock:
+                self._stats["failed"] += 1
+                if self._stats.get("first_error") is None:
+                    # 只留第一条：整批失败时它们通常是同一个原因，留一条就够判案，
+                    # 且 403 这类异常的 repr 里裹着整个响应头（几千字符），必须截断
+                    self._stats["first_error"] = f"{e!r}"[:_FIRST_ERROR_CHARS]
+            raise
         roundtrips = sum(1 for m in (result.get("messages") or []) if getattr(m, "type", "") == "ai") or 1
         with self._stats_lock:
             self._stats["roundtrips"] += roundtrips
@@ -923,10 +947,14 @@ class BaseAgent:
             self._stats["cache_hits"] += 1
 
     def stats(self) -> dict:
-        """本次跑批的调用统计（跑批入口收尾汇总用）：模型往返数与缓存命中数
+        """本次跑批的调用统计（跑批入口收尾汇总用）：往返数、失败数、缓存命中数
 
         roundtrips 只数本层可见的往返（见 _invoke：deep agent 的 subagent 往返不在主 agent
         的 messages 里，数不到）；cache_hits 是被按 message 缓存省下的重复问，不花往返。
+
+        roundtrips 与 failed 相加才是**发出过的调用数**：前者是拿到回复的，后者是抛异常的。
+        只看 roundtrips 会把「请求发出去但全被拒」误读成「什么都没发」——所以 failed 与
+        first_error 都在这里如实报出来（没失败过的 agent 不会带 first_error 这个键）。
         """
         with self._stats_lock:
             return dict(self._stats)

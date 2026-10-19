@@ -22,6 +22,23 @@ _MODEL_CONFIG_PATH = _PROJECT_ROOT / "model_config" / "api_keys.json"
 
 _REQUIRED_FIELDS = ("model_name", "provider", "base_url", "api_key")
 
+_DISABLE_THINKING_DEFAULTS: dict[str, dict] = {
+    # 各家「关掉思考模式」的参数名不一样，只能按 provider 分别给。想改写就
+    # 在 api_keys.json 的该模型下加 "disable_thinking"，会整体覆盖这里的默认值。
+    "deepseek": {"extra_body": {"thinking": {"type": "disabled"}}},
+    "openrouter": {"reasoning": {"effort": "none"}},
+}
+"""关闭思考模式时，往 init_chat_model 里补的参数，按 provider 索引
+
+这里必须用各 provider 建模类自己的字段名，不能统一走 extra_body：
+    ChatDeepSeek 继承 BaseChatOpenAI，extra_body 是它声明的字段，直接透传；
+    ChatOpenRouter 继承 BaseChatOpenAI 也不错，但它自己重写了字段表，
+    没有 extra_body。硬塞的话 pydantic 会把它挪进 model_kwargs 并报警告，
+    而且翻不回来——langchain_openrouter 把 model_kwargs 摊平后整个交给
+    openrouter SDK 的 chat.send()，而后者不接受 extra_body 这个关键字，
+    每次都 TypeError。它自己的开关是 reasoning={"effort": "none"}。
+"""
+
 
 def load_model_config(model_name: str) -> dict:
     """读取并校验某个模型的配置
@@ -55,6 +72,8 @@ def get_model(model_name: str, disable_thinking: bool = False):
             tool_choice（报 400 "Thinking mode does not support this tool_choice"），
             而 ToolStrategy 结构化输出正是靠强制调用结构化输出工具实现的，两者冲突；
             所以凡是要结构化输出就必须关掉思考。代价是失去思维链。
+            具体补什么参数按 provider 取 _DISABLE_THINKING_DEFAULTS，配置里写了
+            "disable_thinking" 则整个以配置为准。
 
     Returns:
         BaseChatModel: 初始化好的模型。注意不要在其上再调 .with_retry()，
@@ -74,7 +93,15 @@ def get_model(model_name: str, disable_thinking: bool = False):
         "max_retries": model_cfg.get("max_retries", 6),
     }
     if disable_thinking:
-        kwargs["extra_body"] = model_cfg.get("extra_body", {"thinking": {"type": "disabled"}})
+        disable_kwargs = model_cfg.get("disable_thinking") or _DISABLE_THINKING_DEFAULTS.get(
+            kwargs["model_provider"]
+        )
+        if disable_kwargs is None:
+            raise ValueError(
+                f"不知道 provider '{kwargs['model_provider']}' 该怎么关思考模式，"
+                f"请在 {_MODEL_CONFIG_PATH} 的 {model_name} 配置里加 \"disable_thinking\" 字段。"
+            )
+        kwargs.update(disable_kwargs)
     return init_chat_model(**kwargs)
 
 

@@ -151,10 +151,14 @@ class ResultWriter:
         等到花完预填充的钱才发现），所以这项由 main 在预填充之后补写到属性上。
         """
         self.agent_stats: dict[str, dict] = {}
-        """各 agent 的调用统计：{名字: {"roundtrips", "cache_hits"}}（见 spatial_agents.BaseAgent.stats）
+        """各 agent 的调用统计：{名字: {"roundtrips", "failed", "cache_hits"[, "first_error"]}}
+        （见 spatial_agents.BaseAgent.stats）
 
         run() 结束时才拿得到，同 reality_prefill：由 main 在收尾前补写到属性上。
         模型往返数是花费的直接口径（缓存命中省下的那部分不在这里，单列 cache_hits）；
+        failed 是发出去但抛异常的调用数，**与 roundtrips 相加才是发出过的调用数**——
+        整批被接口挡下时 roundtrips 是 0，光看它会误判成「一个请求都没发出去」（见
+        _print_agent_stats）。失败过的 agent 另带 first_error（截断后的首个异常）。
         没跑到的 agent（--no-llm、或图没走到）报全 0，不是漏记。
         """
         self.csv_columns = tuple(csv_columns)
@@ -394,20 +398,39 @@ def _print_config_tables(agents) -> None:
 
 
 def _print_agent_stats(stats: dict[str, dict]) -> None:
-    """收尾打印各 agent 的模型往返数与缓存命中数（写进汇总的那份，见 ResultWriter.agent_stats）
+    """收尾打印各 agent 的模型往返数、失败数与缓存命中数（写进汇总的那份，见 ResultWriter.agent_stats）
 
     这是花掉的钱的直接口径：往返数含工具往返与结构化输出那次；命中数是被按 message 缓存
     省下的重复问（命中不花往返）。全 0 的 agent 是没走到或根本没调模型（--no-llm）。
+
+    失败数单独列，且**与往返数一样显眼**：往返数只数拿到回复的那些，一个请求都没成功时它是 0，
+    而 0 次往返读起来正是「一个请求都没发出去」。整批被接口挡下（403 区域限制、欠费、连不上）
+    时真相恰好相反——发是发了，全被拒。所以这里把失败数印在同一行，并在「一次都没成功却失败过」
+    时额外把首个失败原因摊开：那种情况下收尾的这几行就是唯一的诊断入口，不该逼人去翻 jsonl。
     """
     if not stats:
         return
-    parts = [
-        f"{name} {item['roundtrips']} 次往返／{item['cache_hits']} 次命中"
-        for name, item in stats.items()
-    ]
+    parts = []
+    for name, item in stats.items():
+        part = f"{name} {item['roundtrips']} 次往返"
+        if item.get("failed"):
+            part += f"／{item['failed']} 次失败"
+        parts.append(part + f"／{item['cache_hits']} 次命中")
     total = sum(item["roundtrips"] for item in stats.values())
+    failed = sum(item.get("failed", 0) for item in stats.values())
     hits = sum(item["cache_hits"] for item in stats.values())
-    print(f"模型调用账（共 {total} 次往返，缓存省下 {hits} 次）：" + "；".join(parts))
+    tail = f"，{failed} 次失败" if failed else ""
+    print(f"模型调用账（共 {total} 次往返{tail}，缓存省下 {hits} 次）：" + "；".join(parts))
+    if total or not failed:
+        return
+    # 一次往返都没成却冒出失败：整批调用没一个成功的，这是最容易被误读成「没发请求」的形状
+    reason = next(
+        (item["first_error"] for item in stats.values() if item.get("first_error")),
+        "（异常没留下可读的 repr）",
+    )
+    print(f"警告：本次没有任何一次模型调用成功，{failed} 次调用全部失败（请求已发出，被接口拒绝或没能连上）")
+    print(f"      首次失败：{reason}")
+    print("      逐条失败原因见各记录的 status_reason；若全部是同一条 403/超时，先查模型可达性再重跑")
 
 
 def _prefill(records: list[dict], agents, spec: sg.GraphSpec) -> None:
