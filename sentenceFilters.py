@@ -775,26 +775,79 @@ def print_tree(node: MatchNode, indent=0):
     for c in node.children:
         print_tree(c, indent + 1)
 
-def simplify_tree(tree: list[MatchNode]) -> list[dict[str, Any]]:
+def _token_char_spans(tokens: list[str]) -> list[tuple[int, int]]:
+    """每个 token 在原文里的字符跨度 [起, 止)
+
+    语料里的标点是独立 token、直接无缝拼回原文（见 spatial_tools.join_slice），所以跨度就是
+    逐个 token 累加长度，不需要再切分。它与 token 下标是**两套坐标**：后缀切分（见
+    config.LOCATIVE_SPLIT_ENABLED）改的是下标，字符跨度不受影响，于是它能当跨分词版本的
+    校验锚点——换了切分配置后，拿旧产物的 char_span 去原文里取字，取出来的还应该是同一个词。
+    """
+    spans: list[tuple[int, int]] = []
+    start = 0
+    for token in tokens or []:
+        spans.append((start, start + len(str(token))))
+        start += len(str(token))
+    return spans
+
+
+def _span_of_node(node: MatchNode) -> list[int]:
+    """节点自身及其各级 children 覆盖的 token 下标（升序去重）"""
+    indices = [node.index]
+    for child in node.children or []:
+        indices.extend(_span_of_node(child))
+    return sorted(set(indices))
+
+
+def simplify_tree(tree: list[MatchNode], tokens: list[str] | None = None) -> list[dict[str, Any]]:
     """将 MatchNode 树简化为字典列表，方便输出和查看
-    
+
+    除了 index / word / children，另把**匹配证据**一并留下（D4），免得下游拿着词表、规则族和
+    树形去重新推断「这条记录由哪条规则收录、这个词是不是词表命中的」：
+
+        rule          节点命中的条件名（顶层是规则名、子节点是 _link 下的条件名），
+                      即命中规则路径——复核者不重跑模型就知道记录由哪条规则收录
+        vocab_matched 该节点是不是由**词表条件**命中的（conditions["_vocab"]）：
+                      由结构条件（_pos/_syntax/_semantic）收进来的节点是 False，
+                      下游因此不必再翻 conditions 去猜
+        span          节点覆盖的 token 下标（含各级 children）
+        char_span     原文字符跨度 [起, 止)。给了 tokens 才算；没给时是 None——
+                      宁可留空也不按 token 下标去估（切分改了下标就位移了）
+
+    「这个词是不是本次要提取的目标词」**不在这里标**：那要按目标词表判，真源是
+    spatial_tools.target_nodes（与 word_sampler 抽样同一口径）。树里看不出「父节点命中词表
+    时子节点只是结构上下文」之外的区分，硬标一个 role 会在 *_complement 那类规则上标反
+    （根节点是搭配动词、真正的目标词在子节点里），所以只把能确定的证据存下来。
+
     Args:
         tree (list[MatchNode]): MatchNode 树
+        tokens (list[str] | None): 该句的分词结果，用来算 char_span；不给则 char_span 为 None
 
     Returns:
         list[dict[str, Any]]: 简化后的字典列表
     """
+    spans = _token_char_spans(tokens) if tokens else None
 
-    simplified = []
-    for node in tree:
-        simplified.append({
-            # "name": node.name,
+    def convert(node: MatchNode) -> dict[str, Any]:
+        indices = _span_of_node(node)
+        char_span: list[int] | None = None
+        if spans:
+            inside = [i for i in indices if 0 <= i < len(spans)]
+            if inside:
+                # 跨度取覆盖到的最左起点到最右终点：children 未必连续（OrAllJudgeMethod 会
+                # 把同一个 token 的子节点重复拼进来），按最外层取才对得上原文里那一片
+                char_span = [spans[inside[0]][0], spans[inside[-1]][1]]
+        return {
             "index": node.index,
             "word": node.word,
-            # "conditions": node.conditions,
-            "children": simplify_tree(node.children)
-        })
-    return simplified
+            "rule": node.name,
+            "vocab_matched": bool((node.conditions or {}).get("_vocab")),
+            "span": indices,
+            "char_span": char_span,
+            "children": [convert(child) for child in node.children or []],
+        }
+
+    return [convert(node) for node in tree or []]
     
 # =========================
 # 测试

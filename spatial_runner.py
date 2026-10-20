@@ -94,6 +94,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import config
+import file_paths
 import spatial_agents as sa
 import spatial_graphs as sg
 import spatial_tools as st
@@ -136,8 +137,20 @@ class ResultWriter:
         reality_prefill: dict | None = None,
         csv_columns: tuple[tuple[str, str], ...] = (),
         model_name: str | None = None,
+        overwrite: bool = False,
+        input_records: int = 0,
+        expanded_states: int = 0,
     ):
         self.model_name = model_name
+        self.overwrite = bool(overwrite)
+        """本次是否显式允许覆盖已有输出（--overwrite）；默认**拒绝**（见 __init__ 里的检查）"""
+        self.input_records = int(input_records)
+        """本次读进来的原句数（语料条数），只在汇总里用"""
+        self.expanded_states = int(expanded_states)
+        """本次展开出的候选状态数（= 落盘记录数的分母），只在汇总里用
+
+        与 input_records 一起构成「原句 → 位置 → 候选」的转化链（D5）：光看 count 看不出
+        一条原句展开成了几条、又卡在哪一步。"""
         """本次 --model 指定的模型配置名，追加到结果与汇总末尾；--no-llm 模式下为 None"""
         self.corpus_type = corpus_type
         """本次跑批的语料类型；只写进汇总，不进记录（记录形状不随本次改动变）"""
@@ -169,6 +182,16 @@ class ResultWriter:
         """
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # 拒绝覆盖已有输出（E1）：判断发生在**首次写入之前**——本构造是跑批里第一个碰输出
+        # 文件的动作，等 write() 第一次追加时再查，文件里已经混进本轮的记录了。
+        # 旧行为是不拒绝直接追加：显式 --out-file 指向旧结果时，旧记录、重复 id 与不同配置的
+        # 结果会混在同一份文件里，收尾还会按 (line_no, candidate.index) 把整份重排，
+        # 而 summary 的 count 只统计本轮写入，两份口径对不上。
+        if not self.overwrite:
+            with file_paths.open_exclusive(self.path):
+                pass  # 只做独占创建：拿到一个空文件，之后的 append 都落在本轮自己的文件里
+        else:
+            self.path.write_text("", encoding="utf-8")  # 显式覆盖：先清空，免得混入历史记录
         self.lock = threading.Lock()
         self.count = 0
         self.counter_names = tuple(counter_names)
@@ -220,7 +243,9 @@ class ResultWriter:
         if self.csv_columns and records:
             # 成对信息另导一份 csv 供 Excel 看（默认开；--no-pairs-csv 关）：拿刚排好的记录写，
             # 于是 csv 行序与 jsonl 行序同一份来源（见 _sort_records）
-            csv_path = self.path.with_suffix(".csv")
+            # 路径走 st.pairs_csv_path 而不是 with_suffix(".csv")：后者在 --out-file result.csv
+            # 这类路径上换出来还是它自己，收尾导 csv 会把刚写好的 jsonl 覆盖掉（E1）
+            csv_path = st.pairs_csv_path(self.path)
             total, judged = st.write_pairs_csv(records, csv_path, self.csv_columns)
             print(
                 f"  成对信息 csv：{csv_path}（{total} 行，其中 {judged} 行有同义判断）",
@@ -240,6 +265,14 @@ class ResultWriter:
             # csv 也是这次跑批的产物，与 output_file 并列记进汇总；没导（--no-pairs-csv 或非 pair 图）就不写
             **({"csv_file": str(csv_path)} if csv_path else {}),
             **provenance,
+            # 数据契约（D3）：读取侧据此判断这份产物能不能直接解析，不必猜字段
+            "schema_version": st.RESULT_SCHEMA_VERSION,
+            # 分词口径（D4）：切分配置改了下标会位移，旧产物能不能复用就看这一项
+            "segmentation": config.segmentation_signature(),
+            # 「原句 → 候选 → 落盘记录」的转化链（D5）：count 只是最后一环，
+            # 少了前两个数就看不出一条原句展开成了几条、中间掉了多少
+            "input_records": self.input_records,
+            "expanded_states": self.expanded_states,
             "count": self.count,
             "elapsed_seconds": round(time.time() - self.started_at, 1),
             **{name: dict(counter) for name, counter in self.counters.items()},
@@ -297,6 +330,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--out-dir", default=None, help="输出目录（默认 results/<图的 prefix>）")
     parser.add_argument("--out-file", default=None, help="直接指定输出文件（默认按时间戳生成）")
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="允许覆盖已存在的输出文件。默认**拒绝**：已有同名输出直接报错退出（E1）——"
+        "旧行为是不拒绝直接追加，于是历史记录、重复 id 与不同配置的结果会混进同一份文件，"
+        "收尾重排后与只统计本轮的 summary 对不上。覆盖前会先清空该文件，不会混入历史记录",
+    )
+    parser.add_argument(
+        "--max-requests",
+        type=int,
+        default=None,
+        help=f"每个 agent 的请求预算（默认 {config.CANDIDATE_MAX_REQUESTS}，取自 config.CANDIDATE_MAX_REQUESTS；"
+        "0 或负表示不限）。一条语料会展开出多个候选，同一位置的失败若由每个候选各自重试，"
+        "重试次数会被候选数放大成整批的倍数；超预算即停，如实记为失败并转入人工复核（A3）",
+    )
     parser.add_argument("--limit", type=int, default=100, help="最多处理多少条记录")
     parser.add_argument("--offset", type=int, default=0, help="跳过前多少条记录")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="model_config/api_keys.json 里的配置名")
@@ -437,21 +485,26 @@ def _prefill(records: list[dict], agents, spec: sg.GraphSpec) -> None:
     """跑批前把整批句子一次性喂给 LTP
 
     一来省下逐句前向的开销（批量推理快约 4 倍，见 sentenceTable.py），
-    二来让后续多线程不再有并发调同一份模型的窗口——推理是在锁外做的，
-    所以哪些句子会被用到必须由图自己声明（spec.plan），并且预填充后要能自检。
+    二来让后续多线程尽量直接读缓存；未命中的推理由 sentenceTable._infer_lock 串行保护。
+    哪些句子会被用到由图声明（spec.plan），预填充后再检查缓存命中情况。
     """
     sentences = [s for s in spec.plan(records, agents) if s]
     unique = list(dict.fromkeys(sentences))
+    # 一次预填超过缓存容量会使早期句子被 LRU 淘汰；处理 state 尚未开始，
+    # 按容量分片预填也会让后片把前片淘汰。
+    # 继续使用整批预填，并在超过容量时明确提示，避免误报分片已解决重复推理。
     filled = st.prefill_ltp(unique)
     print(f"LTP 预填充：本图需 {len(unique)} 句，实际送入模型 {filled} 句（其余命中缓存）")
 
     missing = [s for s in unique if not st.cache_ready(s)]
     if missing:
-        print(f"警告：预填充后仍有 {len(missing)} 句不在缓存里，多线程下可能并发推理")
+        # 漏网的句子由 worker 现场补算，那一步走 sentenceTable._infer_lock 的串行边界，
+        # 不会退化成并发调同一份模型（见该锁的说明）
+        print(f"警告：预填充后仍有 {len(missing)} 句不在缓存里，多线程下可能补算（已串行保护）")
     if len(unique) > config.CACHE_MAX_SIZE:
         print(
-            f"警告：本图需 {len(unique)} 句，超过缓存容量 {config.CACHE_MAX_SIZE}，"
-            "多线程下可能边填边淘汰；建议减小 --limit 或调大 config.CACHE_MAX_SIZE"
+            f"警告：需预填充 {len(unique)} 句，超过缓存容量 {config.CACHE_MAX_SIZE}；"
+            "早期句子可能被淘汰并重新推理。可缩小 --limit，或提高 config.CACHE_MAX_SIZE"
         )
 
 
@@ -483,6 +536,36 @@ def _prefill_reality(records: list[dict], agents, spec: sg.GraphSpec, workers: i
         line += f"；另有 {stat['skipped']} 个状态没有可判的原句/关注词，未发出"
     print(line)
     return stat
+
+
+def _validate_run_outputs(
+    corpus_path: str | Path,
+    out_path: str | Path,
+    *,
+    csv_columns: tuple[tuple[str, str], ...] = (),
+    overwrite: bool = False,
+) -> None:
+    """在**首次写入之前**把这次跑批要写的几个路径一起查一遍（E1）
+
+    查三件事，任一件不成立就在写盘之前退出：
+      1. 输入与任何一个输出（jsonl / 成对 csv / summary）不能是同一个文件——
+         显式 `--out-file` 与输入相同时，旧行为会把结果追加进输入、收尾再排序重写它，
+         原始语料与结果记录混在一个文件里。
+      2. 几个输出之间不能互撞：`--out-file result.csv` 时 `with_suffix(".csv")` 换出来还是
+         它自己，收尾导 csv 会覆盖刚写好的 jsonl（路径已由 st.pairs_csv_path 错开，这里复查）。
+      3. 已有输出默认拒绝（--overwrite 才允许），且拒绝发生在建文件之前。
+
+    扩展名也在这里规定：jsonl 结果、csv 视图、summary.json 各归各位，不靠调用方自觉。
+    """
+    out_path = Path(out_path)
+    # 真正的检查在 file_paths.validate_run_outputs：两个跑批入口共用同一份口径
+    # 识别相对路径、符号链接与硬链接别名（见 file_paths.same_file_path）
+    file_paths.validate_run_outputs(
+        corpus_path,
+        out_path,
+        st.pairs_csv_path(out_path) if csv_columns else None,
+        overwrite=overwrite,
+    )
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -528,6 +611,8 @@ def main(argv: list[str] | None = None) -> None:
         llm=not args.no_llm,
         overrides=overrides,
         corpus_type=corpus_type,
+        # 请求预算（A3）：不给就按 config.CANDIDATE_MAX_REQUESTS
+        max_requests=config.CANDIDATE_MAX_REQUESTS if args.max_requests is None else args.max_requests,
     )
     for agent in agents.values():
         # 配置错在启动时就报，别留给多线程去抢着建（deep agent 尤其贵）
@@ -535,6 +620,8 @@ def main(argv: list[str] | None = None) -> None:
 
     out_dir = Path(args.out_dir) if args.out_dir else _PROJECT_ROOT / "results" / spec.prefix
     out_path = Path(args.out_file) if args.out_file else st.build_output_path(out_dir, prefix=spec.prefix)
+    csv_columns = spec.csv_columns if not args.no_pairs_csv else ()
+    _validate_run_outputs(corpus_path, out_path, csv_columns=csv_columns, overwrite=args.overwrite)
     writer = ResultWriter(
         out_path,
         counter_names=spec.counter_names,
@@ -542,8 +629,9 @@ def main(argv: list[str] | None = None) -> None:
         corpus_type=corpus_type,
         config_tables=_config_tables(agents),
         # 成对信息 csv：默认导出（--no-pairs-csv 关），列序由图给（只有 pair 图有）
-        csv_columns=spec.csv_columns if not args.no_pairs_csv else (),
+        csv_columns=csv_columns,
         model_name=args.model if not args.no_llm else None,
+        overwrite=args.overwrite,
     )
     graph = spec.build(agents, writer)
 
@@ -561,7 +649,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.no_pairs_csv:
         print("成对信息 csv：本次不导出（--no-pairs-csv）")
     elif spec.csv_columns:
-        print(f"成对信息 csv：收尾导出到 {out_path.with_suffix('.csv')}（--no-pairs-csv 可关）")
+        print(f"成对信息 csv：收尾导出到 {st.pairs_csv_path(out_path)}（--no-pairs-csv 可关）")
     else:
         # 非 pair 图的记录里没有成对字段：默认开着也导不出东西，说清楚而不是静悄悄少一个产物
         print(f"提示：本图（{spec.name}）的记录不是成对形状，没有可导出的成对列，本次不导 csv")
@@ -576,6 +664,9 @@ def main(argv: list[str] | None = None) -> None:
     # 所以状态数一般多于语料条数
     states = spec.init_states(records, agents, str(out_path))
     print(f"展开待选句：{len(records)} 条语料 → {len(states)} 个状态（每个状态落一条记录）")
+    # 转化链的两个分母（D5）补写到 writer 上、进汇总（与 reality_prefill / agent_stats 同一套路）
+    writer.input_records = len(records)
+    writer.expanded_states = len(states)
     started = time.time()
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
         # 结果已在 save 节点落盘，这里只需驱动跑完；map 按输入顺序产出，异常会在此处抛出
@@ -591,8 +682,32 @@ def main(argv: list[str] | None = None) -> None:
     )
     for name in spec.counter_names:
         print(f"{name}：{summary[name]}")
+    _print_admission(summary)
     _print_agent_stats(writer.agent_stats)
     print(f"汇总文件：{summary['summary_file']}")
+
+
+def _print_admission(summary: dict) -> None:
+    """收尾把**处理成功率**与**数据准入率**并列打出来（A1）
+
+    status_counts 说的是流程有没有跑完，而闸门判不出来时流程照样跑得完——那批记录会得到
+    status=ok、空间性却根本没确认。两个数分开报，才不会把「跑完了」当成「能用了」。
+    哪些维度卡住（reality/fluency/features/schema/judgement）也一并列出，
+    review_required 那一行就是下一轮人工复核的入口。
+    """
+    admission = summary.get("admission_counts")
+    if not admission:
+        return
+    total = sum(admission.get(key, 0) for key in ("admitted", "not_admitted"))
+    if not total:
+        return
+    rate = admission.get("admitted", 0) / total
+    print(f"数据准入：{admission.get('admitted', 0)}/{total} 条（{rate:.1%}）；"
+          f"待人工复核 {admission.get('review_required', 0)} 条")
+    for name in ("reality", "fluency", "features", "schema", "judgement"):
+        counter = summary.get(f"{name}_admission")
+        if counter:
+            print(f"    {name}：" + "，".join(f"{key} {value}" for key, value in sorted(counter.items())))
 
 
 if __name__ == "__main__":

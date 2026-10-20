@@ -10,7 +10,8 @@ import json
 
 import config
 import sentenceFilters
-from file_paths import collect_jsonl_inputs
+import file_paths
+from file_paths import atomic_write_text
 
 
 _WORKER_FILTERS: list[tuple[str, Any]] = []
@@ -59,7 +60,8 @@ def _filter_sentence(item: dict[str, Any]) -> list[dict[str, Any] | None]:
 
 		filter_methods = explanation.get("methods", [])
 		match_tree: list[sentenceFilters.MatchNode] = explanation.get("match_tree", [])
-		simplified_tree = sentenceFilters.simplify_tree(match_tree)
+		# 带上分词结果：simplify_tree 据此记原文字符跨度（D4）。cws_result 在上面已取到
+		simplified_tree = sentenceFilters.simplify_tree(match_tree, tokens=cws_result)
 
 		results.append(item | {"sentence": cws_result, "filter_methods": filter_methods, "match_tree": simplified_tree})
 	return results
@@ -116,14 +118,15 @@ def iter_jsonl_file_sentences(input_file: str, vocabs: list[str] = None):
 def iter_path_sentences(src_path: str, vocabs: list[str] = None, *, output_paths=()):
 	"""目录（或单文件）下的 jsonl 逐文件流式产出句子
 
-	此函数不能自身包含 yield：路径检查和目录扫描必须在打开输出文件前完成
-	（与 entry_in_linux.iter_path_sentences 同一理由）。
+	收集与遍历走 file_paths.iter_path_sentences（与 entry_in_linux 同一份）：
+	路径检查和目录扫描必须在打开输出文件前完成，那条约束两入口一致，不该各写一遍。
+	这里只带本平台自己的切句方式进来。
 	"""
-	files = collect_jsonl_inputs(src_path, output_paths)
-	return (
-		sentence
-		for file in files
-		for sentence in iter_jsonl_file_sentences(str(file), vocabs=vocabs)
+	return file_paths.iter_path_sentences(
+		src_path,
+		# index 是文件在清单里的序号：Windows 入口不写"第几个文件"，忽略它
+		lambda file, index: iter_jsonl_file_sentences(str(file), vocabs=vocabs),
+		output_paths=output_paths,
 	)
 
 
@@ -209,6 +212,11 @@ def run_windows_entry(src_path: str, filter_config_paths: Any, output_paths: Any
 	# 输入清单与路径校验在打开任何输出之前完成（见 iter_path_sentences），
 	# 随后输出文件保持打开，命中按批直接写入，收尾不必再统一写盘。
 	sentences = iter_path_sentences(src_path, vocabs, output_paths=paths)
+	# 分词口径打印一次（D4）：切分配置改了下标会位移，事后要能判断一份产物是哪个口径跑出来的
+	print(f"[分词口径] {config.segmentation_signature()}")
 	with ExitStack() as stack:
-		out_files = [stack.enter_context(open(path, "w", encoding="utf-8")) for path in paths]
+		# 先写临时文件、全部成功后才原子替换（E1）。旧写法用 "w" 直接在目标上打开：那在真正
+		# 消费输入之前就把输出截断了，之后初始化过滤器、预填充 LTP 或筛选任一步失败，都会留下
+		# 一个已清空的（或半截的）输出，上一轮的完整结果同时也没了。
+		out_files = [stack.enter_context(atomic_write_text(path)) for path in paths]
 		filter_sentences_streaming(sentences, filter_config_paths, out_files)

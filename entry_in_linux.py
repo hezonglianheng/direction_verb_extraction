@@ -15,7 +15,8 @@ import time
 
 import config
 import sentenceFilters
-from file_paths import collect_jsonl_inputs
+import file_paths
+from file_paths import atomic_write_text
 
 
 _WORKER_FILTERS: list[tuple[str, Any]] = []
@@ -76,7 +77,8 @@ def _filter_sentence_batch(batch: list[dict[str, Any]]) -> tuple[list[list[dict[
 
 			filter_methods = explanation.get("methods", [])
 			match_tree: list[sentenceFilters.MatchNode] = explanation.get("match_tree", [])
-			simplified_tree = sentenceFilters.simplify_tree(match_tree)
+			# 带上分词结果：simplify_tree 据此记原文字符跨度（D4）。cws_result 在上面已取到
+			simplified_tree = sentenceFilters.simplify_tree(match_tree, tokens=cws_result)
 
 			filtered_batches[idx].append(s | {"sentence": cws_result, "filter_methods": filter_methods, "match_tree": simplified_tree})
 
@@ -161,12 +163,15 @@ def iter_jsonl_file_sentences(input_file: str, position: int = 0, vocabs: list[s
 
 
 def iter_path_sentences(src_path: str, vocabs: list[str] = None, *, output_paths=()):
-	# 此函数不能自身包含 yield：路径检查和目录扫描必须在打开输出文件前完成。
-	files = collect_jsonl_inputs(src_path, output_paths)
-	return (
-		sentence
-		for i, file in enumerate(files)
-		for sentence in iter_jsonl_file_sentences(str(file), position=i, vocabs=vocabs)
+	"""目录（或单文件）下的 jsonl 逐文件流式产出句子
+
+	收集与遍历走 file_paths.iter_path_sentences（与 entry_in_win 同一份，理由见那里）。
+	本入口多带一个 position=文件序号，产物里因此知道这句出自第几个输入文件。
+	"""
+	return file_paths.iter_path_sentences(
+		src_path,
+		lambda file, index: iter_jsonl_file_sentences(str(file), position=index, vocabs=vocabs),
+		output_paths=output_paths,
 	)
 
 
@@ -268,9 +273,12 @@ def run(src_path: str, filter_config_paths: Any, output_paths: Any, vocabs: list
 		raise ValueError(f"规则套数（{len(filter_config_paths)}）与输出文件数（{len(paths)}）不一致")
 
 	sentences = iter_path_sentences(src_path, vocabs=vocabs, output_paths=paths)
+	# 分词口径打印一次（D4）：切分配置改了下标会位移，事后要能判断一份产物是哪个口径跑出来的
+	print(f"[分词口径] {config.segmentation_signature()}")
 
 	with ExitStack() as stack:
-		out_files = [stack.enter_context(open(path, "w", encoding="utf-8")) for path in paths]
+		# 先写临时文件、全部成功后才原子替换（E1）：理由与 entry_in_win.run_windows_entry 一致
+		out_files = [stack.enter_context(atomic_write_text(path)) for path in paths]
 		filter_sentences_streaming(sentences, filter_config_paths, out_files)
 
 

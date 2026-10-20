@@ -66,6 +66,10 @@ class SyntaxFallbackTests(unittest.TestCase):
         tools.prefill_ltp = Mock(return_value=3)
         tools.cache_ready = Mock(return_value=True)
         tools.parse_sentence_text = Mock(side_effect=lambda sentence: f"句法分析：{sentence}")
+        # 成对 csv 路径（E1）：与 jsonl 本身错开，别让收尾导 csv 覆盖刚写好的 jsonl
+        tools.pairs_csv_path = Mock(side_effect=lambda path: Path(path).with_suffix(".csv"))
+        # 特征值业务校验（A2）：桩里也给同一份口径，形状与本体一致
+        self.aio.sa.validate_feature_values = lambda features, classes: {"ok": True}
         runner._warn_corpus_type_mismatch = Mock()
         runner._print_config_tables = Mock()
         runner._config_tables = Mock(return_value={})

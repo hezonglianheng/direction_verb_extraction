@@ -27,6 +27,17 @@ def load_graphs():
     graph_api.StateGraph = Mock()
     tools = ModuleType("spatial_tools")
     tools.PAIR_CSV_COLUMNS = ()
+    # 稳定 ID 与候选唯一键（D1/D2）：与 test_synonym_graph 的桩同一套口径
+    tools.RESULT_SCHEMA_VERSION = "1.0"
+    tools.source_document_id = lambda record: record.get("source_file")
+    tools.content_hash = lambda text: "".join(text)
+    tools.sentence_id = lambda record: (
+        f"{record.get('source_file') or 'unknown-doc'}#{record.get('source_line_no') or record.get('line_no')}"
+        if record.get("sentence") else None
+    )
+    tools.candidate_key = lambda sentence_id_, index, replacement: (
+        f"{sentence_id_}|{index}|{replacement}" if sentence_id_ and replacement else None
+    )
     return load_module("spatial_graphs.py", {"langgraph.graph": graph_api, "spatial_tools": tools})
 
 
@@ -165,6 +176,8 @@ class AllInOneFeatureTests(unittest.TestCase):
         pydantic.create_model = Mock()
         spatial_agents = ModuleType("spatial_agents")
         spatial_agents.AgentSet = object
+        # 特征值业务校验（A2）：每条路都过同一个校验器，桩里给一份稳定的返回值
+        spatial_agents.validate_feature_values = lambda features, classes: {"ok": True}
         cls.aio = load_module("all_in_one.py", {
             "langchain.agents.structured_output": structured,
             "langchain_core.callbacks": callbacks,

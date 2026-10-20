@@ -16,6 +16,8 @@ from langchain.agents import create_agent
 from langchain.chat_models import init_chat_model
 from deepagents import create_deep_agent
 
+import config
+
 _PROJECT_ROOT = Path(__file__).resolve().parent
 _MODEL_CONFIG_PATH = _PROJECT_ROOT / "model_config" / "api_keys.json"
 """模型配置文件。用绝对路径而非相对路径，避免换工作目录运行时报找不到文件"""
@@ -90,7 +92,10 @@ def get_model(model_name: str, disable_thinking: bool = False):
         "base_url": model_cfg["base_url"],
         "api_key": model_cfg["api_key"],
         "temperature": model_cfg.get("temperature", 0),
-        "max_retries": model_cfg.get("max_retries", 6),
+        # 超时与重试都显式给（A3）：底层 SDK 自己的默认值不进运行清单、也无法按实验调整，
+        # 而「这一轮允许花多少」必须是可记录、可复现的口径。配置里写了就以配置为准。
+        "timeout": model_cfg.get("timeout", config.REQUEST_TIMEOUT_SECONDS),
+        "max_retries": model_cfg.get("max_retries", config.LLM_MAX_RETRIES),
     }
     if disable_thinking:
         disable_kwargs = model_cfg.get("disable_thinking") or _DISABLE_THINKING_DEFAULTS.get(

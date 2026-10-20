@@ -29,11 +29,15 @@ LTP_BATCH_CHUNK = 32
 
 # ---- 方位词后缀切分（修正 LTP 把「名词+方位词」并成一个 token）----
 LOCATIVE_SPLIT_ENABLED = True
-"""是否启用方位词后缀切分。默认关闭。
+"""是否启用方位词后缀切分。默认开启。
 
-开启后，LTP 输出里以方位词结尾、词性为 n/nl 的 token 会在写缓存前被切开，
+开启后，LTP 输出里以方位词结尾、词性为 nl 的 token 会在写缓存前被切开，
 并用「已分词」模式重跑 pos/dep/sdp。筛选阶段与空间 agent 阶段的 CWS/POS/DEP/SDP
-产物都会随之改变——索引会位移，所以已有产物必须整批重跑，不能增量续跑。"""
+产物都会随之改变——索引会位移，所以已有产物必须整批重跑，不能增量续跑。
+
+（说明与代码对齐：常量是 True，允许切分的词性只有 LOCATIVE_SPLIT_ALLOWED_POS 里的
+nl 一项。旧注释写「默认关闭」「n/nl」，会让人按「没开切分」或「n 也能切」去理解
+已有产物的下标口径，故改正。）"""
 
 LOCATIVE_SPLIT_VOCAB_FILE = "config_files/localization_vocab.json5"
 """后缀词表。相对路径按 _PROJECT_ROOT 解析，保证 spawn 出的子进程读到同一份文件。"""
@@ -60,6 +64,54 @@ LOCATIVE_SPLIT_TOKEN_BLACKLIST = frozenset({
     "乡下", "地下", "手下", "心中", "背后",
 })
 """整词命中即不切分。"""
+
+TOKENIZER_NAME = "ltp"
+"""分词与句法分析的引擎名，与 LTP_MODEL_PATH 一并记进产物，用来判断旧产物能否复用"""
+
+
+def segmentation_signature() -> dict:
+    """本次分词口径的签名：引擎、模型路径、后缀切分开关与词表
+
+    后缀切分会改变 tokens 与下标（见 LOCATIVE_SPLIT_ENABLED），所以**切分配置变了，旧产物
+    的下标一律不可复用**。把这几项写进运行汇总，事后才能判断某份产物是哪个口径跑出来的、
+    要不要整批重跑——光看「索引对不上」分不清是代码改了还是配置改了。
+
+    Returns:
+        dict: 可直接 json 序列化的签名；值一律取字符串或有序列表，便于与历史产物逐字段比。
+    """
+    return {
+        "tokenizer": TOKENIZER_NAME,
+        "model_path": LTP_MODEL_PATH,
+        "locative_split_enabled": LOCATIVE_SPLIT_ENABLED,
+        "locative_split_vocab_file": LOCATIVE_SPLIT_VOCAB_FILE,
+        "locative_split_allowed_pos": sorted(LOCATIVE_SPLIT_ALLOWED_POS),
+    }
+
+
+# ---- 模型请求策略：超时、重试与预算 ----
+# 三者集中在配置里，是为了让「这一轮跑批允许花多少」成为可记录、可复现的口径，
+# 而不是分散在 SDK 默认值与各 agent 的 try/except 里。
+REQUEST_TIMEOUT_SECONDS = 120
+"""单个模型请求的超时秒数
+
+底层 SDK 自己有默认超时，但那条默认值不进运行清单、也无法按实验调整；这里显式给一个，
+并由 agents.get_model 传下去。"""
+
+LLM_MAX_RETRIES = 6
+"""单个模型请求在框架层的最大重试次数（限流、连接断开这类可重试错误）
+
+注意它**不是**业务层的重试：框架重试不产生新的记录语义，只是同一问的补发。"""
+
+CANDIDATE_MAX_REQUESTS = 8
+"""一条候选最多发几次模型请求（0 表示不限）
+
+一条语料会按替换词展开出多个候选，单个候选的失败重试会被候选数放大成整批的倍数。
+超预算的候选不再继续问，如实记为失败并转入复核（见 spatial_agents.RequestBudgetExceeded）。"""
+
+BATCH_MAX_REQUESTS = 0
+"""整批最多发几次模型请求（0 表示不限）
+
+达到上限后余下的候选一律不再发请求，记录里 admission.review_required 记 True，留给人工复核。"""
 
 # FILTER_WORKERS = 0
 FILTER_WORKERS = 1

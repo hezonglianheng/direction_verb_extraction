@@ -24,7 +24,9 @@
 2. 根节点未必是搭配动词。direction_verb_as_center 与 *_one_complement 同时命中的记录里，
    配置顺序让根节点是趋向动词、搭配动词退到 node[1]。→ 任何位置规则都会取错，只按词表判断才对。
 
-一条记录里出现多个目标词时**重复计入每个词**（落成多行），所以输出行数多于语料的命中行数。
+一条记录里出现多个目标词时，旧写法**重复计入每个词**（落成多行，只用 sampled_word 区分），
+于是同一句的两份记录各自都会展开句内全部目标位置，相同句对被重复生成。现按 D1 统一口径：
+一句只落一份记录，抽中的词全部写进 `sampled_words`；下游据此只展开这些词的位置。
 
 内存：本模块自己的数据结构只占几十 MB（两遍流式扫，不把语料读进内存）。但进程整体常驻约 0.8GB ——
 `from sentenceFilters import ...` 会连带 `sentenceTable` 里的 `from ltp import LTP` / `import torch`，
@@ -287,10 +289,19 @@ def sample_lines(
 
 
 def write_sample(corpus: Path, chosen: dict[int, list[str]], out_path: Path) -> int:
-    """第二遍：流式扫语料，把抽中的行原样写出并补上 sampled_word / line_no
+    """第二遍：流式扫语料，把抽中的行原样写出并补上 sampled_words / source_line_no
 
-    按语料原顺序输出（同一行命中多个词就按字典序连着写多条），只重放一次文件、O(1) 内存。
-    不按词分组的写法虽然更好读，但要把十几万条记录全缓存下来，代价不值。
+    **一句只落一份记录**（D1）：同一行被多个词抽中时，这些词全部写进 `sampled_words`
+    （按字典序），不再为每个词各写一行——旧写法下同一句的两份记录都会展开句内全部目标
+    位置，于是那个句子里没被抽中的词也被展开一遍、相同句对被重复生成。配额照样可对账：
+    每个词抽中哪些行由 sample_lines 定死，落盘的行集合不变，变的是「一行只出现一次」。
+
+    行号分两笔记（D2）：`source_line_no` 是本语料（源）里的行号，落盘后不再变动；
+    `line_no` 也照旧写一份同值，**供下游被覆盖**——spatial_tools.read_corpus 读输入文件时
+    会把 `line_no` 改写成当前文件的物理行号，并把原本的源行号留进 `source_line_no`。
+    两份都在，重排、合并或换一份抽样文件之后仍能回查原句。
+
+    按语料原顺序输出，只重放一次文件、O(1) 内存。
 
     这里没有调 spatial_tools.write_jsonl：它一次收一份完整的记录列表，要先把十几万条读进内存，
     正是本模块要避开的；spatial_tools.append_jsonl 每条都开关一次文件，十几万次也受不了。
@@ -303,9 +314,14 @@ def write_sample(corpus: Path, chosen: dict[int, list[str]], out_path: Path) -> 
             if not words:
                 continue
             record = json.loads(line)
-            for word in sorted(words):
-                out.write(json.dumps(record | {"sampled_word": word, "line_no": line_no}, ensure_ascii=False) + "\n")
-                written += 1
+            out.write(
+                json.dumps(
+                    record | {"sampled_words": sorted(words), "source_line_no": line_no, "line_no": line_no},
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+            written += 1
     return written
 
 
@@ -426,7 +442,11 @@ def run_corpus(corpus: Path, args: argparse.Namespace) -> dict:
         "records_with_multiple_words": counts["multi_word"],
         "distinct_words": len(lines_by_word),
         "expanded_records": expanded,
+        # 两个分母别混（D5）：sampled_records 是「词 × 行」的词层抽样条数（各词配额之和，
+        # 同一行被两个词抽中就计两次），sampled_lines 是**原句数**——一句只落一份记录，
+        # 它才是下游展开与落盘条数的分母，也是「原句 → 位置 → 候选」转化的起点。
         "sampled_records": sampled,
+        "sampled_lines": len(chosen),
         "words": {w: {"total": len(nos), "sampled": sampled_by_word[w]} for w, nos in sorted(lines_by_word.items())},
         "words_with_zero_samples": sorted(w for w, k in sampled_by_word.items() if k == 0),
         # 词表里有、但一条记录都没配上的词。这类词在 words 里根本不出现，只看 dict
@@ -457,8 +477,11 @@ def run_corpus(corpus: Path, args: argparse.Namespace) -> dict:
     written = write_sample(corpus, chosen, out_file)
     summary["out_file"] = str(out_file)
     summary["summary_file"] = str(summary_file)
+    # 落盘条数就是原句数（一句一份）：与 sampled_lines 对得上才说明「按词配额抽样」与
+    # 「按句落盘」没有分叉（D1 的对账口径）
+    summary["output_records"] = written
     write_summary(summary_file, summary)
-    print(f"输出文件：{out_file}（{written} 条）")
+    print(f"输出文件：{out_file}（{written} 条，{len(chosen)} 个原句）")
     print(f"汇总文件：{summary_file}")
     return summary
 

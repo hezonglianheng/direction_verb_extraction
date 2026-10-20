@@ -865,28 +865,196 @@ def pair_final_status(state: PairState) -> str:
     return "ok" if stage == "semantic_ok" else "ok_no_semantic_gate"
 
 
-def _record_id(state: dict) -> str | None:
-    """记录 id：语料行号-第几个目标词-该词第几个替换句（三段从 1 起；没有替换句记 0-0）
+ADMISSION_CONFIRMED = "confirmed"
+"""准入维度：这一项**已经确认**（如闸门判 True、两句都判通顺）"""
+ADMISSION_REJECTED = "rejected"
+"""准入维度：这一项明确不成立（闸门判 False、句子不通顺）"""
+ADMISSION_UNKNOWN = "unknown"
+"""准入维度：这一项没得出结论（没调 LLM、调用失败、判不出来）"""
+ADMISSION_FAILED = "failed"
+"""准入维度：这一项执行出错（特征提取失败）"""
+ADMISSION_ABSENT = "absent"
+"""准入维度：这条记录压根没走到这一步（改写未命中、提前收尾）"""
 
-    三段都取自记录里能直接读到的东西：line_no 是语料文件里的真实行号（st.read_corpus 写入，
-    不受 --offset/--limit 影响）；后两段是展开时写在候选上的 focus_order / candidate_order
+ADMISSION_SCHEMA_CONFIGURED = "configured"
+"""schema 那一维：名字来自配置表（查表命中）"""
+ADMISSION_SCHEMA_LLM = "llm"
+"""schema 那一维：名字由模型给出（含自由命名 llm_free）"""
+ADMISSION_JUDGEMENT_TABLE = "table"
+"""判定那一维：结论来自判定表（表里写了 √/×）"""
+ADMISSION_JUDGEMENT_LLM = "llm"
+"""判定那一维：结论来自模型（○ 交 LLM、表未收录、非法空格）"""
+
+ADMISSION_READY = {
+    # 各维度「算数」的取值：进了定版集合的记录，这些维度必须都有实质结论
+    "reality": (ADMISSION_CONFIRMED,),
+    "fluency": (ADMISSION_CONFIRMED,),
+    "features": (ADMISSION_CONFIRMED,),
+    "schema": (ADMISSION_SCHEMA_CONFIGURED, ADMISSION_SCHEMA_LLM),
+    "judgement": (ADMISSION_JUDGEMENT_TABLE, ADMISSION_JUDGEMENT_LLM),
+}
+"""每个维度哪些取值算「已确认」——is_admitted 就是逐个维度查这张表"""
+
+
+def _admission_reality(state: dict) -> str:
+    """闸门那一维：空间性有没有确认
+
+    True -> confirmed；False -> rejected；判不出来（no_llm / error / 没有关注词）-> unknown；
+    没走到这一步 -> absent。三档「判不出来」都是 unknown，绝不能并进 rejected——那等于
+    拿「没问过模型」当「不是空间用法」（见 reality_gate）。
+    """
+    reality = state.get("reality")
+    if not reality:
+        return ADMISSION_ABSENT
+    verdict = reality.get("is_spatial_scene")
+    if verdict is True:
+        return ADMISSION_CONFIRMED
+    if verdict is False:
+        return ADMISSION_REJECTED
+    return ADMISSION_UNKNOWN
+
+
+def _admission_fluency(state: dict) -> str:
+    """通顺性那一维：两句都判通顺才算确认，跳过闸门是 unknown（不是 confirmed）"""
+    stage = state.get("stage", "unknown")
+    if stage == "semantic_ok":
+        return ADMISSION_CONFIRMED
+    if stage.startswith("semantic_failed") or stage == "semantic_error":
+        return ADMISSION_REJECTED
+    if stage == "semantic_skipped":
+        return ADMISSION_UNKNOWN
+    return ADMISSION_ABSENT
+
+
+def _admission_features(state: dict) -> str:
+    """特征那一维：两侧都抽出来才算确认；任一侧 error 是 failed，no_llm 是 unknown"""
+    details = state.get("features_detail") or {}
+    if not details:
+        return ADMISSION_ABSENT
+    statuses = [(details.get(side) or {}).get("status") for side in ("a", "b")]
+    if "error" in statuses:
+        return ADMISSION_FAILED
+    if "skipped" in statuses:
+        return ADMISSION_UNKNOWN
+    return ADMISSION_CONFIRMED
+
+
+def _admission_schema(state: dict) -> str:
+    """图式那一维：查表命中 -> configured；模型给出（含自由命名）-> llm；其余 unknown/absent"""
+    schema = state.get("schema") or {}
+    sources = [(schema.get(side) or {}).get("source") for side in ("a", "b")]
+    sources = [s for s in sources if s]
+    if not sources:
+        return ADMISSION_ABSENT
+    if "table" in sources:
+        return ADMISSION_SCHEMA_CONFIGURED
+    if any(s in ("llm", "llm_free") for s in sources):
+        return ADMISSION_SCHEMA_LLM
+    return ADMISSION_UNKNOWN
+
+
+def _admission_judgement(state: dict) -> str:
+    """判定那一维：来自判定表还是模型；没结论（no_llm / error / 缺判定）一律 unknown"""
+    judge = state.get("judge") or {}
+    if judge.get("same_meaning") is None:
+        return ADMISSION_ABSENT if not judge else ADMISSION_UNKNOWN
+    return ADMISSION_JUDGEMENT_TABLE if judge.get("source") == "table" else ADMISSION_JUDGEMENT_LLM
+
+
+def pair_admission(state: PairState) -> dict:
+    """数据准入：这条记录够不够格进「空间性已确认」的定版集合（A1）
+
+    status（见 pair_final_status）只回答「流程有没有跑完」，而**流程跑完了不等于空间性已确认**：
+    闸门判不出来时链路照往下走，后续都成功就会得到 status=ok、reality 却是 unknown——
+    把两种成功混成一类，等于让一批没确认空间性的记录不声不响地进了定版集合。
+
+    所以这里把六个维度**分开记**，不把它们压成一个通过/不通过：
+        reality    空间性（闸门）
+        fluency    通顺性（语义闸门）
+        features   特征提取是否成功
+        schema     图式来自配置表还是模型
+        judgement  判定来自判定表还是模型
+        source     结论的最终来源（= judgement 的 source，缺判定时为空串）
+
+    is_admitted 是「所有维度都取到了实质结论」，即 ADMISSION_READY 里列的那些取值。
+    它**只看有没有确认，不看结论是什么**：判成不同义（rejected/不同义）的记录照样准入，
+    那是研究要的负例；被拦的是「根本没判出来」的那些。
+
+    review_required 标出需要人工复核的记录：维度里有 unknown / failed、但流程已经跑完
+    （status 以 ok 开头）——这类正是最容易被当成可用语料放行的。超预算停下来的记录也在这里
+    标记（见 spatial_agents.RequestBudgetExceeded），与「判不出来」同一条复核通道。
+    """
+    dimensions = {
+        "reality": _admission_reality(state),
+        "fluency": _admission_fluency(state),
+        "features": _admission_features(state),
+        "schema": _admission_schema(state),
+        "judgement": _admission_judgement(state),
+    }
+    admitted = all(dimensions[name] in values for name, values in ADMISSION_READY.items())
+    unknown_or_failed = [
+        name
+        for name, value in dimensions.items()
+        if value in (ADMISSION_UNKNOWN, ADMISSION_FAILED)
+    ]
+    # 需要复核的：有维度没结论、但流程已经跑完（status 以 ok 开头）
+    status = pair_final_status(state)
+    return {
+        **dimensions,
+        "source": (state.get("judge") or {}).get("source") or "",
+        "status": status,
+        "is_admitted": admitted,
+        "review_required": bool(unknown_or_failed) and status.startswith("ok"),
+        "reasons": unknown_or_failed,
+    }
+
+
+def _record_id(state: dict) -> str | None:
+    """记录 id：句子稳定 ID-第几个目标词-该词第几个替换句（后两段从 1 起；没有替换句记 0-0）
+
+    首段取 **st.sentence_id**（来源文档 + 源行号 + 文本指纹）而不是裸行号（D2）：
+    行号只能在同一份文件里定位，重排、重新抽样或合并之后同一个行号指的是另一句，
+    两份不同输入产出的 id 还会撞在一起却说的不是同一件事。sentence_id 与文件顺序无关，
+    于是 id 能当全局唯一键用；取不到（坏记录里连 sentence 都没有）才回落到物理行号，
+    连行号也没有时返回 None——不编造。
+
+    后两段是展开时写在候选上的 focus_order / candidate_order
     （见 AlterAgent.expand_positions）——前者是"句内第几个展开出候选的目标词"，后者是"该词
     自己的第几个替换句"。与 focus_index（0 基 token 下标）不是一回事：同句两处同一个词
     （上@3 与 上@5）各有各的 focus_order，光看词分不开。
 
-    没有替换句的记录（bad_record / alter_missed，candidate 为 None）记成 `行号-0-0`：这类
-    记录每行至多一条（见 alter_init_states），同一份输出里 id 于是不撞。它是拼出来的**字符串**，
-    字典序不等于数值序，别拿它当排序键（排序仍走 record_order_key）。
-
-    line_no 缺失（手工拼的坏记录）时返回 None，落盘为 null、csv 留空——不编造行号。
+    没有替换句的记录（bad_record / alter_missed，candidate 为 None）记成 `<句子ID>-0-0`：
+    这类记录每句至多一条（见 alter_init_states），同一份输出里 id 于是不撞。它是拼出来的
+    **字符串**，字典序不等于数值序，别拿它当排序键（排序仍走 record_order_key）。
     """
-    line_no = (state.get("record") or {}).get("line_no")
-    if not isinstance(line_no, int):
-        return None
+    record = state.get("record") or {}
+    stem = st.sentence_id(record)
+    if stem is None:
+        line_no = record.get("line_no")
+        if not isinstance(line_no, int):
+            return None
+        stem = str(line_no)
     chosen = state.get("candidate")
     if not chosen:
-        return f"{line_no}-0-0"
-    return f"{line_no}-{chosen.get('focus_order')}-{chosen.get('candidate_order')}"
+        return f"{stem}-0-0"
+    return f"{stem}-{chosen.get('focus_order')}-{chosen.get('candidate_order')}"
+
+
+def _candidate_key(state: dict) -> str | None:
+    """本条记录的候选唯一键 (sentence_id, focus 位置, replacement)（D1）
+
+    与 id 是两套编号：id 里的后两段是"第几个词/第几个替换句"的次序，换了规则表就会错位；
+    candidate_key 用的是**位置下标与替换词本身**，于是两份产物可以拿它直接对账——
+    「同一个 (句子, 位置, 替换词) 是不是被重复生成了」正是 D1 要回答的问题。
+
+    没有候选（bad_record / alter_missed）时返回 None：那类记录不是候选，没有键。
+    """
+    chosen = state.get("candidate")
+    if not chosen:
+        return None
+    return st.candidate_key(
+        st.sentence_id(state.get("record") or {}), chosen.get("focus_index"), chosen.get("replacement")
+    )
 
 
 def _candidate_block(state: dict) -> dict | None:
@@ -943,6 +1111,10 @@ def serialize_pair(state: PairState) -> dict:
 
     id（见 _record_id）刻意放在第一个键上：它同时是成对信息 csv 的首列（st.PAIR_CSV_COLUMNS），
     事后按 id 认记录、回查不用再拼 (line_no, candidate.index)。
+
+    sentence_id / candidate_key / schema_version / admission 四块是数据契约（D1、D2、D3、A1）：
+    前两者给出「与文件顺序无关的稳定来源」与「候选唯一键」，schema_version 让读取侧不靠猜字段，
+    admission 把「流程跑完了」与「数据够不够格入库」分开。source 一块顺带把三级行号都记上。
     """
     record = state["record"]
     return {
@@ -950,6 +1122,10 @@ def serialize_pair(state: PairState) -> dict:
         "status": pair_final_status(state),
         "stage": state.get("stage", "unknown"),
         "status_reason": state.get("status_reason", ""),
+        "schema_version": st.RESULT_SCHEMA_VERSION,
+        "sentence_id": st.sentence_id(record),
+        "content_hash": st.content_hash(record.get("sentence") or []) if record.get("sentence") else None,
+        "candidate_key": _candidate_key(state),
         "line_no": record.get("line_no"),
         "output_file": state.get("output_file"),
         "candidate": _candidate_block(state),
@@ -957,6 +1133,9 @@ def serialize_pair(state: PairState) -> dict:
         "focus_word_b": state.get("focus_word_b"),
         "source": {
             "source_file": record.get("source_file"),
+            "source_document_id": st.source_document_id(record),
+            "source_line_no": record.get("source_line_no"),
+            "input_line_no": record.get("input_line_no"),
             "filter_methods": record.get("filter_methods"),
             "match_tree": record.get("match_tree"),
         },
@@ -981,6 +1160,8 @@ def serialize_pair(state: PairState) -> dict:
         "features_detail": state.get("features_detail", {}),
         "schema": state.get("schema", {}),
         "judgement": state.get("judge", {}),
+        # 数据准入（A1）：与 status 并列，正式导出按它筛，别拿「流程成功」当「数据可用」
+        "admission": pair_admission(state),
         "context": {
             "history": state.get("history", []),
         },
@@ -1060,11 +1241,28 @@ def _tally_reality(record: dict, counters: dict[str, Counter]) -> None:
     counters["reality_counts"][_reality_label(record.get("reality") or {})] += 1
 
 
+def _tally_admission(record: dict, counters: dict[str, Counter]) -> None:
+    """汇总里记一笔数据准入（A1）：各维度的取值分布 + 准入数 + 待复核数
+
+    status_counts 只能看到「流程有没有跑完」，看不到跑完的那些里有多少其实没确认空间性。
+    这一组与 status_counts 一起看才分得开**处理成功率**与**数据准入率**：
+    `admission_counts[admitted/not_admitted]` 是分母为记录数的准入率，
+    各 `*_admission` 组则说明卡在哪个维度（reality/fluency/features/schema/judgement）。
+    """
+    admission = record.get("admission") or {}
+    for name in ("reality", "fluency", "features", "schema", "judgement"):
+        counters[f"{name}_admission"][admission.get(name) or "absent"] += 1
+    counters["admission_counts"]["admitted" if admission.get("is_admitted") else "not_admitted"] += 1
+    if admission.get("review_required"):
+        counters["admission_counts"]["review_required"] += 1
+
+
 def pair_tally(record: dict, counters: dict[str, Counter]) -> None:
-    """pair 图的汇总口径：状态分布、闸门判定、判定分布、判定表的查表分布、两侧 schema 的来源、两侧关注词口径"""
+    """pair 图的汇总口径：状态分布、闸门判定、判定分布、判定表的查表分布、两侧 schema 的来源、两侧关注词口径、数据准入"""
     _tally_focus(record, counters)
     _tally_reality(record, counters)
     _tally_replacement(record, counters)
+    _tally_admission(record, counters)
     counters["status_counts"][record.get("status", "unknown")] += 1
     for side in ("a", "b"):
         counters["schema_sources"][(record.get("schema") or {}).get(side, {}).get("source", "none")] += 1
@@ -1499,8 +1697,9 @@ def synonym_final_status(state: SynonymState) -> str:
 
 
 def serialize_synonym(state: SynonymState) -> dict:
-    """沿用改写检查的成对记录，增加独立 agent 的同义判定。"""
+    """沿用改写检查的成对记录，增加与 pair 图同口径的 id 和独立 agent 的同义判定。"""
     return {
+        "id": _record_id(state),
         **serialize_alter_check(state),
         "status": synonym_final_status(state),
         "judgement": state.get("synonym", {}),
@@ -1603,6 +1802,13 @@ GRAPHS: dict[str, GraphSpec] = {
             "focus_sources",
             "focus_kinds",
             "replacement_kinds",
+            # 数据准入（A1）：与 status_counts 并列，分开报「处理成功率」与「数据准入率」
+            "admission_counts",
+            "reality_admission",
+            "fluency_admission",
+            "features_admission",
+            "schema_admission",
+            "judgement_admission",
         ),
         tally=pair_tally,
         csv_columns=st.PAIR_CSV_COLUMNS,

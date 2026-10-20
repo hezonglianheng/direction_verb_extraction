@@ -88,6 +88,7 @@ from pydantic import Field, create_model
 
 import agents as agent_factory
 import config
+import file_paths
 import spatial_agents as sa
 import spatial_graphs as sg
 import spatial_runner as sr
@@ -733,11 +734,16 @@ def assemble(state: dict, ctx: "_Context", *, dumps: dict | None, error: str | N
                 for side in ("a", "b")
             }
         else:
+            dumped = dumps.get("features") or {}
             feature_results = {
                 side: {
-                    "features": (dumps.get("features") or {}).get(side) or {},
+                    "features": dumped.get(side) or {},
                     "source": feature_agent.table_source,
                     "reason": "",
+                    # 与 flat / deep 两条路**同一份**业务校验（A2）：单次调用的结构化输出
+                    # 同样可能给出未定义标签或空值，校验器放在共用业务层就是为了三处一致。
+                    # 类别表取 ctx 里的那一份（本轮注入的就是它），与特征 agent 用的是同一张表
+                    "validation": sa.validate_feature_values(dumped.get(side) or {}, ctx.feature_classes),
                 }
                 for side in ("a", "b")
             }
@@ -1044,6 +1050,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--out-dir", default=None, help=f"输出目录（默认 results/{DEFAULT_OUT_PREFIX}）")
     parser.add_argument("--out-file", default=None, help="直接指定输出文件（默认按时间戳生成）")
     parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="允许覆盖已存在的输出文件。默认**拒绝**（与 spatial_runner 同一套输出政策，E1）："
+        "已有同名输出直接报错退出，免得历史记录与重复 id 混进本轮结果",
+    )
+    parser.add_argument(
         "--no-syntax",
         action="store_true",
         help="不把句法证据放进消息：与六 agent 那条路不可比（那边把句法证据内联进消息，且没有这个开关）",
@@ -1080,6 +1092,14 @@ def main(argv: list[str] | None = None) -> None:
 
     out_dir = Path(args.out_dir) if args.out_dir else _PROJECT_ROOT / "results" / DEFAULT_OUT_PREFIX
     out_path = Path(args.out_file) if args.out_file else st.build_output_path(out_dir, prefix=DEFAULT_OUT_PREFIX)
+    # 与 spatial_runner 同一套输出路径检查（E1）：输入/输出、jsonl/csv/summary 互不撞，
+    # 已有输出默认拒绝，且全部发生在建文件之前
+    file_paths.validate_run_outputs(
+        corpus_path,
+        out_path,
+        st.pairs_csv_path(out_path) if not args.no_pairs_csv else None,
+        overwrite=args.overwrite,
+    )
 
     print("单次调用版（all_in_one）：一次请求答完 pair 图的五个 LLM 判断")
     print(f"语料类型：{corpus_type}（{'--corpus-type' if args.corpus_type else '默认'}）")
@@ -1146,6 +1166,9 @@ def main(argv: list[str] | None = None) -> None:
         # 成对信息 csv：默认导出（--no-pairs-csv 关），列与行序跟 pair 图一致（用 pair 图那套列）
         csv_columns=sg.GRAPHS["pair"].csv_columns if not args.no_pairs_csv else (),
         model_name=args.model if ctx.llm else None,
+        overwrite=args.overwrite,
+        input_records=len(records),
+        expanded_states=len(states),
     )
     counter = CallCounter()
     suppressed: Counter = Counter()
@@ -1158,7 +1181,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.no_pairs_csv:
         print("成对信息 csv：本次不导出（--no-pairs-csv）")
     else:
-        print(f"成对信息 csv：收尾导出到 {out_path.with_suffix('.csv')}（--no-pairs-csv 可关）")
+        print(f"成对信息 csv：收尾导出到 {st.pairs_csv_path(out_path)}（--no-pairs-csv 可关）")
     # 落盘与统计都留在主线程：pool.map 按输入顺序产出，于是输出文件与串行跑逐字节同序
     # （line_no 升序、同句再按 candidate.index）。pair 图那边是各 worker 在 save 节点并发落盘、
     # 顺序是完成顺序，但两侧收尾都由 ResultWriter.finish 按同一个键重排，所以两份文件最终同序、

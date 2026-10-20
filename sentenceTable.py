@@ -12,6 +12,16 @@ from locative_split import get_suffix_vocab, split_tokens_by_suffix
 
 _ltp = None
 _ltp_init_lock = threading.Lock()
+_infer_lock = threading.Lock()
+"""LTP 推理的串行边界（A4）
+
+缓存字典自带的锁只保护字典本身，推理是**在锁外**做的（见 get_task_value），所以预填充没兜住的
+句子会由多个 worker 线程同时送进同一份模型：那不是数据竞争（结果一致），而是把一次前向拆成
+并发的多次、互相抢占显存与算力。这里给推理划一条明确的串行边界：并发的调用排队过这一把锁，
+于是"在途推理"恒为一组，与线程池里的在途候选数解耦。
+
+预填充（spatial_runner._prefill）仍然是首选路径——它把整批句子一次喂进去，根本不走这个锁；
+这条边界只是兜住漏网的那些句子。"""
 
 
 def _get_ltp() -> LTP:
@@ -106,11 +116,14 @@ class SentenceTaskCache:
         注意必须统一以 list 调 pipeline：传裸 str 时 is_batch=False，LTPOutput 会把
         单句结果解包一层，result[t] 就不再是逐句列表了。
         """
-        ltp = _get_ltp()
-        tasks = list(self.BASE_TASKS)
-        result = ltp.pipeline(sentences, tasks=tasks)
-        values = [{t: result[t][i] for t in tasks} for i in range(len(sentences))]
-        self._correct_splits(ltp, values)
+        # 整段（含 _correct_splits 里那次重跑）都在推理锁内：两个线程各跑一半前向没有意义，
+        # 反而让"在途推理组数"变成不可控的量（见 _infer_lock）
+        with _infer_lock:
+            ltp = _get_ltp()
+            tasks = list(self.BASE_TASKS)
+            result = ltp.pipeline(sentences, tasks=tasks)
+            values = [{t: result[t][i] for t in tasks} for i in range(len(sentences))]
+            self._correct_splits(ltp, values)
         return values
 
     def _correct_splits(self, ltp: LTP, values: list[dict]) -> None:
@@ -243,6 +256,7 @@ class SentenceTaskCache:
         # 走这里的是 ner/srl/sdpg，它们不在 BASE_TASKS 里，本项目也没有调用方；
         # 该分支只缓存 task 自身，不缓存未修正的 CWS，因此不受方位词切分影响。
         tasks_list = [config.CWS, task] if task != config.CWS else [task]
-        value = _get_ltp().pipeline(sentence, tasks=tasks_list)[task]
+        with _infer_lock:  # 与 _infer_base 同一条串行边界（见 _infer_lock）
+            value = _get_ltp().pipeline(sentence, tasks=tasks_list)[task]
         self._update_cache(sentence, {task: value})
         return value

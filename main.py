@@ -11,8 +11,13 @@ from entry_in_linux import run_linux_entry
 from entry_in_win import run_windows_entry
 
 
-DEFAULT_FILTER_CONFIG = "filter_config.json5"
-"""筛选配置文件默认路径"""
+DEFAULT_FILTER_CONFIG = ""
+"""筛选配置文件默认路径
+
+刻意**不再**指向一个不存在的文件：旧默认值 filter_config.json5 在仓库里根本没有，按默认跑
+必然 FileNotFoundError，而报错只说「找不到文件」，看不出该选哪一个。实际的规则文件是
+config_files/*_expressions.json5（方位词与趋向动词各一份）——选哪套是研究口径，不由程序替
+用户猜，所以默认留空并在 main 里报出可选项（E2）。"""
 
 LEGACY_OUTPUT_NAME = "filtered_sentences.jsonl"
 """只运行一套规则、且未指定 -o 时的输出文件名（与历史行为一致）"""
@@ -138,8 +143,17 @@ def main(
         vocab_config_path (str | list[str] | None): 初筛词表文件，None 表示从筛选配置自动推导
         out_name (str | None): 输出文件名（多套规则时作为前缀）
     """
-    filter_configs = _normalize_paths(filter_config_path) or [DEFAULT_FILTER_CONFIG]
+    filter_configs = _normalize_paths(filter_config_path) or ([DEFAULT_FILTER_CONFIG] if DEFAULT_FILTER_CONFIG else [])
     vocab_configs = _normalize_paths(vocab_config_path)
+
+    if not filter_configs:
+        # 默认值为空是刻意的（见 DEFAULT_FILTER_CONFIG）：这里把可选项直接列出来，
+        # 免得「按默认跑」变成一次必然失败、却看不出该选哪个的 FileNotFoundError（E2）
+        candidates = sorted(p.name for p in (Path(config._PROJECT_ROOT) / "config_files").glob("*_expressions.json5"))
+        raise ValueError(
+            "必须用 -f/--filter_config_path 指定筛选配置（方位词与趋向动词是两套不同的规则）："
+            f"config_files 下有 {'、'.join(candidates) or '（无）'}"
+        )
 
     for path in filter_configs:
         if not Path(path).is_file():
@@ -174,7 +188,9 @@ if __name__ == "__main__":
     parser.add_argument("src_path", type=str, help="输入文件或目录路径")
     parser.add_argument(
         "-f", "--filter_config_path", action="append", type=str, default=None,
-        help=f"筛选配置文件路径，可重复传入（也可用逗号分隔）以同时运行多套规则，默认为 {DEFAULT_FILTER_CONFIG}",
+        help="筛选配置文件路径，可重复传入（也可用逗号分隔）以同时运行多套规则；"
+        "**必须显式指定**（两套规则的研究口径不同，不默认替你选）："
+        "config_files/direction_expressions.json5（趋向动词）或 localization_expressions.json5（方位词）",
     )
     parser.add_argument(
         "-v", "--vocab_config_path", action="append", type=str, default=None,

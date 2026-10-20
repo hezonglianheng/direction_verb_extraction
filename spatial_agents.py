@@ -70,6 +70,7 @@ import argparse
 import copy
 import json
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Iterable
@@ -90,6 +91,19 @@ _FIRST_ERROR_CHARS = 200
 与 _reply_digest 同一个口径：够认出是哪一类失败（403 区域限制、超时、连不上……），
 又不至于把整个响应头搬进汇总。完整的那份仍在各条记录的 status_reason 里。
 """
+
+
+class RequestBudgetExceeded(RuntimeError):
+    """本 agent 已用完请求预算，这一问不再发出（A3）
+
+    预算是「统一策略」的一部分：一条语料会按替换词展开出多个候选，而同一位置的失败若由
+    每个候选各自重试，重试次数会被候选数放大成整批的倍数（见 config.CANDIDATE_MAX_REQUESTS
+    与 config.BATCH_MAX_REQUESTS）。达到上限时**抛出而不是无限重试**：各 agent 的 run() 本来
+    就兜异常，于是这条记录如实记成 error/未知并转入人工复核（见 spatial_graphs.pair_admission
+    的 review_required），而不是静默吞掉一批请求费。
+
+    它与接口失败的区别只在原因，不在处置：两者都进同一条复核通道，记录里都看得见。
+    """
 
 
 class StructuredOutputMissing(RuntimeError):
@@ -589,6 +603,67 @@ def _validate_feature_classes(feature_classes: list[dict], *, source: str | None
         raise ValueError(f"特征类别表里有重复的 key，请修改 {where}。")
 
 
+def validate_feature_values(features: dict, feature_classes: list[dict]) -> dict:
+    """结构化输出**之后**的业务校验（A2）：闭集取值、缺失、未定义标签
+
+    _feature_model 建的模型只约束了形状（每类一个 list[str]），**没有**把配置里的闭集 values
+    变成枚举约束。于是格式完全合法的输出仍可能含未定义标签、近义拼写或不符合该维度约定的
+    取值，后果是 schema 查表静默未命中、或整条记录意外降级到 LLM 兜底——看起来却一切正常。
+    这类问题不能只靠提示语约束，必须在产出之后查一遍。
+
+    闭集与开放分开处理：
+      - 类别表里 `values` 非空的按**闭集**查：取值必须在里面，否则记进 undefined；
+      - 没写 values 的是**开放**类，只查取值本身是不是非空字符串（没有可对照的清单）。
+
+    空列表**不判失败**：某维度在这一句里确实可能不适用（现有测试也把空特征当合法），
+    所以只在闭集类里记 missing，由调用方决定要不要复核——不把合法空值误伤成错误。
+
+    Args:
+        features (dict): 模型给出的特征对象 {key: [取值, ...]}
+        feature_classes (list[dict]): 特征类别表（键与取值清单的真源）
+
+    Returns:
+        dict: {"ok": bool, "undefined": {key: [越界取值, ...]}, "missing": [闭集但没取值的 key, ...],
+               "open": [开放类的 key, ...], "unfilled": [类别表里没定义的 key, ...]}
+               —— flat、deep、all_in_one 三条路共用同一份口径，对同一个特征对象给出同一个结果。
+    """
+    declared = {str(c.get("key")): c for c in feature_classes or [] if isinstance(c, dict) and c.get("key")}
+    closed: dict[str, set[str]] = {}
+    for key, feature_class in declared.items():
+        values = [str(v) for v in (feature_class.get("values") or []) if str(v)]
+        if values:
+            closed[key] = set(values)
+
+    undefined: dict[str, list[str]] = {}
+    missing: list[str] = []
+    unfilled: list[str] = []
+    open_keys: list[str] = []
+
+    for key, values in (features or {}).items():
+        key = str(key)
+        if key not in declared:
+            unfilled.append(key)
+            continue
+        items = [v for v in (values or []) if isinstance(v, str) and v.strip()]
+        if key not in closed:
+            open_keys.append(key)
+            continue
+        allowed = closed[key]
+        outside = sorted({v for v in items if v not in allowed})
+        if outside:
+            undefined[key] = outside
+        elif not items:
+            missing.append(key)
+
+    return {
+        "ok": not undefined and not missing and not unfilled,
+        "undefined": undefined,
+        "missing": sorted(missing),
+        "open": sorted(open_keys),
+        "unfilled": sorted(unfilled),
+    }
+
+
 def _table_missing(path: str) -> bool:
     """这张表是「路径上确实没有文件」吗
 
@@ -779,8 +854,12 @@ class BaseAgent:
         llm: bool = True,
         tools: list | None = None,
         corpus_type: str | None = None,
+        max_requests: int | None = None,
     ):
         self.model_key = model_key
+        # 本 agent 的请求预算（A3）：None = 不限。由 build_agents 按 config.CANDIDATE_MAX_REQUESTS
+        # 注入；超预算即抛 RequestBudgetExceeded，不再把失败按候选放大成整批的倍数。
+        self.max_requests = None if not max_requests or max_requests < 0 else int(max_requests)
         # 本次跑批的语料类型（规范化后的中文名："方位词" / "趋向动词"）；None = 调用方没交代类型。
         # 刻意不在这里补成默认类型：补了就没法区分「显式指定方位词」与「没指定」，
         # 而两者对提示语的要求不同——只有显式给了类型才在 user message 里交代那一行
@@ -816,7 +895,18 @@ class BaseAgent:
         # 本次跑批的调用统计：模型往返数（含工具往返）、发出去但没成的调用数、缓存命中数，
         # 跑批入口收尾时汇总。三者缺一不可——只数成功的那部分，会把「整批被接口挡下」显示成
         # 0 次往返，读起来正是一个请求都没发出去（见 _invoke 的失败分支）
-        self._stats = {"roundtrips": 0, "failed": 0, "cache_hits": 0}
+        self._stats = {
+            "roundtrips": 0,
+            "failed": 0,
+            "cache_hits": 0,
+            # A3：超预算而没发出的请求数。它与 failed 是两件事——failed 是发出去没成，
+            # budget_exceeded 是**根本没发**；合起来看才知道「省下了多少」与「漏了多少」。
+            "budget_exceeded": 0,
+            # A5：统一事件口径里的两项成本指标。requests = roundtrips + failed（发出过的调用数），
+            # elapsed_seconds 是这些调用花掉的墙上时间，用来算「每个有效句对的成本」。
+            "requests": 0,
+            "elapsed_seconds": 0.0,
+        }
         self._stats_lock = threading.Lock()
 
     # -- 子类实现 ----------------------------------------------------------
@@ -885,11 +975,22 @@ class BaseAgent:
         全被拒」，见 spatial_runner._print_agent_stats。首次失败的原因也留一份（截断），
         免得为了看这一句还得去翻某条记录的 status_reason。
         """
+        # 预算检查放在**发请求之前**（A3）：超预算就不发，而不是发了再记账。
+        # 计数用「已发出的调用数」而不是成功数——失败的那几次同样占了预算。
+        with self._stats_lock:
+            if self.max_requests is not None and self._stats["requests"] >= self.max_requests:
+                self._stats["budget_exceeded"] += 1
+                raise RequestBudgetExceeded(
+                    f"{self.NAME or self.__class__.__name__} 已达请求预算 {self.max_requests} 次，本次不再发请求"
+                )
+        started = time.perf_counter()
         try:
             result = self._model().invoke({"messages": [{"role": "user", "content": content}]})
         except Exception as e:  # 记账后原样抛出：怎么处理失败由各 run() 决定（见 RealityAgent._ask）
             with self._stats_lock:
                 self._stats["failed"] += 1
+                self._stats["requests"] += 1
+                self._stats["elapsed_seconds"] += time.perf_counter() - started
                 if self._stats.get("first_error") is None:
                     # 只留第一条：整批失败时它们通常是同一个原因，留一条就够判案，
                     # 且 403 这类异常的 repr 里裹着整个响应头（几千字符），必须截断
@@ -898,6 +999,8 @@ class BaseAgent:
         roundtrips = sum(1 for m in (result.get("messages") or []) if getattr(m, "type", "") == "ai") or 1
         with self._stats_lock:
             self._stats["roundtrips"] += roundtrips
+            self._stats["requests"] += 1
+            self._stats["elapsed_seconds"] += time.perf_counter() - started
         verdict = result.get("structured_response")
         if verdict is None:
             raise StructuredOutputMissing(_reply_digest(result.get("messages") or []))
@@ -955,9 +1058,17 @@ class BaseAgent:
         roundtrips 与 failed 相加才是**发出过的调用数**：前者是拿到回复的，后者是抛异常的。
         只看 roundtrips 会把「请求发出去但全被拒」误读成「什么都没发」——所以 failed 与
         first_error 都在这里如实报出来（没失败过的 agent 不会带 first_error 这个键）。
+        requests 就是这两个数之和，省得调用方再算一遍。
+
+        A5 另给两项成本口径：elapsed_seconds（这些调用花掉的墙上时间之和）与
+        budget_exceeded（因超预算而没发出的请求数）。拿它们与有效句对数一起看，才能算出
+        「每个唯一且可用句对的成本」——只比「往返数」时，不同模式的口径并不可比
+        （deep 的子 agent 往返不在主 agent 的 messages 里，见 _invoke）。
         """
         with self._stats_lock:
-            return dict(self._stats)
+            stats = dict(self._stats)
+        stats["elapsed_seconds"] = round(stats.get("elapsed_seconds", 0.0), 2)
+        return stats
 
     def describe(self) -> str:
         """启动时打印用的一句话"""
@@ -1477,7 +1588,16 @@ class FeatureAgent(BaseAgent):
 
         # 类别表已填时 data 直接就是特征字段；未填（FreeFeatures）时特征装在 features 键下
         features = data.get("features") if set(data) == {"features"} else data
-        return {"features": features or {}, "source": self.table_source, "reason": ""}
+        features = features or {}
+        # 结构化输出之后的业务校验（A2）：形状对了不代表取值对，闭集越界与未定义键都要留痕。
+        # 校验结果只**记录**不改值——要不要纠正由人工/复核流程决定，这里不猜模型的意思。
+        validation = validate_feature_values(features, self.feature_classes)
+        return {
+            "features": features,
+            "source": self.table_source,
+            "reason": "",
+            "validation": validation,
+        }
 
     def run(self, sentence: str, focus_word: dict) -> dict:
         if not self.llm:
@@ -1995,6 +2115,7 @@ def build_agents(
     llm: bool = True,
     overrides: dict[str, dict] | None = None,
     corpus_type: str | None = None,
+    max_requests: int | None = None,
 ) -> AgentSet:
     """按需建 agent —— 只建 needs 里声明的那些，用不到的不建（deep agent 尤其贵）
 
@@ -2009,6 +2130,9 @@ def build_agents(
             构造期注入给每个 agent：agent 据此选四张配置表的目录，也据此在 user message 里
             交代本次跑批的类型。None = 调用方没交代类型：表仍按默认类型（方位词）解析，
             但提示语里不加那一行（保持与旧版逐字节一致，离线接线测试靠这条）
+        max_requests (int, optional): 每个 agent 的请求预算（A3）。None = 不限；
+            给了就由 BaseAgent._invoke 在发请求之前检查，超预算抛 RequestBudgetExceeded。
+            一条候选的失败重试不该被候选数放大，这条预算就是那个上限。
 
     Returns:
         AgentSet: {名字: agent 实例}
@@ -2022,6 +2146,7 @@ def build_agents(
                 model_key=model_key,
                 llm=llm,
                 corpus_type=corpus_type,
+                max_requests=max_requests,
                 **overrides.get(name, {}),
             ),
         )

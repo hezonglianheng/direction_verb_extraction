@@ -32,6 +32,8 @@
 句内**每个**目标词位置都要参与改写（见 pick_focus_words）：一句「他从山上掉到山谷里」里
 「上」与「里」各出一个位置，改写时逐位置各出一批待选句，但**一条记录仍只改一个位置**——
 所以 pick_focus_word（= pick_focus_words 的首元素）仍是下游读的那个单值关注词。
+例外是抽样产物：带 `sampled_words` 的记录只展开**被抽中的词**的位置，免得同一句在
+两个词层各抽一次就重复生成同一批句对（D1）。
 
 一对句子里的两侧各有各的关注词：a 侧（原句）看的是记录里那个词，b 侧（改写句）看的是规则表
 换上去的那个词（见 replacement_focus_word，来源记 FOCUS_SOURCE_ALTER）。所以 b 侧的 schema
@@ -40,6 +42,7 @@ b 侧会收窄回原词那一组，判定表就永远只在自己那一组里打
 """
 
 import csv
+import hashlib
 import json
 import unicodedata
 from datetime import datetime
@@ -547,8 +550,18 @@ def read_corpus(path: str | Path, limit: int | None = None, offset: int = 0) -> 
         limit (int, optional): 最多读多少行，None 表示不限
         offset (int): 跳过前多少行
 
+    行号分层保留（D2），三样各是各的口径，不要互相覆盖：
+        source_line_no   源语料（抽样前那份）里的行号，由 word_sampler 写入，落到产物里不再变
+        input_line_no    本次输入文件里的物理行号（从 1 开始）
+        line_no          与 input_line_no 同值，是历史字段名：排序键、记录 id 都按它算，
+                         保留原名才能让旧产物与对账脚本继续工作
+
+    旧写法无条件把 line_no 覆盖成当前行号，于是抽样阶段写的源行号被吃掉：文件重排、
+    重新抽样或合并之后就再也说不清这条记录原先是哪一句。现在源行号先让位给
+    source_line_no，再写本次的行号——两个都有值时互不干扰。
+
     Returns:
-        list[dict]: 每条记录原样返回，另加 "line_no" 字段记录它在文件里的行号（从 1 开始）
+        list[dict]: 每条记录原样返回，另加上述三个行号字段
     """
     records: list[dict] = []
     with open(path, "r", encoding="utf-8") as f:
@@ -556,11 +569,97 @@ def read_corpus(path: str | Path, limit: int | None = None, offset: int = 0) -> 
             if line_no <= offset or not line.strip():
                 continue
             record = json.loads(line)
+            # 记录里已带行号（抽样产物写的是源行号）就先把它留成 source_line_no，
+            # 别用本次的物理行号顶掉它
+            source_line_no = record.get("source_line_no")
+            if source_line_no is None:
+                source_line_no = record.get("line_no")
+            record["source_line_no"] = source_line_no
+            record["input_line_no"] = line_no
             record["line_no"] = line_no
             records.append(record)
             if limit is not None and len(records) >= limit:
                 break
     return records
+
+
+SOURCE_DOCUMENT_KEYS = ("source_file", "source_document_id", "source_document")
+"""记录里「这条语料出自哪篇原始文章」的候选字段，按优先级取第一个非空值
+
+筛选阶段主要写 source_file（见 entry_in_win/entry_in_linux 的记录构造），它是文件的完整
+路径；同一篇文章被拆成多个输入文件时，靠它区分来源。"""
+
+
+def source_document_id(record: dict) -> str | None:
+    """这条语料出自哪一篇原始文章（source_file 等字段的第一个非空值）
+
+    稳定 ID 要有它：同一句文本可能来自多篇不同文章，**内容相同不等于来源相同**，
+    去重（看内容哈希）与溯源（看来源）是两件事，不能并成一个字段。
+    """
+    for key in SOURCE_DOCUMENT_KEYS:
+        value = (record or {}).get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def content_hash(text: str | Iterable[str]) -> str:
+    """句子文本的指纹（查重用）：先按 normalize 规整，再取 sha1 的前 12 位
+
+    参数是分词切片或拼好的句子都行（join_slice 后再 normalize）。它**只回答「这两句文本
+    是不是一样」**，不含来源信息：同一句出现在两篇文章里哈希相同，那正是它的用途
+    ——查重。要与来源区分时另看 source_document_id。
+    """
+    body = join_slice(text) if not isinstance(text, str) else text
+    return hashlib.sha1(normalize(body).encode("utf-8")).hexdigest()[:12]
+
+
+def sentence_id(record: dict) -> str | None:
+    """与文件顺序无关的句子稳定 ID：`来源文档#源行号#文本指纹`
+
+    三段各管一件事，缺一段就换成占位符而不是编造：
+        来源文档   source_document_id（区分同文多源；缺失记 "unknown-doc"）
+        源行号     source_line_no，其次 input_line_no（缺失记 "?"）
+        文本指纹   content_hash(sentence)（内容变了 ID 就变，重排不影响）
+
+    为什么不用纯行号：文件重排、重新抽样或换一份输入后，同一个行号指的是另一句，
+    两份产物的 ID 会撞在一起却说的不是同一件事（D2）。为什么不用纯内容哈希：
+    同一句在多篇文章里各出现一次时它们是不同的样本，合并后会被误判成重复。
+
+    Returns:
+        str | None: 稳定 ID；记录里连句子都没有（坏记录）时返回 None，不编造。
+    """
+    sentence = (record or {}).get("sentence")
+    if not sentence:
+        return None
+    line_no = (record or {}).get("source_line_no")
+    if line_no is None:
+        line_no = (record or {}).get("input_line_no")
+    return "#".join(
+        (
+            source_document_id(record) or "unknown-doc",
+            str(line_no) if isinstance(line_no, int) else "?",
+            content_hash(sentence),
+        )
+    )
+
+
+def candidate_key(sentence_id_: str | None, focus_index, replacement) -> str | None:
+    """候选唯一键 (sentence_id, focus 位置, replacement)（D1）
+
+    「抽样单元」「候选单元」「最终有效句对」是三个不同的口径，只有候选单元需要唯一键：
+    一句抽中两个词、两个词又各有好几个替换词，(句子, 位置, 替换词) 才唯一确定一条候选。
+    sentence_id 已经含来源与文本指纹，所以跨文件也不会撞。
+
+    focus_index 是原句分词里的 token 下标（0 基），不是「第几个关注词」：同一句两处同一个
+    词（上@3 与 上@5）各是一个位置，光看词分不开。
+
+    Returns:
+        str | None: 唯一键；缺 sentence_id 或替换词时返回 None（不拼出不完整的键）。
+    """
+    if not sentence_id_ or not isinstance(replacement, str) or not replacement:
+        return None
+    return f"{sentence_id_}|{focus_index if focus_index is not None else '?'}|{replacement}"
 
 
 def join_slice(sentence_slice: Iterable[str]) -> str:
@@ -700,7 +799,9 @@ def pick_focus_word(record: dict, vocab: dict[str, set[str]] | None = None) -> d
 
     三级回落，取到的是哪一级记在返回值的 source 里：
 
-    1. "sampled_word"：语料经 word_sampler.py 抽样而带上的字段，有就直接用。
+    1. "sampled_word"：语料经 word_sampler.py 抽样而带上的字段（现写法是 `sampled_words`，
+       一句一份记录、抽中的词全在里面；旧的 `sampled_word` 仍认），有就直接用。
+       **只展开这些词命中的位置**（D1），句内其余目标词不再参与——见 pick_focus_words。
        抽样只落了词、没落位置，同一个词在句子里出现 ≥2 次时无从区分，这里取 index 最小的那个
        （实测 direction 3.3%、location 7.2% 的抽样记录如此）。实测这批记录的 index 与
        sentence[index] 100% 对齐，alter_sentence 的「index 处的词与 word 不一致」守卫不会误伤。
@@ -764,9 +865,17 @@ def pick_focus_words(record: dict, vocab: dict[str, set[str]] | None = None) -> 
        - 补语位偏好是**排序**：只在趋向动词族生效，把"排在父节点之后"的位置挪到前面。
          排序而不是过滤，是为了让动词前面那个位置也照样被替换（取一个时它会被丢掉，这正是
          本函数要修的东西）；排序后首元素仍是"index 最小的补语位节点"，与取一个时逐字一致。
-    ② **sampled_word 命中的位置排在最前，且不参与族收窄**：抽样记录就是为那个词抽出来的，
-       今天它在该级直接返回、绕过了族收窄；保留这个语义才能保住首元素不变。同一句里其余
-       本族目标词追加在它后面。
+    ② **抽样口径：记录是为哪些词抽出来的，就只展开那些词的位置**（D1）
+
+       `sampled_words`（word_sampler 现写法，一句一份记录、抽中的词全在里面）或旧字段
+       `sampled_word`（一份记录一个词）存在时，**只**展开这些词命中的位置，不再把句内其余
+       目标词追加进来。旧行为是「抽中的词排最前 + 其余本族位置照旧展开」，于是
+       - 一句含「上」和「下」且两层都被抽中 → 两份记录各自展开这两个位置，相同句对重复生成；
+       - 只在「上」层抽中时也会处理其中的「下」→ 下游实际展开的词层分布不再等于采样配额。
+
+       统一成抽样口径之后：每个允许的位置按约定只展开一次，重复输入不增加唯一候选数，
+       采样配额（sampled_words 里那几个词）与实际展开的词层分布可以逐词对账。
+       没有抽样字段（原始语料直接跑）时行为一字不变，仍是「句内全部本族位置」。
 
     Args:
         record (dict): 语料记录，需含 match_tree
@@ -780,13 +889,23 @@ def pick_focus_words(record: dict, vocab: dict[str, set[str]] | None = None) -> 
     filter_methods = record.get("filter_methods") or []
     nodes = word_sampler.target_nodes(record, set().union(*vocab.values()) if vocab else set())
 
-    sampled = record.get("sampled_word")
-    matched: list[dict] = []
-    if isinstance(sampled, str) and sampled:
-        matched = [node for node in nodes if node["word"] == sampled]
+    sampled_words = _sampled_words(record)
+    if sampled_words is not None:
+        # 抽样口径：只认被抽中的那些词的位置（同一个词的多个位置都展开，那是"该词的全部位置"）
+        entries = [
+            _focus_entry(node, "sampled_word", filter_methods, vocab)
+            for node in nodes
+            if node["word"] in sampled_words
+        ]
+        if entries:
+            return entries
+        # 一个位置都没对上（抽样用的词表与本配置的两份词表不一致）时**不静默回退**：
+        # 回退到 match_tree[0] 等于替一个根本没抽过的词造样本，回退到全部位置更是把
+        # "抽样口径"整个丢掉。如实返回空表——下游把它当"这条记录取不到关注词"，
+        # 汇总里的 focus_sources 会把它暴露出来（见 pick_focus_word 的 level 1）。
+        return []
 
-    matched_indices = {node["index"] for node in matched}
-    rest = [node for node in nodes if node["index"] not in matched_indices]
+    rest = list(nodes)
 
     family = _record_family(filter_methods)
     if family and family in vocab:
@@ -801,8 +920,7 @@ def pick_focus_words(record: dict, vocab: dict[str, set[str]] | None = None) -> 
         if after_nodes:
             rest = after_nodes + [node for node in rest if node["index"] in before]
 
-    entries = [_focus_entry(node, "sampled_word", filter_methods, vocab) for node in matched]
-    entries += [_focus_entry(node, "vocab", filter_methods, vocab) for node in rest]
+    entries = [_focus_entry(node, "vocab", filter_methods, vocab) for node in rest]
     if entries:
         return entries
 
@@ -810,6 +928,23 @@ def pick_focus_words(record: dict, vocab: dict[str, set[str]] | None = None) -> 
     if node is None:
         return []
     return [_focus_entry(node, "match_tree", filter_methods, vocab)]
+
+
+def _sampled_words(record: dict) -> set[str] | None:
+    """这条记录是被哪些词抽出来的；没有抽样字段时返回 None（= 原始语料，按词表展开全部位置）
+
+    `sampled_words` 是 word_sampler 现在的写法（一句一份记录，抽中的词全在里面）；
+    `sampled_word` 是旧写法（一份记录一个词），老抽样产物仍然只带它，两条路都要认。
+    """
+    words = record.get("sampled_words")
+    if isinstance(words, (list, tuple)):
+        # 空列表当成「没有抽样信息」而不是「一个词都不许展开」：前者退回按词表展开全部位置
+        # （原始语料的口径），后者会让这条记录落到 match_tree[0] 那条退路上，那不是抽样的意思
+        return {str(word) for word in words if isinstance(word, str) and word} or None
+    word = record.get("sampled_word")
+    if isinstance(word, str) and word:
+        return {word}
+    return None
 
 
 FOCUS_SOURCE_ALTER = "alter"
@@ -1538,12 +1673,78 @@ def lookup_judgement(schema_a: str | None, schema_b: str | None, table: dict | N
 # --------------------------------------------------------------------------
 
 
+RESULT_SCHEMA_VERSION = "1.0"
+"""结果 jsonl 的 schema 版本号，写进每条记录与运行汇总
+
+正式产物一律带版本号：读取侧据此判断这份文件能不能直接解析，旧格式走一次性迁移并有异常
+清单，**不在正式读取链路里长期靠猜字段**（D3）。改记录形状就升版本号。"""
+
+RESULT_REQUIRED_FIELDS: tuple[str, ...] = (
+    "id",
+    "status",
+    "stage",
+    "line_no",
+    "sentence_id",
+    "candidate_key",
+    "admission",
+    "schema_version",
+)
+"""一条正式结果记录必有的顶层字段（schema 检查用）
+
+只查**键在不在**、不查取值非空：id / line_no 在坏记录上本来就是 null（见
+spatial_graphs._record_id），把它们判成缺失会让 schema 检查把已知的合法形状报成错误。"""
+
+
+def validate_result_record(record: dict) -> list[str]:
+    """检查一条结果记录是否符合当前 schema，返回问题列表（空列表 = 通过）
+
+    与「流程跑完了」是两件事：这里只管记录的形状够不够格当正式产物（D3），语义对不对由
+    人工金标准与准入字段负责（见 spatial_graphs.pair_admission）。缺字段、字段类型不对、
+    schema_version 不是当前版本都在这里报出来，供收尾打印与离线体检用。
+    """
+    problems: list[str] = []
+    if not isinstance(record, dict):
+        return [f"记录不是对象，实际是 {type(record).__name__}"]
+    for field in RESULT_REQUIRED_FIELDS:
+        if field not in record:
+            problems.append(f"缺少顶层字段 {field!r}")
+    version = record.get("schema_version")
+    if version != RESULT_SCHEMA_VERSION:
+        problems.append(f"schema_version 是 {version!r}，当前版本 {RESULT_SCHEMA_VERSION!r}（需迁移后再用）")
+    return problems
+
+
 def build_output_path(out_dir: str | Path, prefix: str = "spatial_pairs") -> Path:
-    """生成带时间戳的输出文件路径，并确保目录存在"""
+    """生成带时间戳的输出文件路径，并确保目录存在
+
+    文件名精确到秒（E1）：同秒、同前缀两次运行会撞到同一个路径，而调用方是以 "w" 打开的，
+    撞上就是后一次把前一次截断。所以这里**挑一个尚不存在的名字**：已存在就往后顺延序号
+    （_2、_3 …），再配合 file_paths.open_exclusive 的独占创建，双重兜住这条路径。
+    """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return out_dir / f"{prefix}_{stamp}.jsonl"
+    base = out_dir / f"{prefix}_{stamp}"
+    candidate = base.with_suffix(".jsonl")
+    sequence = 1
+    while candidate.exists():
+        sequence += 1
+        candidate = base.with_name(f"{base.name}_{sequence}.jsonl")
+    return candidate
+
+
+def pairs_csv_path(jsonl_path: str | Path) -> Path:
+    """与结果 jsonl 配套的成对信息 csv 路径，**保证与 jsonl 本身不是同一个文件**
+
+    `with_suffix(".csv")` 在 `--out-file result.csv` 这类路径上换出来还是它自己，于是收尾
+    导 csv 会把刚写好的 jsonl 覆盖掉（E1）。撞上就改用 `.pairs.csv`，宁可文件名长一点，
+    也不能让一份产物吃掉另一份。
+    """
+    path = Path(jsonl_path)
+    csv_path = path.with_suffix(".csv")
+    if csv_path == path:
+        csv_path = path.with_suffix(".pairs.csv")
+    return csv_path
 
 
 def write_jsonl(records: Iterable[dict], path: str | Path) -> int:
@@ -1592,6 +1793,15 @@ PAIR_CSV_COLUMNS: tuple[tuple[str, str], ...] = (
     ("判断来源", "judgement.source"),
     ("查表结果", "judgement.lookup"),
     ("阶段", "stage"),
+    # 「阶段」只说走到哪一步停下，看不出这条记录**成不成立**——判定失败、闸门没判出来
+    # 都停在同一个阶段。落最终 status 与失败原因，人工池才能按「留空」的真实由头分层
+    # （改写未命中 / 非空间 / 不通顺 / 未调 LLM / 调用失败），而不是把几种原因混成一类（D5）。
+    ("最终状态", "status"),
+    ("失败原因", "status_reason"),
+    # 稳定溯源与候选唯一键（D2/D1）：按它们回连结构化原记录、查同一候选有没有重复产出
+    ("句子ID", "sentence_id"),
+    ("候选唯一键", "candidate_key"),
+    ("是否准入", "admission.is_admitted"),
     ("模型名称", "model_name"),
 )
 """成对记录拍平 csv 的列序：表头 -> 记录里的点分路径（形状见 spatial_graphs.serialize_pair）

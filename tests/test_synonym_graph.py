@@ -64,6 +64,18 @@ def load_graphs():
     tools = ModuleType("spatial_tools")
     tools.PAIR_CSV_COLUMNS = ()
     tools.join_slice = "".join
+    # 稳定 ID 与候选唯一键（D1/D2）是记录形状的公共契约，桩里也要给同一套口径，
+    # 不然测到的就是「缺了这几个助手函数也能跑」，与本体的形状对不上
+    tools.RESULT_SCHEMA_VERSION = "1.0"
+    tools.source_document_id = lambda record: record.get("source_file")
+    tools.content_hash = lambda text: "".join(text)
+    tools.sentence_id = lambda record: (
+        f"{record.get('source_file') or 'unknown-doc'}#{record.get('source_line_no') or record.get('line_no')}"
+        if record.get("sentence") else None
+    )
+    tools.candidate_key = lambda sentence_id_, index, replacement: (
+        f"{sentence_id_}|{index}|{replacement}" if sentence_id_ and replacement else None
+    )
     tools.pick_focus_words = lambda record: [record["focus_word"]]
     tools.pick_focus_word = lambda record: record["focus_word"]
     tools.replacement_focus_word = lambda focus, word, methods: {
