@@ -341,9 +341,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--max-requests",
         type=int,
         default=None,
-        help=f"每个 agent 的请求预算（默认 {config.CANDIDATE_MAX_REQUESTS}，取自 config.CANDIDATE_MAX_REQUESTS；"
-        "0 或负表示不限）。一条语料会展开出多个候选，同一位置的失败若由每个候选各自重试，"
-        "重试次数会被候选数放大成整批的倍数；超预算即停，如实记为失败并转入人工复核（A3）",
+        help=f"每个 agent **每条候选**的请求预算（默认 {config.CANDIDATE_MAX_REQUESTS}，取自"
+        "config.CANDIDATE_MAX_REQUESTS；0 或负表示不限）。一条语料会展开出多个候选，同一位置的"
+        "失败若由每个候选各自重试，重试次数会被候选数放大成整批的倍数；超预算即停，"
+        "如实记为失败并转入人工复核（A3）",
+    )
+    parser.add_argument(
+        "--batch-max-requests",
+        type=int,
+        default=None,
+        help=f"整批共用的请求预算（默认 {config.BATCH_MAX_REQUESTS}，取自 config.BATCH_MAX_REQUESTS；"
+        "0 或负表示不限）。所有 agent 共用一份计数，达到上限后余下的调用一律不再发出，"
+        "记录照常落盘并转入人工复核（A3）",
     )
     parser.add_argument("--limit", type=int, default=100, help="最多处理多少条记录")
     parser.add_argument("--offset", type=int, default=0, help="跳过前多少条记录")
@@ -446,7 +455,9 @@ def _print_config_tables(agents) -> None:
 
 
 def _print_agent_stats(stats: dict[str, dict]) -> None:
-    """收尾打印各 agent 的模型往返数、失败数与缓存命中数（写进汇总的那份，见 ResultWriter.agent_stats）
+    """收尾打印各 agent 的模型往返数、失败数、超预算未发数与缓存命中数
+
+    （写进汇总的那份，见 ResultWriter.agent_stats）
 
     这是花掉的钱的直接口径：往返数含工具往返与结构化输出那次；命中数是被按 message 缓存
     省下的重复问（命中不花往返）。全 0 的 agent 是没走到或根本没调模型（--no-llm）。
@@ -455,20 +466,32 @@ def _print_agent_stats(stats: dict[str, dict]) -> None:
     而 0 次往返读起来正是「一个请求都没发出去」。整批被接口挡下（403 区域限制、欠费、连不上）
     时真相恰好相反——发是发了，全被拒。所以这里把失败数印在同一行，并在「一次都没成功却失败过」
     时额外把首个失败原因摊开：那种情况下收尾的这几行就是唯一的诊断入口，不该逼人去翻 jsonl。
+
+    超预算未发数（budget_exceeded）与失败数是两件事：后者发出去了但被拒，前者**根本没发**。
+    不印出来的话，超预算成片发生时调用账看起来只是「往返少」，看不出是预算掐断的。
     """
     if not stats:
         return
     parts = []
+    budget = 0
     for name, item in stats.items():
         part = f"{name} {item['roundtrips']} 次往返"
         if item.get("failed"):
             part += f"／{item['failed']} 次失败"
+        if item.get("budget_exceeded"):
+            budget += item["budget_exceeded"]
+            part += f"／{item['budget_exceeded']} 次超预算未发"
         parts.append(part + f"／{item['cache_hits']} 次命中")
     total = sum(item["roundtrips"] for item in stats.values())
     failed = sum(item.get("failed", 0) for item in stats.values())
     hits = sum(item["cache_hits"] for item in stats.values())
     tail = f"，{failed} 次失败" if failed else ""
     print(f"模型调用账（共 {total} 次往返{tail}，缓存省下 {hits} 次）：" + "；".join(parts))
+    if budget:
+        print(
+            f"提示：有 {budget} 次调用因请求预算未发出，记录里记为 source=error 并转入人工复核；"
+            "需要放宽时调 --max-requests（每条候选）或 --batch-max-requests（整批）"
+        )
     if total or not failed:
         return
     # 一次往返都没成却冒出失败：整批调用没一个成功的，这是最容易被误读成「没发请求」的形状
@@ -611,8 +634,13 @@ def main(argv: list[str] | None = None) -> None:
         llm=not args.no_llm,
         overrides=overrides,
         corpus_type=corpus_type,
-        # 请求预算（A3）：不给就按 config.CANDIDATE_MAX_REQUESTS
+        # 请求预算（A3）：两条上限各取 config，命令行给了就以命令行为准
         max_requests=config.CANDIDATE_MAX_REQUESTS if args.max_requests is None else args.max_requests,
+        batch_max_requests=(
+            config.BATCH_MAX_REQUESTS
+            if args.batch_max_requests is None
+            else args.batch_max_requests
+        ),
     )
     for agent in agents.values():
         # 配置错在启动时就报，别留给多线程去抢着建（deep agent 尤其贵）
@@ -668,9 +696,16 @@ def main(argv: list[str] | None = None) -> None:
     writer.input_records = len(records)
     writer.expanded_states = len(states)
     started = time.time()
+
+    def run_state(state):
+        # 一条状态 = 一条候选，候选预算在这个作用域内累计（见 AgentSet.budget_scope）；
+        # 作用域按线程隔离，--workers N 下各条候选互不串账
+        with agents.budget_scope():
+            return graph.invoke(state, {"recursion_limit": 60})
+
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
         # 结果已在 save 节点落盘，这里只需驱动跑完；map 按输入顺序产出，异常会在此处抛出
-        for _ in pool.map(lambda state: graph.invoke(state, {"recursion_limit": 60}), states):
+        for _ in pool.map(run_state, states):
             pass
 
     # 各 agent 的调用账（往返数与缓存命中数）：跑完才齐，收尾补写到 writer 上、进汇总

@@ -67,11 +67,13 @@ agent 据此选目录；同一条信息也会写进 user message（见 head_bloc
 """
 
 import argparse
+import contextvars
 import copy
 import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -94,16 +96,75 @@ _FIRST_ERROR_CHARS = 200
 
 
 class RequestBudgetExceeded(RuntimeError):
-    """本 agent 已用完请求预算，这一问不再发出（A3）
+    """请求预算用完，这一问不再发出（A3）
 
-    预算是「统一策略」的一部分：一条语料会按替换词展开出多个候选，而同一位置的失败若由
-    每个候选各自重试，重试次数会被候选数放大成整批的倍数（见 config.CANDIDATE_MAX_REQUESTS
-    与 config.BATCH_MAX_REQUESTS）。达到上限时**抛出而不是无限重试**：各 agent 的 run() 本来
-    就兜异常，于是这条记录如实记成 error/未知并转入人工复核（见 spatial_graphs.pair_admission
-    的 review_required），而不是静默吞掉一批请求费。
+    预算分两层，各防一件事（见 config.CANDIDATE_MAX_REQUESTS 与 config.BATCH_MAX_REQUESTS）：
+    候选预算防「同一问按候选数放大重试」，整批预算防「候选乘记录没有上限」。达到上限时
+    **抛出而不是无限重试**：各 agent 的 run() 本来就兜异常，于是这条记录如实记成 error/未知
+    并转入人工复核（见 spatial_graphs.pair_admission 的 review_required），而不是静默吞掉
+    一批请求费。
 
     它与接口失败的区别只在原因，不在处置：两者都进同一条复核通道，记录里都看得见。
     """
+
+
+class BatchRequestBudget:
+    """整批请求预算：所有 agent 共用一份，按「已发出的调用数」计（见 config.BATCH_MAX_REQUESTS）
+
+    与候选预算（BaseAgent.max_requests + budget_scope）分工不同：候选预算是有作用域的，
+    只在一段 graph.invoke（= 一条候选状态）内累计；整批预算没有作用域，跑批从头到尾一份。
+    两者都在**发请求之前**检查，且与「占名额」在同一把锁里完成，多个 worker 同时抢最后
+    一个名额时不会一起越过去。
+    """
+
+    def __init__(self, max_requests: int | None = None):
+        # 与 BaseAgent.max_requests 同一套口径：0 或负数表示不限
+        self.max_requests = None if not max_requests or max_requests < 0 else int(max_requests)
+        self.requests = 0  # 已发出的调用数（成功的、失败的都是发出去的）
+        self.exceeded = 0  # 因整批预算而未发出的调用数
+        self._lock = threading.Lock()
+
+    def reserve(self, agent_name: str) -> None:
+        """占一个整批名额；没有名额了就抛 RequestBudgetExceeded（调用方负责记账）"""
+        with self._lock:
+            if self.max_requests is not None and self.requests >= self.max_requests:
+                self.exceeded += 1
+                raise RequestBudgetExceeded(
+                    f"整批已达请求预算 {self.max_requests} 次，本次不再发请求（{agent_name} 这一问未发出）"
+                )
+            self.requests += 1
+
+
+class _BudgetScope:
+    """一条候选的预算作用域：按 agent 实例各记一份已发出的调用数（见 BaseAgent.budget_scope）
+
+    计数挂在**一个跨线程共享的对象**上，而不是线程本地变量：langgraph 的同步节点并不在
+    调用 graph.invoke 的那个线程里跑，而是由 BackgroundExecutor 提交到线程池（它只复制
+    contextvars，不复制 threading.local）。作用域本身用 ContextVar 下发（见 _CURRENT_BUDGET），
+    复制到节点线程的上下文里的是这个对象的引用，于是各节点对计数的增减彼此可见。
+    同一候选的几个节点也可能并行跑，所以取名额要过 _lock。
+    """
+
+    def __init__(self):
+        self.requests: dict[object, int] = {}
+        self._lock = threading.Lock()
+
+    def reserve(self, agent, limit: int | None) -> bool:
+        """占一个候选名额；limit 为 None 表示不限。返回 False 表示这条候选已超预算"""
+        if limit is None:
+            return True
+        with self._lock:
+            used = self.requests.get(agent, 0)
+            if used >= limit:
+                return False
+            self.requests[agent] = used + 1
+            return True
+
+
+_CURRENT_BUDGET: contextvars.ContextVar[_BudgetScope | None] = contextvars.ContextVar(
+    "spatial_agents_budget_scope", default=None
+)
+"""当前线程/节点所处的那条候选的预算作用域（None = 不在任何候选作用域内）"""
 
 
 class StructuredOutputMissing(RuntimeError):
@@ -855,11 +916,15 @@ class BaseAgent:
         tools: list | None = None,
         corpus_type: str | None = None,
         max_requests: int | None = None,
+        batch_budget: BatchRequestBudget | None = None,
     ):
         self.model_key = model_key
         # 本 agent 的请求预算（A3）：None = 不限。由 build_agents 按 config.CANDIDATE_MAX_REQUESTS
         # 注入；超预算即抛 RequestBudgetExceeded，不再把失败按候选放大成整批的倍数。
+        # 它只在 budget_scope() 内累计（一条候选状态一个作用域），见 _invoke。
         self.max_requests = None if not max_requests or max_requests < 0 else int(max_requests)
+        # 整批预算：所有 agent 共用 build_agents 建的那一份（None = 不限）
+        self.batch_budget = batch_budget
         # 本次跑批的语料类型（规范化后的中文名："方位词" / "趋向动词"）；None = 调用方没交代类型。
         # 刻意不在这里补成默认类型：补了就没法区分「显式指定方位词」与「没指定」，
         # 而两者对提示语的要求不同——只有显式给了类型才在 user message 里交代那一行
@@ -952,6 +1017,33 @@ class BaseAgent:
         if self.llm:
             self._model()
 
+    @contextmanager
+    def budget_scope(self):
+        """把这一圈调用算作**同一条候选**的请求预算（见 _invoke）
+
+        跑批入口在每次 graph.invoke 外面套一层（见 AgentSet.budget_scope）：一条候选状态
+        展开出的 a/b 两侧、以及失败后的重试，共用 max_requests 这份预算，而不是让每个候选
+        各拿一份、再被候选数放大成整批的倍数。
+
+        作用域用 ContextVar 下发而不是 threading.local：langgraph 把同步节点提交到线程池
+        执行，threading.local 不会跟过去（见 _BudgetScope）。ContextVar 也不跨候选串联：
+        --workers N 时每条候选在各自的 run_state 里进入/退出，互不干扰。
+
+        已在某个作用域内（AgentSet 逐个 agent 进入）就复用那一份，不另起炉灶——计数按
+        agent 实例分开，同一条候选里各 agent 的预算各算各的。
+
+        不在作用域内的调用（直接 run()、单独建 agent 做对照实验）不套候选预算——那时没有
+        「一条候选」可言，按实例累计反而会误伤一次性调用。整批预算不受作用域影响，始终生效。
+        """
+        if _CURRENT_BUDGET.get() is not None:
+            yield
+            return
+        token = _CURRENT_BUDGET.set(_BudgetScope())
+        try:
+            yield
+        finally:
+            _CURRENT_BUDGET.reset(token)
+
     def _invoke(self, content: str):
         """跑一次底层 agent 并取结构化输出。异常不吞，由 run() 决定怎么如实记 source
 
@@ -978,10 +1070,19 @@ class BaseAgent:
         # 预算检查放在**发请求之前**（A3）：超预算就不发，而不是发了再记账。
         # 计数用「已发出的调用数」而不是成功数——失败的那几次同样占了预算。
         with self._stats_lock:
-            if self.max_requests is not None and self._stats["requests"] >= self.max_requests:
+            # 整批预算先查（没有作用域也生效）；候选预算只在 budget_scope 内查、只计作用域内的调用
+            if self.batch_budget is not None:
+                try:
+                    self.batch_budget.reserve(self.NAME or self.__class__.__name__)
+                except RequestBudgetExceeded:
+                    self._stats["budget_exceeded"] += 1
+                    raise
+            scope = _CURRENT_BUDGET.get()
+            if scope is not None and not scope.reserve(self, self.max_requests):
                 self._stats["budget_exceeded"] += 1
                 raise RequestBudgetExceeded(
-                    f"{self.NAME or self.__class__.__name__} 已达请求预算 {self.max_requests} 次，本次不再发请求"
+                    f"{self.NAME or self.__class__.__name__} 本候选已达请求预算 {self.max_requests} 次，"
+                    "本次不再发请求"
                 )
         started = time.perf_counter()
         try:
@@ -2107,6 +2208,18 @@ class AgentSet(dict):
             raise KeyError(f"这套 agent 里没有 {name!r}：请在所属 GraphSpec.needs 里声明它")
         return self[name]
 
+    @contextmanager
+    def budget_scope(self):
+        """整张图跑一条候选状态期间，所有 agent 都处在各自的候选预算作用域里
+
+        跑批入口按状态套这一层（见 spatial_runner）：一个 graph.invoke 里可能依次走
+        reality → semantic → feature → …，每个 agent 的候选预算各算各的；退出时全部清零。
+        """
+        with ExitStack() as stack:
+            for agent in self.values():
+                stack.enter_context(agent.budget_scope())
+            yield
+
 
 def build_agents(
     needs: Iterable[str],
@@ -2116,6 +2229,7 @@ def build_agents(
     overrides: dict[str, dict] | None = None,
     corpus_type: str | None = None,
     max_requests: int | None = None,
+    batch_max_requests: int | None = None,
 ) -> AgentSet:
     """按需建 agent —— 只建 needs 里声明的那些，用不到的不建（deep agent 尤其贵）
 
@@ -2130,14 +2244,18 @@ def build_agents(
             构造期注入给每个 agent：agent 据此选四张配置表的目录，也据此在 user message 里
             交代本次跑批的类型。None = 调用方没交代类型：表仍按默认类型（方位词）解析，
             但提示语里不加那一行（保持与旧版逐字节一致，离线接线测试靠这条）
-        max_requests (int, optional): 每个 agent 的请求预算（A3）。None = 不限；
-            给了就由 BaseAgent._invoke 在发请求之前检查，超预算抛 RequestBudgetExceeded。
+        max_requests (int, optional): 每个 agent **每条候选**的请求预算（A3）。None = 不限；
+            给了就由 BaseAgent._invoke 在 budget_scope 内检查，超预算抛 RequestBudgetExceeded。
             一条候选的失败重试不该被候选数放大，这条预算就是那个上限。
+        batch_max_requests (int, optional): 整批共用的请求预算（A3）。None = 不限；
+            所有 agent 共用一份 BatchRequestBudget，不受候选作用域影响，超了整批余下的调用
+            都不再发（记录照常落盘、转入人工复核）。
 
     Returns:
         AgentSet: {名字: agent 实例}
     """
     overrides = overrides or {}
+    batch_budget = BatchRequestBudget(batch_max_requests)
     return AgentSet(
         (
             name,
@@ -2147,6 +2265,7 @@ def build_agents(
                 llm=llm,
                 corpus_type=corpus_type,
                 max_requests=max_requests,
+                batch_budget=batch_budget,
                 **overrides.get(name, {}),
             ),
         )

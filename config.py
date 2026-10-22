@@ -106,12 +106,16 @@ CANDIDATE_MAX_REQUESTS = 8
 """一条候选最多发几次模型请求（0 表示不限）
 
 一条语料会按替换词展开出多个候选，单个候选的失败重试会被候选数放大成整批的倍数。
-超预算的候选不再继续问，如实记为失败并转入复核（见 spatial_agents.RequestBudgetExceeded）。"""
+预算按候选作用域计（一条 graph.invoke = 一条候选，a/b 两侧与重试共用这一份，见
+spatial_agents.BaseAgent.budget_scope）；超预算的候选不再继续问，如实记为失败并转入复核
+（见 spatial_agents.RequestBudgetExceeded）。"""
 
 BATCH_MAX_REQUESTS = 0
 """整批最多发几次模型请求（0 表示不限）
 
-达到上限后余下的候选一律不再发请求，记录里 admission.review_required 记 True，留给人工复核。"""
+所有 agent 共用一份计数，不受候选作用域影响（见 spatial_agents.BatchRequestBudget）。
+达到上限后余下的调用一律不再发请求，记录照常落盘、admission.review_required 记 True，
+留给人工复核。候选预算管「一条候选内别被重试放大」，这条管「候选乘记录别没有上限」。"""
 
 # FILTER_WORKERS = 0
 FILTER_WORKERS = 1
