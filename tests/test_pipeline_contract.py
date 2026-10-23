@@ -99,6 +99,8 @@ def sample_record(**extra):
         ],
         "filter_methods": ["direction_verb_as_center"],
         "source_line_no": 42,
+        # read_corpus 写的：本次输入里第几篇来源文档（id 首段）
+        "source_document_no": 1,
     }
     record.update(extra)
     return record
@@ -150,6 +152,24 @@ class StableIdentityTests(unittest.TestCase):
         path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in records), encoding="utf-8")
         return path
 
+    def test_source_documents_are_numbered_by_first_appearance(self):
+        # 两篇文档交替出现：编号按第一次遇到的顺序给，同一篇后面复用同一个号
+        path = self.write(
+            [
+                sample_record(source_file="b.jsonl", source_line_no=1),
+                sample_record(source_file="a.jsonl", source_line_no=2),
+                sample_record(source_file="b.jsonl", source_line_no=3),
+            ]
+        )
+        records = self.st.read_corpus(path)
+        self.assertEqual([record["source_document_no"] for record in records], [1, 2, 1])
+        self.assertEqual([record["source_line_no"] for record in records], [1, 2, 3])
+
+    def test_read_corpus_recomputes_stale_document_numbers(self):
+        # 上游残留的编号不沿用：否则两份语料拼接后同一个号会指两篇文档
+        path = self.write([sample_record(source_file="a.jsonl", source_document_no=9)])
+        self.assertEqual(self.st.read_corpus(path)[0]["source_document_no"], 1)
+
     def test_source_line_no_survives_reordering(self):
         # 抽样产物写的 source_line_no 是源语料行号，读输入文件时不能被当前物理行号顶掉
         path = self.write([{"sentence": SENTENCE}, sample_record(source_line_no=42)])
@@ -186,6 +206,84 @@ class StableIdentityTests(unittest.TestCase):
         self.assertNotEqual(self.st.candidate_key(sid, 2, "到"), self.st.candidate_key(sid, 2, "进"))
         self.assertNotEqual(self.st.candidate_key(sid, 2, "到"), self.st.candidate_key(sid, 7, "到"))
         self.assertIsNone(self.st.candidate_key(sid, 2, ""))   # 缺替换词时不拼半个键
+
+
+class RecordIdTests(unittest.TestCase):
+    """记录 id：来源文档编号-源行号-第几个目标词位置-第几个替换句（各段从 1 起）"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.st, cls.graphs = load_real_stack()
+
+    def state(self, candidate=None, **record_overrides):
+        return {
+            "record": sample_record(**record_overrides),
+            "candidate": {"focus_order": 3, "candidate_order": 2} if candidate is None else candidate,
+        }
+
+    def test_prefers_source_line_no(self):
+        state = self.state(source_line_no=42, input_line_no=7, line_no=9)
+        self.assertEqual(self.st.record_line_no(state["record"]), 42)
+        self.assertEqual(self.graphs._record_id(state), "1-42-3-2")
+
+    def test_reads_document_number_from_source_block(self):
+        # 落盘后的结果记录把编号收在 source 块里（serialize_pair），迁移脚本也要能认
+        record = {"source": {"source_document_no": 3}, "source_line_no": 42}
+        self.assertEqual(self.st.record_document_no(record), 3)
+
+    def test_document_number_types(self):
+        self.assertEqual(self.st.record_document_no({"source_document_no": "2"}), 2)
+        self.assertEqual(self.st.record_document_no({"source_document_no": 2.0}), 2)
+        self.assertIsNone(self.st.record_document_no({"source_document_no": True}))
+        self.assertIsNone(self.st.record_document_no({"source_document_no": 0}))
+        self.assertIsNone(self.st.record_document_no({}))
+
+    def test_missing_document_number_returns_none(self):
+        record = sample_record(source_line_no=42)
+        record.pop("source_document_no")
+        self.assertIsNone(self.st.record_document_no(record))
+        self.assertIsNone(
+            self.graphs._record_id(
+                {"record": record, "candidate": {"focus_order": 1, "candidate_order": 1}}
+            )
+        )
+
+    def test_falls_back_to_input_line_no_then_line_no(self):
+        record = sample_record(source_line_no=None, input_line_no=7, line_no=9)
+        self.assertEqual(self.st.record_line_no(record), 7)
+        record = sample_record(source_line_no=None, input_line_no=None, line_no=9)
+        self.assertEqual(self.st.record_line_no(record), 9)
+
+    def test_reads_line_numbers_from_source_block(self):
+        # 落盘后的结果记录把行号收在 source 块里（serialize_pair），迁移脚本也要能认
+        record = {"source": {"source_line_no": None, "input_line_no": 5, "line_no": 9}, "line_no": 9}
+        self.assertEqual(self.st.record_line_no(record), 5)
+
+    def test_line_number_types(self):
+        self.assertEqual(self.st.record_line_no({"source_line_no": "42"}), 42)
+        self.assertEqual(self.st.record_line_no({"source_line_no": 42.0}), 42)
+        self.assertIsNone(self.st.record_line_no({"source_line_no": True}))
+        self.assertIsNone(self.st.record_line_no({"source_line_no": "abc"}))
+        self.assertIsNone(self.st.record_line_no({}))
+
+    def test_no_candidate_uses_zero_zero(self):
+        state = self.state(source_line_no=42)
+        state["candidate"] = None
+        self.assertEqual(self.graphs._record_id(state), "1-42-0-0")
+
+    def test_missing_or_invalid_orders_return_none(self):
+        record = sample_record(source_line_no=42)
+        self.assertIsNone(self.graphs._record_id({"record": record, "candidate": {"focus_order": 1}}))
+        self.assertIsNone(
+            self.graphs._record_id(
+                {"record": record, "candidate": {"focus_order": 0, "candidate_order": 1}}
+            )
+        )
+
+    def test_no_usable_line_returns_none(self):
+        record = sample_record(source_line_no=None)
+        self.assertIsNone(self.st.record_line_no(record))
+        self.assertIsNone(self.graphs._record_id({"record": record, "candidate": {"focus_order": 1, "candidate_order": 1}}))
 
 
 class RecordContractTests(unittest.TestCase):
@@ -235,6 +333,9 @@ class RecordContractTests(unittest.TestCase):
         self.assertTrue(record["sentence_id"])
         self.assertEqual(record["candidate_key"], self.st.candidate_key(record["sentence_id"], 2, "到"))
         self.assertEqual(record["source"]["source_line_no"], 42)  # 源行号留在产物里
+        self.assertEqual(record["source"]["source_document_no"], 1)  # 文档编号也留在产物里
+        # 文档号-源行号-位置-替换句，不再嵌 sentence_id
+        self.assertEqual(record["id"], "1-42-1-1")
 
     def test_flow_success_is_not_data_admission(self):
         # 闸门判不出来、后续都成功：status 仍是 ok，但空间性根本没确认——两者必须分开

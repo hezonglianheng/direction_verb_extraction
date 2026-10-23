@@ -1421,11 +1421,11 @@ class AlterAgent(BaseAgent):
         `上@3` 与 `上@5` 会有各自的一批候选，只有带着位置才分得开（见 spatial_graphs.alter_node）。
 
         focus_order / candidate_order 是拼记录 id 用的两个**从 1 起**的层级序号（见
-        spatial_graphs._record_id）：前者数"句内第几个展开出候选的目标词"（按本方法的循环顺序，
-        展开不出候选的位置不占号），后者数"该词自己的第几个替换句"（按规则表顺序）。
-        四个编号各是各的口径，别混：candidate_index 是全展开上从 0 起的连续号（排序键用），
-        focus_index 是句内第几个 token（0 基下标，"是不是同一位置"看它）——后两个只用来拼
-        id（候选 dict 上的这两个键不直接落盘，落盘的是它们拼出的顶层 id）。
+        spatial_graphs._record_id）：前者是"句内第几个目标词位置"（按本方法的循环顺序，
+        展开不出候选的位置也占号，所以同句 id 会跳号），后者是"该位置自己的第几个替换句"
+        （按规则表顺序）。四个编号各是各的口径，别混：candidate_index 是全展开上从 0 起的
+        连续号（排序键用），focus_index 是句内第几个 token（0 基下标，"是不是同一位置"看它）
+        ——后两个只用来拼 id（候选 dict 上的这两个键不直接落盘，落盘的是它们拼出的顶层 id）。
 
         returns 的 details 与**位置**一一对应（不是与候选一一对应），形如
         [{"focus_word": ..., "detail": ...}]，detail 是 spatial_tools.alter_sentence 的原样
@@ -1441,14 +1441,15 @@ class AlterAgent(BaseAgent):
         for focus_word in focus_words or []:
             if not isinstance(focus_word, dict):
                 continue
+            # 每个目标词位置都占一个号：第二段要回答「句内第几个目标词位置」，
+            # 不是「第几个展开出候选的位置」。空位置照样占号，所以同句 id 会出现跳号。
+            focus_order += 1
             result = self.run(sentence_slice, focus_word)
             detail = result["detail"]
             details.append({"focus_word": focus_word, "detail": detail})
             if not detail["candidates"]:
-                # 这个位置展开不出候选：不进候选表、也不占 focus_order 的号——没有记录会用到它，
-                # 同一原句的 id 第二段于是连续（日后要改成"每个位置都占号"就动这一处）
+                # 这个位置展开不出候选：不进候选表，但上面已经占过号了
                 continue
-            focus_order += 1
             for candidate_order, (candidate, slice_, sentence) in enumerate(
                 zip(detail["candidates"], result["slices"], result["sentences"]), start=1
             ):

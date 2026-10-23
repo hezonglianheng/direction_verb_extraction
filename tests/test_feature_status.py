@@ -30,6 +30,22 @@ def load_graphs():
     # 稳定 ID 与候选唯一键（D1/D2）：与 test_synonym_graph 的桩同一套口径
     tools.RESULT_SCHEMA_VERSION = "1.0"
     tools.source_document_id = lambda record: record.get("source_file")
+
+    def record_line_no(record):
+        source = record.get("source") if isinstance(record.get("source"), dict) else {}
+        for key in ("source_line_no", "input_line_no", "line_no"):
+            for container in (source, record):
+                value = container.get(key)
+                if isinstance(value, int) and not isinstance(value, bool):
+                    return value
+        return None
+
+    tools.record_line_no = record_line_no
+    tools.record_document_no = lambda record: (
+        (record.get("source") or {}).get("source_document_no")
+        or record.get("source_document_no")
+        or 1
+    )
     tools.content_hash = lambda text: "".join(text)
     tools.sentence_id = lambda record: (
         f"{record.get('source_file') or 'unknown-doc'}#{record.get('source_line_no') or record.get('line_no')}"

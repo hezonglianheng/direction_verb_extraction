@@ -1010,34 +1010,46 @@ def pair_admission(state: PairState) -> dict:
 
 
 def _record_id(state: dict) -> str | None:
-    """记录 id：句子稳定 ID-第几个目标词-该词第几个替换句（后两段从 1 起；没有替换句记 0-0）
+    """记录 id：`来源文档编号-源行号-第几个目标词位置-该位置第几个替换句`（各段从 1 起）
 
-    首段取 **st.sentence_id**（来源文档 + 源行号 + 文本指纹）而不是裸行号（D2）：
-    行号只能在同一份文件里定位，重排、重新抽样或合并之后同一个行号指的是另一句，
-    两份不同输入产出的 id 还会撞在一起却说的不是同一件事。sentence_id 与文件顺序无关，
-    于是 id 能当全局唯一键用；取不到（坏记录里连 sentence 都没有）才回落到物理行号，
-    连行号也没有时返回 None——不编造。
+    四段各回答一个问题：
+        来源文档编号 这条语料出自本次输入里第几篇来源文档（st.read_corpus 按首次出现顺序
+                    写入的 source_document_no，口径见 st.record_document_no）
+        源行号      这句在**原来文件**里的行号，优先 source_line_no，其次 input_line_no，
+                    最后 line_no（口径见 st.record_line_no）
+        目标词位置  句内第几个目标词位置（AlterAgent.expand_positions 的 focus_order）；
+                    展开不出候选的位置也占号，所以同句 id 会跳号
+        替换句      该位置自己的第几个替换句（candidate_order，按规则表顺序）
 
-    后两段是展开时写在候选上的 focus_order / candidate_order
-    （见 AlterAgent.expand_positions）——前者是"句内第几个展开出候选的目标词"，后者是"该词
-    自己的第几个替换句"。与 focus_index（0 基 token 下标）不是一回事：同句两处同一个词
-    （上@3 与 上@5）各有各的 focus_order，光看词分不开。
+    没有替换句的记录（bad_record / alter_missed，candidate 为 None）记成
+    `<文档号>-<行号>-0-0`：这类记录每句至多一条（见 alter_init_states）。
+    没有可用文档号或行号时返回 None——不编造。
 
-    没有替换句的记录（bad_record / alter_missed，candidate 为 None）记成 `<句子ID>-0-0`：
-    这类记录每句至多一条（见 alter_init_states），同一份输出里 id 于是不撞。它是拼出来的
-    **字符串**，字典序不等于数值序，别拿它当排序键（排序仍走 record_order_key）。
+    与 sentence_id 的分工：id 只表达位置，**不再全局唯一**——来源文档编号只在一次跑批的
+    输入内有效（--offset 从中间起跑会重排），跨文件溯源与查重仍看顶层 sentence_id /
+    content_hash / candidate_key。id 是拼出来的**字符串**，字典序不等于数值序，别拿它
+    当排序键（排序仍走 record_order_key）。
     """
     record = state.get("record") or {}
-    stem = st.sentence_id(record)
-    if stem is None:
-        line_no = record.get("line_no")
-        if not isinstance(line_no, int):
-            return None
-        stem = str(line_no)
+    document_no = st.record_document_no(record)
+    line_no = st.record_line_no(record)
+    if document_no is None or line_no is None:
+        return None
     chosen = state.get("candidate")
     if not chosen:
-        return f"{stem}-0-0"
-    return f"{stem}-{chosen.get('focus_order')}-{chosen.get('candidate_order')}"
+        return f"{document_no}-{line_no}-0-0"
+    focus_order = chosen.get("focus_order")
+    candidate_order = chosen.get("candidate_order")
+    if (
+        not isinstance(focus_order, int)
+        or isinstance(focus_order, bool)
+        or not isinstance(candidate_order, int)
+        or isinstance(candidate_order, bool)
+        or focus_order < 1
+        or candidate_order < 1
+    ):
+        return None
+    return f"{document_no}-{line_no}-{focus_order}-{candidate_order}"
 
 
 def _candidate_key(state: dict) -> str | None:
@@ -1110,7 +1122,10 @@ def serialize_pair(state: PairState) -> dict:
     事后要核对"这一对落在判定表哪一格、为什么"就得两份都在。
 
     id（见 _record_id）刻意放在第一个键上：它同时是成对信息 csv 的首列（st.PAIR_CSV_COLUMNS），
-    事后按 id 认记录、回查不用再拼 (line_no, candidate.index)。
+    事后按 id 认记录、回查不用再拼 (line_no, candidate.index)。id 是
+    `来源文档编号-源行号-第几个目标词位置-第几个替换句`，只在同一次跑批的输入内唯一；
+    文档编号随 --offset 重排，跨文件身份仍看 sentence_id。source 块顺带记下这个编号
+    （source_document_no），迁移旧结果时才能按同一口径重算。
 
     sentence_id / candidate_key / schema_version / admission 四块是数据契约（D1、D2、D3、A1）：
     前两者给出「与文件顺序无关的稳定来源」与「候选唯一键」，schema_version 让读取侧不靠猜字段，
@@ -1134,6 +1149,7 @@ def serialize_pair(state: PairState) -> dict:
         "source": {
             "source_file": record.get("source_file"),
             "source_document_id": st.source_document_id(record),
+            "source_document_no": record.get("source_document_no"),
             "source_line_no": record.get("source_line_no"),
             "input_line_no": record.get("input_line_no"),
             "filter_methods": record.get("filter_methods"),

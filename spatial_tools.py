@@ -553,8 +553,13 @@ def read_corpus(path: str | Path, limit: int | None = None, offset: int = 0) -> 
     行号分层保留（D2），三样各是各的口径，不要互相覆盖：
         source_line_no   源语料（抽样前那份）里的行号，由 word_sampler 写入，落到产物里不再变
         input_line_no    本次输入文件里的物理行号（从 1 开始）
-        line_no          与 input_line_no 同值，是历史字段名：排序键、记录 id 都按它算，
-                         保留原名才能让旧产物与对账脚本继续工作
+        line_no          与 input_line_no 同值，是历史字段名：排序键按它算；
+                         记录 id 的第二段现在优先用 source_line_no（见 record_line_no），
+                         取不到才退回它。保留原名才能让旧产物与对账脚本继续工作
+
+    另写 source_document_no：来源文档在**本次输入**里第几篇（1 起，按首次出现顺序）。
+    它就是 id 的首段（见 record_document_no），所以 --offset 从语料中间起跑时，前面没遇到的
+    文档不占号，编号会从头重排——id 本来就是文件内口径，跨文件溯源看 sentence_id。
 
     旧写法无条件把 line_no 覆盖成当前行号，于是抽样阶段写的源行号被吃掉：文件重排、
     重新抽样或合并之后就再也说不清这条记录原先是哪一句。现在源行号先让位给
@@ -564,6 +569,7 @@ def read_corpus(path: str | Path, limit: int | None = None, offset: int = 0) -> 
         list[dict]: 每条记录原样返回，另加上述三个行号字段
     """
     records: list[dict] = []
+    document_numbers: dict[str, int] = {}
     with open(path, "r", encoding="utf-8") as f:
         for line_no, line in enumerate(f, start=1):
             if line_no <= offset or not line.strip():
@@ -577,6 +583,15 @@ def read_corpus(path: str | Path, limit: int | None = None, offset: int = 0) -> 
             record["source_line_no"] = source_line_no
             record["input_line_no"] = line_no
             record["line_no"] = line_no
+            # 来源文档编号按本次输入里的首次出现顺序给；上游残留的旧编号一律重算，
+            # 否则两份语料拼在一起时会出现同一编号指两篇文档
+            document = source_document_id(record)
+            if document is None:
+                record.pop("source_document_no", None)
+            else:
+                if document not in document_numbers:
+                    document_numbers[document] = len(document_numbers) + 1
+                record["source_document_no"] = document_numbers[document]
             records.append(record)
             if limit is not None and len(records) >= limit:
                 break
@@ -612,6 +627,62 @@ def content_hash(text: str | Iterable[str]) -> str:
     """
     body = join_slice(text) if not isinstance(text, str) else text
     return hashlib.sha1(normalize(body).encode("utf-8")).hexdigest()[:12]
+
+
+def record_document_no(record: dict) -> int | None:
+    """记录 id 首段要用的来源文档编号：本次输入里第几篇来源文档（1 起）
+
+    read_corpus 按首次出现顺序写进顶层；落盘后的结果记录把它收在 `source` 块里
+    （见 spatial_graphs.serialize_pair）。两种形状都认，先看 `source` 块再看顶层。
+
+    只接受正整数（排除 bool）、整值浮点数与纯数字字符串；取不到或不是正整数都返回
+    None——0 与 "?" 不是「第几篇文档」，不能拼进 id。
+    """
+    source = record.get("source") if isinstance(record, dict) else None
+    containers = [source, record] if isinstance(source, dict) else [record]
+    for container in containers:
+        if not isinstance(container, dict):
+            continue
+        value = container.get("source_document_no")
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int) and value >= 1:
+            return value
+        if isinstance(value, float) and value.is_integer() and value >= 1:
+            return int(value)
+        if isinstance(value, str) and value.strip().isdigit():
+            number = int(value.strip())
+            if number >= 1:
+                return number
+    return None
+
+
+def record_line_no(record: dict) -> int | None:
+    """记录 id 第二段要用的行号：源行号优先，其次输入行号，最后历史字段 line_no
+
+    两种记录形状都认：跑批中的语料记录把行号放在顶层（见 read_corpus），
+    落盘后的结果记录把它们收在 `source` 块里（见 spatial_graphs.serialize_pair）。
+    每个键先看 `source` 块、再看顶层，三个键之间严格按上面的优先序。
+
+    只接受整数（排除 bool）、整值浮点数与纯数字字符串；取不到或不是数字都返回 None，
+    绝不把 "None" / "1.0" 这类字面量拼进 id。
+    """
+    source = record.get("source") if isinstance(record, dict) else None
+    containers = [source, record] if isinstance(source, dict) else [record]
+    for key in ("source_line_no", "input_line_no", "line_no"):
+        for container in containers:
+            if not isinstance(container, dict):
+                continue
+            value = container.get(key)
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, int):
+                return value
+            if isinstance(value, float) and value.is_integer():
+                return int(value)
+            if isinstance(value, str) and value.strip().isdigit():
+                return int(value.strip())
+    return None
 
 
 def sentence_id(record: dict) -> str | None:
@@ -1673,11 +1744,15 @@ def lookup_judgement(schema_a: str | None, schema_b: str | None, table: dict | N
 # --------------------------------------------------------------------------
 
 
-RESULT_SCHEMA_VERSION = "1.0"
+RESULT_SCHEMA_VERSION = "1.2"
 """结果 jsonl 的 schema 版本号，写进每条记录与运行汇总
 
 正式产物一律带版本号：读取侧据此判断这份文件能不能直接解析，旧格式走一次性迁移并有异常
-清单，**不在正式读取链路里长期靠猜字段**（D3）。改记录形状就升版本号。"""
+清单，**不在正式读取链路里长期靠猜字段**（D3）。改记录形状就升版本号。
+1.1：顶层 id 由 `sentence_id-位置-替换` 改为 `源行号-第几个目标词位置-第几个替换句`。
+1.2：id 最前面加来源文档编号，变成
+`来源文档编号-源行号-第几个目标词位置-第几个替换句`；source 块新增 source_document_no。
+（迁移脚本见 migrate_result_ids.py）。"""
 
 RESULT_REQUIRED_FIELDS: tuple[str, ...] = (
     "id",
@@ -1778,8 +1853,9 @@ def read_jsonl(path: str | Path) -> list[dict]:
 
 
 PAIR_CSV_COLUMNS: tuple[tuple[str, str], ...] = (
-    # 记录标识「语料行号-第几个目标词-第几个替换句」（见 spatial_graphs._record_id）：
-    # 没有替换句的记录是「行号-0-0」；id 之前产出的旧记录没有这个字段，这一格留空
+    # 记录标识「来源文档编号-源行号-第几个目标词位置-该位置第几个替换句」
+    # （见 spatial_graphs._record_id）：第三段把句内全部目标词位置都算上，空位置也占号；
+    # 没有替换句的记录是「文档号-行号-0-0」。id 之前产出的旧记录没有这个字段，这一格留空
     ("id", "id"),
     ("原句", "pair.a.sentence"),
     ("替换句", "pair.b.sentence"),
@@ -1809,8 +1885,9 @@ PAIR_CSV_COLUMNS: tuple[tuple[str, str], ...] = (
 真源就在这里：跑批收尾（spatial_runner.ResultWriter.finish）与独立的导出脚本
 （export_pairs_csv.py）都用这一份，改列只改这里。只有 pair 图画得成这张表——单句图与
 改写检查图的记录里没有 pair/judgement 两块（见 spatial_graphs.GraphSpec.csv_columns）。
-首列 id 是记录标识（语料行号-第几个目标词-第几个替换句，口径见 spatial_graphs._record_id），
-在记录里就是顶层一个字段、点分路径只有一段；旧记录缺它时这一格留空。
+首列 id 是记录标识（来源文档编号-源行号-第几个目标词位置-第几个替换句，口径见
+spatial_graphs._record_id），在记录里就是顶层一个字段、点分路径只有一段；旧记录缺它时这一格留空。
+编号只在同一次跑批的输入内唯一（文档编号随 --offset 重排），跨文件的身份仍看「句子ID」。
 末列「模型名称」来自顶层 model_name，记录本次 --model 的配置名；--no-llm 模式或旧记录缺该字段时留空。
 """
 
