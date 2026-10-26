@@ -89,6 +89,7 @@ from pydantic import Field, create_model
 import agents as agent_factory
 import config
 import file_paths
+import retry
 import spatial_agents as sa
 import spatial_graphs as sg
 import spatial_runner as sr
@@ -400,9 +401,8 @@ class _RequestProbe(BaseCallbackHandler):
     由 call_once 挂在**本次 invoke** 的 config 上，而不是挂在 agent 上：worker 并发下
     每条记录各带各的探针，请求数才按记录归账。on_chat_model_start 在模型每次真正开始
     一次请求时触发——ToolStrategy(handle_errors=True) 的补发是同一个 invoke 里的第二次
-    模型请求，会再触发一次（「模型轮次」数不到、这里数得到）。底层 HTTP 连接层的自动
-    重试（langchain-openai 的 max_retries）发生在一次模型请求内部，不会再触发本回调，
-    不在本口径里。
+    模型请求，会再触发一次（「模型轮次」数不到、这里数得到）；retry.call_with_retry 的
+    传输层重试会重新 invoke 一次，每次也各带一个新探针，由 call_once 累加。
     """
 
     def __init__(self) -> None:
@@ -420,7 +420,8 @@ class CallCounter:
     rounds   外层调用数（模型轮次）：只在 call_once 里 +1——「每条记录至多一次调用」
              这句承诺唯一可核对的地方；agent 内部的补发不经过 call_once，数不到；
     requests 实际请求数（含内部补发）：call_once 按每条记录的回调探针（_RequestProbe）累加；
-    retried  补发次数：每次调用按 max(0, 请求数 - 1) 累加，未发请求的失败调用不计补发。
+    retried  补发次数：每次调用按 max(0, 请求数 - 1) 累加，含传输层超时重试
+             与 ToolStrategy 内部补发；未发请求的失败调用不计补发。
 
     --workers 下 call_once 会从各个 worker 并发调到这来，故三个计数都用锁串起来
     （与 ResultWriter 同一口径）；收尾是等池子跑完再读，读到的是终值。
@@ -442,32 +443,47 @@ class CallCounter:
             self.retried += max(0, count - 1)
 
 
-def call_once(agent, content: str, counter: CallCounter) -> tuple:
-    """发一次请求，返回 (结构化输出, 出错原因, 本次真实请求数)
+def call_once(agent, content: str, counter: CallCounter, retry_policy: dict | None = None) -> tuple:
+    """发一次**逻辑**请求，返回 (结构化输出, 出错原因, 本次真实请求数)
 
-    本函数自己不重试：重试就是第二次请求，与「只调一次」直接冲突。单条记录失败不带走整批，
-    原因如实记进 all_in_one.error，下游按 source="error" 诚实记录（闸门由此落到 semantic_error）。
+    超时/连接/限流/5xx 由 ``retry.call_with_retry`` 在传输层重发（次数取自
+    config.LLM_MAX_RETRIES 或模型配置的 max_retries）；重发的是同一问，不改变
+    “一条记录一次逻辑调用”的语义。重试次数与框架内部补发都计入返回的真实请求数
+    （见 _RequestProbe 与 CallCounter）。
 
-    注意 agent 内部还藏着一条补发路径（ToolStrategy 的 handle_errors，见 build_call_agent）——
-    这里管不到它，所以那边默认也是关的。两处一起才构成「这一次就是唯一一次」。补发若真的
-    发生，会如实落进返回的请求数里（见 _RequestProbe），并由 CallCounter 按本次请求数累计补发。
+    本函数不重试**业务/结构化输出**错误：那类补发由 ToolStrategy(handle_errors=...)
+    控制，默认关，见 build_call_agent。
     """
-
     counter.bump()
-    probe = _RequestProbe()
+    total_requests = 0
+
+    def invoke_once():
+        nonlocal total_requests
+        probe = _RequestProbe()
+        try:
+            result = agent.invoke(
+                {"messages": [{"role": "user", "content": content}]},
+                config={"callbacks": [probe]},
+            )
+        finally:
+            # 无论成功失败都把这几次尝试里真实开始的模型请求记上；失败早于回调时是 0，
+            # 与“请求已发出但被拒”区分开（见 test_call_once_failure_still_counts_rounds_and_requests）
+            total_requests += probe.count
+        return result
+
     try:
-        result = agent.invoke(
-            {"messages": [{"role": "user", "content": content}]},
-            config={"callbacks": [probe]},
+        result = retry.call_with_retry(
+            invoke_once,
+            policy=retry_policy or {"max_retries": 0},
         )
     except Exception as e:
-        counter.add_requests(probe.count)
-        return None, f"调用失败：{e!r}", probe.count
-    counter.add_requests(probe.count)
+        counter.add_requests(total_requests)
+        return None, f"调用失败：{e!r}", total_requests
+    counter.add_requests(total_requests)
     response = result.get("structured_response") if isinstance(result, dict) else None
     if response is None:
-        return None, "模型这次没有给出结构化输出（structured_response 为空）", probe.count
-    return response.model_dump(), None, probe.count
+        return None, "模型这次没有给出结构化输出（structured_response 为空）", total_requests
+    return response.model_dump(), None, total_requests
 
 
 def build_call_agent(model_key: str, system_prompt: str, verdict_model: type, *, allow_retry: bool):
@@ -810,7 +826,12 @@ def process_state(state: dict, *, ctx: "_Context", args: argparse.Namespace, cal
                 prepared.message,
             )
         elif ctx.llm:
-            dumps, error, requests = call_once(call_agent, prepared.message, counter)
+            dumps, error, requests = call_once(
+                call_agent,
+                prepared.message,
+                counter,
+                retry_policy=getattr(ctx, "retry_policy", None),
+            )
 
     outcome = assemble(state, ctx, dumps=dumps, error=error, llm_used=ctx.llm)
     state = _apply(state, {"stage": outcome.stage, "status_reason": outcome.status_reason})
@@ -908,6 +929,8 @@ class _Context(NamedTuple):
     feature_classes: list
     prompt_path: str
     reality_path: str
+    retry_policy: dict | None = None
+    """超时/重试策略（见 agents.request_policy）；None = 不重试（测试/--print-prompt 的默认）"""
     syntax_error: str | None = None
     """预填充失败的原因；本轮省略句法证据，避免每条记录再次尝试不可用的 LTP。"""
 
@@ -945,6 +968,11 @@ def build_context(args: argparse.Namespace, corpus_type: str, out_path: Path) ->
         feature_classes=feature_classes,
         prompt_path=str(utils.prompt_path(PROMPT_FILE)),
         reality_path=reality_agent.prompt_paths[sa.REALITY_PROMPT_FILE],
+        retry_policy=(
+            agent_factory.request_policy(args.model)
+            if not args.no_llm and not args.print_prompt
+            else {"max_retries": 0}
+        ),
     )
 
 
@@ -1170,6 +1198,8 @@ def main(argv: list[str] | None = None) -> None:
         input_records=len(records),
         expanded_states=len(states),
     )
+    if ctx.retry_policy:
+        writer.extra_summary["request_policy"] = dict(ctx.retry_policy)
     counter = CallCounter()
     suppressed: Counter = Counter()
     failed = 0
@@ -1210,7 +1240,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     print(
         f"实际请求 {counter.requests} 次（回调实测，含框架内部补发 {counter.retried} 次；"
-        "底层 HTTP 连接层重试不在此列）"
+        "传输层超时重试与 ToolStrategy 补发均计入，SDK 层重试已关闭）"
     )
     # 对照数是按**逐条实际走到哪一步**累加的，不是「记录数 × 换算系数」：停在 reality 闸门的记录
     # 本来只要一次调用，一律按整条链路算会把这批语料说得比实际贵。

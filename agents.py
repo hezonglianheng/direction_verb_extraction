@@ -17,6 +17,13 @@ from langchain.chat_models import init_chat_model
 from deepagents import create_deep_agent
 
 import config
+import retry
+
+call_with_retry = retry.call_with_retry
+"""给业务 agent 用的重试入口（见 spatial_agents.BaseAgent._invoke / all_in_one.call_once）"""
+
+is_retryable_error = retry.is_retryable_error
+"""给调用方判断“这次失败值不值得重试”的同一个口径（见 retry.is_retryable_error）"""
 
 _PROJECT_ROOT = Path(__file__).resolve().parent
 _MODEL_CONFIG_PATH = _PROJECT_ROOT / "model_config" / "api_keys.json"
@@ -65,6 +72,51 @@ def load_model_config(model_name: str) -> dict:
     return model_cfg
 
 
+def request_policy(model_name: str) -> dict:
+    """读取某个模型的超时/重试策略（模型配置优先，其次 config.py 的默认值）
+
+    返回的 dict 直接交给 ``retry.call_with_retry``，键为：
+        timeout               单次请求超时秒数
+        max_retries           首次之外最多重试几次（默认 config.LLM_MAX_RETRIES = 6）
+        backoff_seconds       首次退避秒数
+        backoff_max_seconds   单次退避上限
+        jitter_seconds        随机抖动上限
+
+    配置写错（bool、负数、小数次数、字符串）就在启动时抛 ValueError，
+    不把一次“重试其实没生效”的跑批留到事后从耗时里猜。
+    """
+    return _request_policy(load_model_config(model_name), model_name)
+
+
+def _request_policy(model_cfg: dict, model_name: str) -> dict:
+    """request_policy 的实现：从已读出的模型配置构造策略"""
+    timeout = model_cfg.get("timeout", config.REQUEST_TIMEOUT_SECONDS)
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
+        raise ValueError(f"模型 {model_name!r} 的 timeout 必须是正数，收到 {timeout!r}")
+
+    def _int(field: str, default: int) -> int:
+        value = model_cfg.get(field, default)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"模型 {model_name!r} 的 {field} 必须是非负整数，收到 {value!r}")
+        return value
+
+    def _float(field: str, default: float) -> float:
+        value = model_cfg.get(field, default)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+            raise ValueError(f"模型 {model_name!r} 的 {field} 必须是非负数，收到 {value!r}")
+        return float(value)
+
+    return {
+        "timeout": float(timeout),
+        "max_retries": _int("max_retries", config.LLM_MAX_RETRIES),
+        "backoff_seconds": _float("retry_backoff_seconds", config.LLM_RETRY_BACKOFF_SECONDS),
+        "backoff_max_seconds": _float(
+            "retry_backoff_max_seconds", config.LLM_RETRY_BACKOFF_MAX_SECONDS
+        ),
+        "jitter_seconds": _float("retry_jitter_seconds", config.LLM_RETRY_JITTER_SECONDS),
+    }
+
+
 def get_model(model_name: str, disable_thinking: bool = False):
     """按配置初始化 chat model
 
@@ -79,10 +131,15 @@ def get_model(model_name: str, disable_thinking: bool = False):
 
     Returns:
         BaseChatModel: 初始化好的模型。注意不要在其上再调 .with_retry()，
-            它返回的 RunnableRetry 没有 bind_tools，会在 agent 绑工具时崩掉；
-            重试交给这里的 max_retries。
+            它返回的 RunnableRetry 没有 bind_tools，会在 agent 绑工具时崩掉。
+
+    重试口径：SDK 自带的重试**显式关掉**（max_retries=0），统一由
+    retry.call_with_retry 在业务调用层做。两层都开 6 次会叠成最多 49 次请求，
+    一次超时就能把整批拖到不可控；集中到一层后，重试次数也才能如实记进
+    agent_stats（见 spatial_agents.BaseAgent.stats）。
     """
     model_cfg = load_model_config(model_name)
+    policy = _request_policy(model_cfg, model_name)
 
     # langchain 1.x 的 init_chat_model 把参数改名了：model_name -> model，
     # provider -> model_provider（旧名会被当成模型字段透传，随后报错），此处做一次映射。
@@ -92,10 +149,9 @@ def get_model(model_name: str, disable_thinking: bool = False):
         "base_url": model_cfg["base_url"],
         "api_key": model_cfg["api_key"],
         "temperature": model_cfg.get("temperature", 0),
-        # 超时与重试都显式给（A3）：底层 SDK 自己的默认值不进运行清单、也无法按实验调整，
-        # 而「这一轮允许花多少」必须是可记录、可复现的口径。配置里写了就以配置为准。
-        "timeout": model_cfg.get("timeout", config.REQUEST_TIMEOUT_SECONDS),
-        "max_retries": model_cfg.get("max_retries", config.LLM_MAX_RETRIES),
+        # 超时由这一层显式给；重试统一收在 retry.call_with_retry，SDK 层置 0。
+        "timeout": policy["timeout"],
+        "max_retries": 0,
     }
     if disable_thinking:
         disable_kwargs = model_cfg.get("disable_thinking") or _DISABLE_THINKING_DEFAULTS.get(

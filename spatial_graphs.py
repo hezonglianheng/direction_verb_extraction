@@ -1616,14 +1616,23 @@ def alter_check_plan(records: list[dict], agents) -> list[str]:
 
 
 def alter_check_tally(record: dict, counters: dict[str, Counter]) -> None:
-    """改写检查图的汇总口径：状态分布 + 闸门判定 + 两侧通顺性分布 + 两侧关注词口径"""
+    """改写检查图的汇总口径：状态分布 + 闸门判定 + 两侧通顺性分布 + 两侧关注词口径
+
+    多模型投票平票/无有效票的记录 status=discarded：代表模型的通顺性布尔值不能
+    再当成正式结论统计（见 voting.combine_model_records），两侧一律记 discarded。
+    """
     _tally_focus(record, counters)
     _tally_reality(record, counters)
     _tally_replacement(record, counters)
     counters["status_counts"][record.get("status", "unknown")] += 1
+    discarded = record.get("status") == "discarded" or (record.get("voting") or {}).get(
+        "status"
+    ) in ("tie", "no_valid_votes")
     for side in ("a", "b"):
         item = (record.get("semantic") or {}).get(side) or {}
-        if not item:
+        if discarded:
+            label = "discarded"
+        elif not item:
             # 没走到 semantic 节点（比如改写未命中）时该侧没有判断，与"判了但失败"是两回事
             label = "absent"
         elif item.get("source") == "no_llm":

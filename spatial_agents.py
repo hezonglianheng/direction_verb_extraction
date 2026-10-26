@@ -134,6 +134,12 @@ class BatchRequestBudget:
                 )
             self.requests += 1
 
+    def release(self) -> None:
+        """回退一次已占用的整批名额（候选预算随后拒绝时用，避免白扣整批预算）"""
+        with self._lock:
+            if self.requests > 0:
+                self.requests -= 1
+
 
 class _BudgetScope:
     """一条候选的预算作用域：按 agent 实例各记一份已发出的调用数（见 BaseAgent.budget_scope）
@@ -159,6 +165,13 @@ class _BudgetScope:
                 return False
             self.requests[agent] = used + 1
             return True
+
+    def release(self, agent) -> None:
+        """回退一次候选名额（整批预算随后拒绝时用，避免白扣候选预算）"""
+        with self._lock:
+            used = self.requests.get(agent, 0)
+            if used > 0:
+                self.requests[agent] = used - 1
 
 
 _CURRENT_BUDGET: contextvars.ContextVar[_BudgetScope | None] = contextvars.ContextVar(
@@ -917,8 +930,26 @@ class BaseAgent:
         corpus_type: str | None = None,
         max_requests: int | None = None,
         batch_budget: BatchRequestBudget | None = None,
+        retry_policy: dict | None = None,
     ):
         self.model_key = model_key
+        if retry_policy is not None:
+            self.retry_policy = dict(retry_policy)
+        else:
+            # 生产路径由 build_agents 传入；单独构造 agent 时（测试桩、对照实验）退回不重试。
+            # getattr 兜底是为了让只桩了 get_agent 的旧测试仍能构造 agent。
+            request_policy = getattr(agent_factory, "request_policy", None)
+            self.retry_policy = (
+                request_policy(model_key)
+                if request_policy is not None and llm and self.NEEDS_LLM
+                else {"max_retries": 0}
+            )
+        """超时/重试策略（见 agents.request_policy 与 retry.call_with_retry）
+
+        由 build_agents 按模型读一次、所有 agent 共用；模型配置里的 timeout /
+        max_retries / retry_backoff_seconds 等在这里生效。--no-llm 或纯规则 agent
+        不读模型配置，策略置为不重试。
+        """
         # 本 agent 的请求预算（A3）：None = 不限。由 build_agents 按 config.CANDIDATE_MAX_REQUESTS
         # 注入；超预算即抛 RequestBudgetExceeded，不再把失败按候选放大成整批的倍数。
         # 它只在 budget_scope() 内累计（一条候选状态一个作用域），见 _invoke。
@@ -967,10 +998,15 @@ class BaseAgent:
             # A3：超预算而没发出的请求数。它与 failed 是两件事——failed 是发出去没成，
             # budget_exceeded 是**根本没发**；合起来看才知道「省下了多少」与「漏了多少」。
             "budget_exceeded": 0,
-            # A5：统一事件口径里的两项成本指标。requests = roundtrips + failed（发出过的调用数），
+            # A5：统一事件口径里的两项成本指标。requests = roundtrips + failed（成功/最终失败的逻辑调用数），
             # elapsed_seconds 是这些调用花掉的墙上时间，用来算「每个有效句对的成本」。
             "requests": 0,
             "elapsed_seconds": 0.0,
+            # 重试账：retries 是决定重发的次数（含最终成功的那几次），
+            # retry_exhausted 是重试次数用完仍失败的逻辑调用数。两者与 failed 分开，
+            # 才能从汇总里一眼分出「模型慢」与「一直在超时重试」。
+            "retries": 0,
+            "retry_exhausted": 0,
         }
         self._stats_lock = threading.Lock()
 
@@ -1067,31 +1103,78 @@ class BaseAgent:
         全被拒」，见 spatial_runner._print_agent_stats。首次失败的原因也留一份（截断），
         免得为了看这一句还得去翻某条记录的 status_reason。
         """
-        # 预算检查放在**发请求之前**（A3）：超预算就不发，而不是发了再记账。
-        # 计数用「已发出的调用数」而不是成功数——失败的那几次同样占了预算。
-        with self._stats_lock:
-            # 整批预算先查（没有作用域也生效）；候选预算只在 budget_scope 内查、只计作用域内的调用
-            if self.batch_budget is not None:
-                try:
-                    self.batch_budget.reserve(self.NAME or self.__class__.__name__)
-                except RequestBudgetExceeded:
-                    self._stats["budget_exceeded"] += 1
-                    raise
-            scope = _CURRENT_BUDGET.get()
-            if scope is not None and not scope.reserve(self, self.max_requests):
-                self._stats["budget_exceeded"] += 1
-                raise RequestBudgetExceeded(
-                    f"{self.NAME or self.__class__.__name__} 本候选已达请求预算 {self.max_requests} 次，"
-                    "本次不再发请求"
-                )
+        # 预算检查放在**每次实际尝试之前**（A3）：超预算就不发，而不是发了再记账。
+        # 重试也是请求，必须同样扣预算——否则 BATCH_MAX_REQUESTS=1 时一次超时仍会发出 7 次请求。
+        # 两层预约要么都成功、要么都不留痕：候选预算先约，整批预算拒绝时把候选名额退回去，
+        # 避免“实际没发请求却白扣一个候选名额/整批名额”。
+        def reserve_budget() -> None:
+            with self._stats_lock:
+                scope = _CURRENT_BUDGET.get()
+                candidate_reserved = False
+                if scope is not None:
+                    if not scope.reserve(self, self.max_requests):
+                        self._stats["budget_exceeded"] += 1
+                        raise RequestBudgetExceeded(
+                            f"{self.NAME or self.__class__.__name__} 本候选已达请求预算 {self.max_requests} 次，"
+                            "本次不再发请求"
+                        )
+                    candidate_reserved = True
+                if self.batch_budget is not None:
+                    try:
+                        self.batch_budget.reserve(self.NAME or self.__class__.__name__)
+                    except RequestBudgetExceeded:
+                        if candidate_reserved:
+                            scope.release(self)
+                        self._stats["budget_exceeded"] += 1
+                        raise
+
+        sent_any = False
+        last_error = None
+
+        def invoke_once():
+            nonlocal sent_any, last_error
+            reserve_budget()
+            sent_any = True
+            try:
+                return self._model().invoke({"messages": [{"role": "user", "content": content}]})
+            except Exception as exc:
+                last_error = exc
+                raise
+
         started = time.perf_counter()
+        call_with_retry = getattr(agent_factory, "call_with_retry", None)
+        is_retryable_error = getattr(agent_factory, "is_retryable_error", lambda exc: False)
         try:
-            result = self._model().invoke({"messages": [{"role": "user", "content": content}]})
+            # 重试只覆盖可恢复错误（超时/连接/限流/5xx），鉴权与参数错误直接抛出。
+            # SDK 层的 max_retries 已在 agents.get_model 里置 0，避免两层重试相乘。
+            if call_with_retry is None:
+                result = invoke_once()
+            else:
+                result = call_with_retry(
+                    invoke_once,
+                    policy=self.retry_policy,
+                    on_retry=lambda exc, attempt, delay: self._note_retry(),
+                )
+        except RequestBudgetExceeded as e:
+            # 如果被拦下的是首发，什么都没发出，只记 budget_exceeded；
+            # 如果此前已经发过并失败过（例如超时后重试被预算拦下），那一次逻辑调用
+            # 确实发生过，必须保留 failed/requests/elapsed 与首个失败原因，不能整笔漏记。
+            if sent_any:
+                with self._stats_lock:
+                    self._stats["failed"] += 1
+                    self._stats["requests"] += 1
+                    self._stats["elapsed_seconds"] += time.perf_counter() - started
+                    if self._stats.get("first_error") is None:
+                        cause = last_error or e
+                        self._stats["first_error"] = f"{cause!r}"[:_FIRST_ERROR_CHARS]
+            raise
         except Exception as e:  # 记账后原样抛出：怎么处理失败由各 run() 决定（见 RealityAgent._ask）
             with self._stats_lock:
                 self._stats["failed"] += 1
                 self._stats["requests"] += 1
                 self._stats["elapsed_seconds"] += time.perf_counter() - started
+                if self.retry_policy.get("max_retries", 0) > 0 and is_retryable_error(e):
+                    self._stats["retry_exhausted"] += 1
                 if self._stats.get("first_error") is None:
                     # 只留第一条：整批失败时它们通常是同一个原因，留一条就够判案，
                     # 且 403 这类异常的 repr 里裹着整个响应头（几千字符），必须截断
@@ -1150,6 +1233,11 @@ class BaseAgent:
         with self._stats_lock:
             self._stats["cache_hits"] += 1
 
+    def _note_retry(self) -> None:
+        """记一次“决定重发”（含最终成功的那几次），不改变 roundtrips/failed 口径"""
+        with self._stats_lock:
+            self._stats["retries"] += 1
+
     def stats(self) -> dict:
         """本次跑批的调用统计（跑批入口收尾汇总用）：往返数、失败数、缓存命中数
 
@@ -1165,6 +1253,10 @@ class BaseAgent:
         budget_exceeded（因超预算而没发出的请求数）。拿它们与有效句对数一起看，才能算出
         「每个唯一且可用句对的成本」——只比「往返数」时，不同模式的口径并不可比
         （deep 的子 agent 往返不在主 agent 的 messages 里，见 _invoke）。
+
+        retries 是超时/连接/限流/5xx 的重发次数（含最终成功的那几次），
+        retry_exhausted 是重试用完仍失败的逻辑调用数；failed 仍按**逻辑调用**计数，
+        不把每次补发都算成一条新失败。
         """
         with self._stats_lock:
             stats = dict(self._stats)
@@ -2257,6 +2349,12 @@ def build_agents(
     """
     overrides = overrides or {}
     batch_budget = BatchRequestBudget(batch_max_requests)
+    request_policy = getattr(agent_factory, "request_policy", None)
+    retry_policy = (
+        request_policy(model_key)
+        if llm and request_policy is not None
+        else {"max_retries": 0}
+    )
     return AgentSet(
         (
             name,
@@ -2267,6 +2365,7 @@ def build_agents(
                 corpus_type=corpus_type,
                 max_requests=max_requests,
                 batch_budget=batch_budget,
+                retry_policy=retry_policy,
                 **overrides.get(name, {}),
             ),
         )

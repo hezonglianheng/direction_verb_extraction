@@ -75,6 +75,15 @@ group）标明这是第几个待选句、改的是句内哪个位置（一条记
     .venv/bin/python spatial_runner.py --corpus-type 趋向动词 --limit 20   # 换语料类型（别名 direction 也行）
     .venv/bin/python spatial_runner.py --corpus results/direction_corpus.jsonl --corpus-type 趋向动词 --limit 20
     .venv/bin/python spatial_runner.py --corpus-type 趋向动词 --alter-rules <路径> --limit 5   # 换改写的表
+    .venv/bin/python spatial_runner.py --models model-a model-b --workers 4   # 多模型加权投票
+
+多模型投票（--models）：
+    每个模型独立跑完整张图，原始结果写到 ``<输出主干>.models/00_<模型>.jsonl``；
+    最终投票结果写到 ``--out-file`` 指定的文件，记录形状与单模型一致，另带 voting 块。
+    模型配置里的 ``voting_weight`` 是票数（缺省 1，必须 >= 1）；加权得分唯一最高的标签
+    被采纳，最高分并列即平票，该条 status=discarded、admission 转人工复核。
+    各模型并行执行（--model-workers，0 = 全部并行），每个模型内部仍按 --workers 并发；
+    LTP 预填充是模型无关的，整批只做一次。
 
 四张配置表（改写规则 / 语义特征类别 / schema / 判定）**按语料类型分两组**存放在
 config_files/localization/（方位词）与 config_files/direction/（趋向动词）下，文件名相同；
@@ -87,17 +96,21 @@ config_files/localization/（方位词）与 config_files/direction/（趋向动
 
 import argparse
 import json
+import os
+import tempfile
 import threading
 import time
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+import agents as agent_factory
 import config
 import file_paths
 import spatial_agents as sa
 import spatial_graphs as sg
 import spatial_tools as st
+import voting
 
 _PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_CORPUS = _PROJECT_ROOT / "results" / st.CORPUS_TYPE_CORPORA[st.DEFAULT_CORPUS_TYPE]
@@ -140,8 +153,11 @@ class ResultWriter:
         overwrite: bool = False,
         input_records: int = 0,
         expanded_states: int = 0,
+        progress_prefix: str = "",
     ):
         self.model_name = model_name
+        self.progress_prefix = progress_prefix
+        """进度行的前缀；多模型并行时各 writer 用它区分 [模型名]，单模型保持空串"""
         self.overwrite = bool(overwrite)
         """本次是否显式允许覆盖已有输出（--overwrite）；默认**拒绝**（见 __init__ 里的检查）"""
         self.input_records = int(input_records)
@@ -180,6 +196,12 @@ class ResultWriter:
         由驱动按图与开关传入（--no-pairs-csv 关掉，非 pair 图本就传空）——writer 不认识图，
         也不该认识，收尾只照这份列序把已排序的记录导成同名 .csv（见 finish）。
         """
+        self.extra_summary: dict = {}
+        """调用方补写的汇总字段（多模型投票的 voting / models 块）
+
+        由 main 在收尾前写入；finish 把它并进 .summary.json。单模型时为空，
+        所以原有汇总形状与字段顺序不变。
+        """
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         # 拒绝覆盖已有输出（E1）：判断发生在**首次写入之前**——本构造是跑批里第一个碰输出
@@ -206,7 +228,7 @@ class ResultWriter:
             self.count += 1
             self.tally(record, self.counters)
             if self.count % 10 == 0:
-                print(f"  已写出 {self.count} 条", flush=True)
+                print(f"  {self.progress_prefix}已写出 {self.count} 条", flush=True)
 
     def _sort_records(self) -> list[dict]:
         """把已落盘的 jsonl 按 (line_no, candidate.index) 重排（键见 sg.record_order_key）
@@ -231,9 +253,19 @@ class ResultWriter:
             # 条数对不上说明文件被中途截断或人工拼接改过；仍照常排，只当场说清楚
             print(f"警告：输出文件里有 {len(records)} 条，本次记录数为 {self.count}，请核对该文件")
         records.sort(key=sg.record_order_key)  # 稳定排序；键由构造保证唯一
-        tmp = self.path.with_name(self.path.name + ".sorting")
-        st.write_jsonl(records, tmp)  # 复用唯一一份 jsonl 写法
-        tmp.replace(self.path)  # Path.replace = os.replace，原子替换
+        # 临时文件用 mkstemp 生成唯一名字，不再用确定的 `<输出>.sorting`：
+        # 那个名字理论上可能正好是输入文件（或输入文件的别名），直接写会覆盖原始语料，
+        # 且不受 --overwrite 控制。mkstemp 在目标同目录创建，replace 仍是原子的。
+        fd, temp_name = tempfile.mkstemp(
+            dir=self.path.parent, prefix=f".{self.path.name}.", suffix=".sorting.tmp"
+        )
+        os.close(fd)
+        tmp = Path(temp_name)
+        try:
+            st.write_jsonl(records, tmp)  # 复用唯一一份 jsonl 写法
+            tmp.replace(self.path)  # Path.replace = os.replace，原子替换
+        finally:
+            tmp.unlink(missing_ok=True)
         print(f"  输出已按 (line_no, candidate.index) 排序（{len(records)} 条）", flush=True)
         return records
 
@@ -277,6 +309,7 @@ class ResultWriter:
             "elapsed_seconds": round(time.time() - self.started_at, 1),
             **{name: dict(counter) for name, counter in self.counters.items()},
             "model_name": self.model_name,
+            **self.extra_summary,
         }
         summary_path = self.path.with_suffix(".summary.json")
         summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -356,7 +389,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--limit", type=int, default=100, help="最多处理多少条记录")
     parser.add_argument("--offset", type=int, default=0, help="跳过前多少条记录")
-    parser.add_argument("--model", default=DEFAULT_MODEL, help="model_config/api_keys.json 里的配置名")
+    model_group = parser.add_mutually_exclusive_group()
+    model_group.add_argument("--model", default=DEFAULT_MODEL, help="model_config/api_keys.json 里的配置名（单模型模式）")
+    model_group.add_argument(
+        "--models",
+        nargs="+",
+        default=None,
+        metavar="配置名",
+        help="多模型投票模式：指定 model_config/api_keys.json 里的多个配置名。"
+        "每个模型独立跑完整张图（各自的 agent、缓存与原始结果），再按 voting_weight "
+        "对每条候选做加权简单多数；平票记为 discarded。只给一个名字时等价于 --model。"
+        "不能与 --no-llm 同用（投票必须有模型判定）",
+    )
+    parser.add_argument(
+        "--model-workers",
+        type=int,
+        default=config.VOTING_MODEL_WORKERS,
+        help=f"多模型投票时同时跑几个模型（默认 {config.VOTING_MODEL_WORKERS}，0 = 全部并行）。"
+        "每个模型内部仍按 --workers 并发处理记录，总线程数约为两者相乘",
+    )
     parser.add_argument("--workers", type=int, default=1, help="并发处理的记录数（LLM 调用是 IO 密集）")
     parser.add_argument(
         "--no-llm",
@@ -481,6 +532,8 @@ def _print_agent_stats(stats: dict[str, dict]) -> None:
         if item.get("budget_exceeded"):
             budget += item["budget_exceeded"]
             part += f"／{item['budget_exceeded']} 次超预算未发"
+        if item.get("retries"):
+            part += f"／{item['retries']} 次重试"
         parts.append(part + f"／{item['cache_hits']} 次命中")
     total = sum(item["roundtrips"] for item in stats.values())
     failed = sum(item.get("failed", 0) for item in stats.values())
@@ -531,7 +584,7 @@ def _prefill(records: list[dict], agents, spec: sg.GraphSpec) -> None:
         )
 
 
-def _prefill_reality(records: list[dict], agents, spec: sg.GraphSpec, workers: int) -> dict:
+def _prefill_reality(records: list[dict], agents, spec: sg.GraphSpec, workers: int, *, verbose: bool = True) -> dict:
     """跑批前把闸门要判的原句一次判完（去重），随后节点按 message 读缓存
 
     与 _prefill 同一套路、同一个理由：同一件判定的重复请求应当在进线程池之前去掉。闸门判的
@@ -557,7 +610,8 @@ def _prefill_reality(records: list[dict], agents, spec: sg.GraphSpec, workers: i
         line += f"；其中 {stat['failed']} 次失败未入缓存，会在各自候选上重试"
     if stat["skipped"]:
         line += f"；另有 {stat['skipped']} 个状态没有可判的原句/关注词，未发出"
-    print(line)
+    if verbose:
+        print(line)
     return stat
 
 
@@ -591,12 +645,387 @@ def _validate_run_outputs(
     )
 
 
+def _build_overrides(args, spec: sg.GraphSpec) -> dict[str, dict]:
+    """命令行里会影响 agent 构造的注入项（--alter-rules / --feature-deep）
+
+    与具体模型无关，多模型时每个模型各建一份同口径的 agent。
+    """
+    overrides: dict[str, dict] = {}
+    if args.alter_rules:
+        overrides["alter"] = {"rules": st.load_alter_rules(args.alter_rules), "rules_path": args.alter_rules}
+    if args.feature_deep and "feature" in spec.needs:
+        overrides.setdefault("feature", {})["deep"] = True
+    return overrides
+
+
+def _build_model_agents(args, spec: sg.GraphSpec, corpus_type: str, model_key: str, overrides: dict[str, dict]):
+    """按模型建一套 agent 并预热：配置错在启动时就报，不留给线程池去抢着建"""
+    agents = sa.build_agents(
+        spec.needs,
+        model_key=model_key,
+        llm=not args.no_llm,
+        overrides=overrides,
+        corpus_type=corpus_type,
+        # 请求预算（A3）：两条上限各取 config，命令行给了就以命令行为准
+        max_requests=config.CANDIDATE_MAX_REQUESTS if args.max_requests is None else args.max_requests,
+        batch_max_requests=(
+            config.BATCH_MAX_REQUESTS
+            if args.batch_max_requests is None
+            else args.batch_max_requests
+        ),
+    )
+    for agent in agents.values():
+        agent.warm()
+    return agents
+
+
+def _execute_run(
+    args,
+    spec: sg.GraphSpec,
+    corpus_type: str,
+    corpus_path,
+    records: list[dict],
+    agents,
+    out_path: str | Path,
+    *,
+    model_key: str,
+    prefill_ltp: bool = True,
+    verbose: bool = True,
+) -> dict:
+    """用一套已建好的 agent 跑完整张图并落盘
+
+    单模型与多模型的单模型分支共用这一段；多模型模式下 verbose=False（各模型的启动打印
+    由协调层统一出，避免几个线程的日志交错），prefill_ltp=False（LTP 是模型无关的，
+    整批只在协调层预填充一次）。
+    """
+    out_path = Path(out_path)
+    csv_columns = spec.csv_columns if not args.no_pairs_csv else ()
+    writer = ResultWriter(
+        out_path,
+        counter_names=spec.counter_names,
+        tally=spec.tally,
+        corpus_type=corpus_type,
+        config_tables=_config_tables(agents),
+        # 成对信息 csv：默认导出（--no-pairs-csv 关），列序由图给（只有 pair 图有）
+        csv_columns=csv_columns,
+        model_name=model_key if not args.no_llm else None,
+        overwrite=args.overwrite,
+        progress_prefix="" if verbose else f"[{model_key}] ",
+    )
+    graph = spec.build(agents, writer)
+    # 实际生效的请求策略（超时/重试/退避）写进汇总：事后看到某轮特别慢，
+    # 能直接判断是模型慢还是重试多，不必翻 config.py 与模型配置去猜
+    first_agent = next(iter(agents.values()), None)
+    policy = getattr(first_agent, "retry_policy", None)
+    if policy:
+        writer.extra_summary["request_policy"] = dict(policy)
+
+    if verbose:
+        print(f"输入语料：{corpus_path}（{len(records)} 条）")
+        print(f"输出文件：{out_path}")
+        print(f"图：{spec.name}（{spec.doc}）")
+        print("agent：" + "；".join(agent.describe() for agent in agents.values()))
+        # 逐张打印本次实际读的配置表（含 --alter-rules 换过的那张）：缺表/空表当场说清楚。
+        # 「表为空 → 一条都不改写却不提示」曾是最容易误读成「代码没接上」的情形，这一块就是
+        # 把「配置缺内容」与「代码有问题」分开的地方
+        _print_config_tables(agents)
+        # 关注词表推得出来吗：推不出来（筛选配置改名、取词表的前缀对不上）就该在这里报，
+        # 而不是等每条记录都静默回落成 match_tree[0]
+        print("关注词表：" + "；".join(f"{kind} {len(words)} 个" for kind, words in st.load_focus_vocab().items()))
+        if args.no_pairs_csv:
+            print("成对信息 csv：本次不导出（--no-pairs-csv）")
+        elif spec.csv_columns:
+            print(f"成对信息 csv：收尾导出到 {st.pairs_csv_path(out_path)}（--no-pairs-csv 可关）")
+        else:
+            # 非 pair 图的记录里没有成对字段：默认开着也导不出东西，说清楚而不是静悄悄少一个产物
+            print(f"提示：本图（{spec.name}）的记录不是成对形状，没有可导出的成对列，本次不导 csv")
+
+    if not args.no_llm:
+        if prefill_ltp:
+            _prefill(records, agents, spec)
+        # 闸门的原句在这里一次判完（去重）。图已经建好——接线错在花钱之前就报出来，于是这份
+        # 去重账补写到 writer 上，与语料类型、配置表一并进汇总（见 ResultWriter.reality_prefill）
+        writer.reality_prefill = _prefill_reality(records, agents, spec, args.workers, verbose=verbose)
+
+    # 一条语料的每个目标词位置各能改出好几个待选句，每个待选句一个状态、一条记录，
+    # 所以状态数一般多于语料条数
+    states = spec.init_states(records, agents, str(out_path))
+    if verbose:
+        print(f"展开待选句：{len(records)} 条语料 → {len(states)} 个状态（每个状态落一条记录）")
+    # 转化链的两个分母（D5）补写到 writer 上、进汇总（与 reality_prefill / agent_stats 同一套路）
+    writer.input_records = len(records)
+    writer.expanded_states = len(states)
+    started = time.time()
+
+    def run_state(state):
+        # 一条状态 = 一条候选，候选预算在这个作用域内累计（见 AgentSet.budget_scope）；
+        # 作用域按线程隔离，--workers N 下各条候选互不串账
+        with agents.budget_scope():
+            return graph.invoke(state, {"recursion_limit": 60})
+
+    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+        # 结果已在 save 节点落盘，这里只需驱动跑完；map 按输入顺序产出，异常会在此处抛出
+        for _ in pool.map(run_state, states):
+            pass
+
+    # 各 agent 的调用账（往返数、重试数与缓存命中数）：跑完才齐，收尾补写到 writer 上、进汇总
+    writer.agent_stats = {name: agent.stats() for name, agent in agents.items()}
+    summary = writer.finish()
+    if verbose:
+        print(
+            f"\n完成 {summary['count']} 条记录（{len(records)} 条语料），用时 {summary['elapsed_seconds']} 秒"
+            f"（总耗时 {round(time.time() - started, 1)} 秒）"
+        )
+        for name in spec.counter_names:
+            print(f"{name}：{summary[name]}")
+        _print_admission(summary)
+        _print_agent_stats(writer.agent_stats)
+        print(f"汇总文件：{summary['summary_file']}")
+    return {"summary": summary, "writer": writer, "states": states}
+
+
+def _run_single_model(args, spec, corpus_type, corpus_path, records, out_path: Path, model_key: str) -> dict:
+    """原有单模型路径：行为、输出文件与汇总形状保持不变"""
+    overrides = _build_overrides(args, spec)
+    agents = _build_model_agents(args, spec, corpus_type, model_key, overrides)
+    csv_columns = spec.csv_columns if not args.no_pairs_csv else ()
+    _validate_run_outputs(corpus_path, out_path, csv_columns=csv_columns, overwrite=args.overwrite)
+    return _execute_run(
+        args,
+        spec,
+        corpus_type,
+        corpus_path,
+        records,
+        agents,
+        out_path,
+        model_key=model_key,
+        prefill_ltp=True,
+        verbose=True,
+    )
+
+
+def _run_multi_model(
+    args,
+    spec,
+    corpus_type,
+    corpus_path,
+    records: list[dict],
+    out_path: Path,
+    model_names: list[str],
+    weights: dict[str, int],
+) -> dict:
+    """多模型投票：每个模型独立跑完整张图，再逐候选加权投票
+
+    并行边界在**模型**这一层：模型之间互不共享 agent、缓存与 writer；
+    每个模型内部仍按 --workers 并发跑候选。原始结果各写自己的文件，
+    最终投票结果写用户 --out-file 指定的那一个，下游读取方式与单模型一致。
+    """
+    if args.model_workers < 0:
+        raise SystemExit("错误：--model-workers 不能为负数")
+    model_workers = args.model_workers or len(model_names)
+    raw_dir, raw_paths = voting.model_output_paths(out_path, model_names)
+    csv_columns = spec.csv_columns if not args.no_pairs_csv else ()
+    voting_csv_columns = csv_columns
+    if csv_columns:
+        # 最终 csv 在原有的成对列后追加投票审计列；原始各模型的 csv 仍用原列序
+        voting_csv_columns = csv_columns + (
+            ("投票状态", "voting.status"),
+            ("获胜标签", "voting.winner_label"),
+            ("获胜模型", "voting.winner_model"),
+            ("有效权重", "voting.valid_weight"),
+            ("配置权重", "voting.configured_weight"),
+            ("缺票模型", "voting.missing_models"),
+        )
+
+    # 所有输出（最终投票文件 + 各模型原始文件及其 csv/summary）放进同一张清单，
+    # 一次检查输入/输出别名与已有文件：分开逐组检查看不出“最终文件”和某个原始文件
+    # 其实是同一个硬链接/软链接的情况。
+    outputs: list[Path] = [out_path]
+    if csv_columns:
+        outputs.append(st.pairs_csv_path(out_path))
+    outputs.append(out_path.with_suffix(".summary.json"))
+    for raw_path in raw_paths.values():
+        outputs.append(raw_path)
+        if csv_columns:
+            outputs.append(st.pairs_csv_path(raw_path))
+        outputs.append(raw_path.with_suffix(".summary.json"))
+    file_paths.validate_output_paths([corpus_path], outputs)
+    if not args.overwrite:
+        for output in outputs:
+            if output.exists():
+                raise ValueError(
+                    f"输出文件 {output} 已存在（默认拒绝覆盖，免得混入历史记录与重复 id）；"
+                    "请换一个输出路径，或显式加 --overwrite 覆盖它"
+                )
+
+    print(f"多模型投票：{len(model_names)} 个模型（权重 " + "，".join(f"{n}={weights[n]}" for n in model_names) + "）")
+    print(f"最终输出：{out_path}")
+    print(f"各模型原始结果：{raw_dir}/")
+    print(f"模型并发：{model_workers}；每个模型内部 --workers={max(1, args.workers)}")
+
+    overrides = _build_overrides(args, spec)
+    agents_by_model = {}
+    for name in model_names:
+        print(f"  准备模型 {name}（voting_weight={weights[name]}）")
+        agents_by_model[name] = _build_model_agents(args, spec, corpus_type, name, overrides)
+
+    first_agents = agents_by_model[model_names[0]]
+    _print_config_tables(first_agents)
+    print("关注词表：" + "；".join(f"{kind} {len(words)} 个" for kind, words in st.load_focus_vocab().items()))
+    if args.no_pairs_csv:
+        print("成对信息 csv：本次不导出（--no-pairs-csv）")
+    elif spec.csv_columns:
+        print(f"成对信息 csv：收尾导出到 {st.pairs_csv_path(out_path)}（--no-pairs-csv 可关）")
+    else:
+        print(f"提示：本图（{spec.name}）的记录不是成对形状，没有可导出的成对列，本次不导 csv")
+
+    # LTP 是模型无关的：整批只预填充一次，避免几个模型线程重复做同一批句法分析
+    if not args.no_llm:
+        _prefill(records, first_agents, spec)
+
+    started = time.time()
+    results: dict[str, dict] = {}
+    errors: list[tuple[str, BaseException]] = []
+    with ThreadPoolExecutor(max_workers=max(1, model_workers)) as pool:
+        futures = {
+            pool.submit(
+                _execute_run,
+                args,
+                spec,
+                corpus_type,
+                corpus_path,
+                records,
+                agents_by_model[name],
+                raw_paths[name],
+                model_key=name,
+                prefill_ltp=False,
+                verbose=False,
+            ): name
+            for name in model_names
+        }
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                results[name] = future.result()
+                print(f"[{name}] 完成 {results[name]['summary']['count']} 条，"
+                      f"用时 {results[name]['summary']['elapsed_seconds']} 秒")
+            except BaseException as exc:  # 先收集，等其余模型收尾后再抛
+                errors.append((name, exc))
+                print(f"[{name}] 失败：{exc!r}")
+    if errors:
+        failed_model, exc = errors[0]
+        raise RuntimeError(f"多模型投票中模型 {failed_model} 运行失败：{exc!r}") from exc
+
+    model_records = {}
+    for name in model_names:
+        path = raw_paths[name]
+        if not path.exists():
+            raise RuntimeError(f"模型 {name} 没有产出结果文件：{path}")
+        model_records[name] = st.read_jsonl(path)
+
+    final_records = voting.combine_model_records(
+        spec.name,
+        model_records,
+        weights,
+        model_names,
+        output_file=out_path,
+    )
+    if not final_records:
+        print("警告：所有模型都没有产出可投票的记录，未生成最终结果")
+        return {}
+
+    voting_writer = ResultWriter(
+        out_path,
+        counter_names=spec.counter_names,
+        tally=spec.tally,
+        corpus_type=corpus_type,
+        config_tables=_config_tables(first_agents),
+        csv_columns=voting_csv_columns,
+        model_name="voting",
+        overwrite=args.overwrite,
+        input_records=len(records),
+        expanded_states=len(results[model_names[0]]["states"]),
+        progress_prefix="[voting] ",
+    )
+    voting_writer.extra_summary = {
+        "voting": voting.summarize_voting(final_records),
+        "model_names": list(model_names),
+        "voting_weights": dict(weights),
+        "models": [
+            {
+                "name": name,
+                "weight": weights[name],
+                "output_file": str(raw_paths[name]),
+                "count": results[name]["summary"]["count"],
+                "elapsed_seconds": results[name]["summary"]["elapsed_seconds"],
+                "agent_stats": results[name]["writer"].agent_stats,
+                "reality_prefill": results[name]["writer"].reality_prefill,
+                "request_policy": results[name]["writer"].extra_summary.get("request_policy"),
+            }
+            for name in model_names
+        ],
+    }
+    for record in final_records:
+        voting_writer.write(record)
+    summary = voting_writer.finish()
+
+    print(
+        f"\n完成 {summary['count']} 条最终记录（{len(records)} 条语料），"
+        f"用时 {summary['elapsed_seconds']} 秒（总耗时 {round(time.time() - started, 1)} 秒）"
+    )
+    for name in model_names:
+        stats = results[name]["writer"].agent_stats
+        roundtrips = sum(item.get("roundtrips", 0) for item in stats.values())
+        failed = sum(item.get("failed", 0) for item in stats.values())
+        retries = sum(item.get("retries", 0) for item in stats.values())
+        print(
+            f"  模型 {name}（权重 {weights[name]}）：{roundtrips} 次往返"
+            + (f"／{failed} 次失败" if failed else "")
+            + (f"／{retries} 次重试" if retries else "")
+        )
+    vote_stats = summary["voting"]
+    print(
+        f"投票：采纳 {vote_stats['accepted']} 条，舍弃 {vote_stats['discarded']} 条"
+        f"（平票 {vote_stats['tie']}，无有效票 {vote_stats['no_valid_votes']}）；"
+        f"不完整 {vote_stats['incomplete']} 条"
+    )
+    if vote_stats["labels"]:
+        print("  采纳标签：" + "，".join(f"{k} {v}" for k, v in vote_stats["labels"].items()))
+    if vote_stats["missing_by_model"]:
+        print("  缺票模型：" + "，".join(f"{k} {v} 条" for k, v in vote_stats["missing_by_model"].items()))
+    for name in spec.counter_names:
+        print(f"{name}：{summary[name]}")
+    _print_admission(summary)
+    print(f"汇总文件：{summary['summary_file']}")
+    return summary
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
 
     if args.list_graphs:
         _print_graphs()
         return
+
+    selected_models = list(args.models) if args.models else [args.model]
+    if len(set(selected_models)) != len(selected_models):
+        raise SystemExit("错误：--models 里有重复的模型配置名")
+    multi_model = len(selected_models) > 1
+    if args.models and not multi_model:
+        print(f"提示：--models 只给了一个模型（{selected_models[0]}），按单模型模式运行")
+    if multi_model and args.no_llm:
+        raise SystemExit("错误：--models 多模型投票必须有模型判定，不能与 --no-llm 同用")
+
+    # 权重在花钱之前校验完：写错一个字段就当场退出，而不是跑完几个模型才发现权重没生效。
+    # 单模型不读模型配置：--no-llm 的用途之一就是在没有 api_keys.json 的机器上验纯规则，
+    # 这里不能因为一个用不到的投票权重把那条路堵死。
+    weights: dict[str, int] = {}
+    if multi_model:
+        for name in selected_models:
+            cfg = agent_factory.load_model_config(name)
+            weights[name] = voting.normalize_weight(
+                cfg.get(voting.VOTING_WEIGHT_FIELD), model_name=name
+            )
 
     # args.corpus_type 已被 argparse 规范化（None 仍是 None），这里才落默认值：
     # 落到 None 上就分不清「没指定」与「显式指定方位词」，启动打印要说出类型是哪来的
@@ -616,110 +1045,17 @@ def main(argv: list[str] | None = None) -> None:
         print(f"没有从 {corpus_path} 读到记录")
         return
 
-    # --alter-rules 换的是改写那张表，走的是 build_agents 的注入通道（见 spatial_agents.AlterAgent）。
-    # 不给就由 AlterAgent 自己按语料类型取本组的那张（config_files/<类型目录>/alter_rules.json5）。
-    # --feature-deep 同理：注入 FeatureAgent.deep，默认那条单次调用的路一个字不改
-    overrides: dict[str, dict] = {}
-    if args.alter_rules:
-        overrides["alter"] = {"rules": st.load_alter_rules(args.alter_rules), "rules_path": args.alter_rules}
-    if args.feature_deep:
-        if "feature" not in spec.needs:
-            # 图不建 feature agent，这个开关就无从生效；静默忽略会让人以为 deep 跑过了
-            print(f"提示：--feature-deep 对本图（{spec.name}）无效——它不建 feature agent")
-        else:
-            overrides.setdefault("feature", {})["deep"] = True
-    agents = sa.build_agents(
-        spec.needs,
-        model_key=args.model,
-        llm=not args.no_llm,
-        overrides=overrides,
-        corpus_type=corpus_type,
-        # 请求预算（A3）：两条上限各取 config，命令行给了就以命令行为准
-        max_requests=config.CANDIDATE_MAX_REQUESTS if args.max_requests is None else args.max_requests,
-        batch_max_requests=(
-            config.BATCH_MAX_REQUESTS
-            if args.batch_max_requests is None
-            else args.batch_max_requests
-        ),
-    )
-    for agent in agents.values():
-        # 配置错在启动时就报，别留给多线程去抢着建（deep agent 尤其贵）
-        agent.warm()
+    if args.feature_deep and "feature" not in spec.needs:
+        # 图不建 feature agent，这个开关就无从生效；静默忽略会让人以为 deep 跑过了
+        print(f"提示：--feature-deep 对本图（{spec.name}）无效——它不建 feature agent")
 
     out_dir = Path(args.out_dir) if args.out_dir else _PROJECT_ROOT / "results" / spec.prefix
     out_path = Path(args.out_file) if args.out_file else st.build_output_path(out_dir, prefix=spec.prefix)
-    csv_columns = spec.csv_columns if not args.no_pairs_csv else ()
-    _validate_run_outputs(corpus_path, out_path, csv_columns=csv_columns, overwrite=args.overwrite)
-    writer = ResultWriter(
-        out_path,
-        counter_names=spec.counter_names,
-        tally=spec.tally,
-        corpus_type=corpus_type,
-        config_tables=_config_tables(agents),
-        # 成对信息 csv：默认导出（--no-pairs-csv 关），列序由图给（只有 pair 图有）
-        csv_columns=csv_columns,
-        model_name=args.model if not args.no_llm else None,
-        overwrite=args.overwrite,
-    )
-    graph = spec.build(agents, writer)
 
-    print(f"输入语料：{corpus_path}（{len(records)} 条）")
-    print(f"输出文件：{out_path}")
-    print(f"图：{spec.name}（{spec.doc}）")
-    print("agent：" + "；".join(agent.describe() for agent in agents.values()))
-    # 逐张打印本次实际读的配置表（含 --alter-rules 换过的那张）：缺表/空表当场说清楚。
-    # 「表为空 → 一条都不改写却不提示」曾是最容易误读成「代码没接上」的情形，这一块就是
-    # 把「配置缺内容」与「代码有问题」分开的地方
-    _print_config_tables(agents)
-    # 关注词表推得出来吗：推不出来（筛选配置改名、取词表的前缀对不上）就该在这里报，
-    # 而不是等每条记录都静默回落成 match_tree[0]
-    print("关注词表：" + "；".join(f"{kind} {len(words)} 个" for kind, words in st.load_focus_vocab().items()))
-    if args.no_pairs_csv:
-        print("成对信息 csv：本次不导出（--no-pairs-csv）")
-    elif spec.csv_columns:
-        print(f"成对信息 csv：收尾导出到 {st.pairs_csv_path(out_path)}（--no-pairs-csv 可关）")
+    if multi_model:
+        _run_multi_model(args, spec, corpus_type, corpus_path, records, out_path, selected_models, weights)
     else:
-        # 非 pair 图的记录里没有成对字段：默认开着也导不出东西，说清楚而不是静悄悄少一个产物
-        print(f"提示：本图（{spec.name}）的记录不是成对形状，没有可导出的成对列，本次不导 csv")
-
-    if not args.no_llm:
-        _prefill(records, agents, spec)
-        # 闸门的原句在这里一次判完（去重）。图已经建好——接线错在花钱之前就报出来，于是这份
-        # 去重账补写到 writer 上，与语料类型、配置表一并进汇总（见 ResultWriter.reality_prefill）
-        writer.reality_prefill = _prefill_reality(records, agents, spec, args.workers)
-
-    # 一条语料的每个目标词位置各能改出好几个待选句，每个待选句一个状态、一条记录，
-    # 所以状态数一般多于语料条数
-    states = spec.init_states(records, agents, str(out_path))
-    print(f"展开待选句：{len(records)} 条语料 → {len(states)} 个状态（每个状态落一条记录）")
-    # 转化链的两个分母（D5）补写到 writer 上、进汇总（与 reality_prefill / agent_stats 同一套路）
-    writer.input_records = len(records)
-    writer.expanded_states = len(states)
-    started = time.time()
-
-    def run_state(state):
-        # 一条状态 = 一条候选，候选预算在这个作用域内累计（见 AgentSet.budget_scope）；
-        # 作用域按线程隔离，--workers N 下各条候选互不串账
-        with agents.budget_scope():
-            return graph.invoke(state, {"recursion_limit": 60})
-
-    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
-        # 结果已在 save 节点落盘，这里只需驱动跑完；map 按输入顺序产出，异常会在此处抛出
-        for _ in pool.map(run_state, states):
-            pass
-
-    # 各 agent 的调用账（往返数与缓存命中数）：跑完才齐，收尾补写到 writer 上、进汇总
-    writer.agent_stats = {name: agent.stats() for name, agent in agents.items()}
-    summary = writer.finish()
-    print(
-        f"\n完成 {summary['count']} 条记录（{len(records)} 条语料），用时 {summary['elapsed_seconds']} 秒"
-        f"（总耗时 {round(time.time() - started, 1)} 秒）"
-    )
-    for name in spec.counter_names:
-        print(f"{name}：{summary[name]}")
-    _print_admission(summary)
-    _print_agent_stats(writer.agent_stats)
-    print(f"汇总文件：{summary['summary_file']}")
+        _run_single_model(args, spec, corpus_type, corpus_path, records, out_path, selected_models[0])
 
 
 def _print_admission(summary: dict) -> None:

@@ -1,0 +1,21 @@
+{
+  "model-a": {
+    "model_name": "provider-model-a",
+    "provider": "deepseek",
+    "base_url": "https://example.invalid/v1",
+    "api_key": "REPLACE_WITH_LOCAL_SECRET",
+    "temperature": 0,
+    "timeout": 120,
+    "max_retries": 6,
+    "voting_weight": 2
+  },
+  "model-b": {
+    "model_name": "provider-model-b",
+    "provider": "deepseek",
+    "base_url": "https://example.invalid/v1",
+    "api_key": "REPLACE_WITH_LOCAL_SECRET",
+    "temperature": 0,
+    "timeout": 120,
+    "max_retries": 6
+  }
+}
