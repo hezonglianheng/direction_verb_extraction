@@ -1,20 +1,20 @@
 # encoding: utf8
 
-from ltp import StnSplit
 import jsonlines
 
 from contextlib import ExitStack
 from pathlib import Path
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import multiprocessing as mp
-import re
 from typing import Any, Iterable
 import json
 import os
+import threading
 import time
 
 import config
 import sentenceFilters
+import sentence_split
 import file_paths
 from file_paths import atomic_write_text
 
@@ -23,6 +23,10 @@ _WORKER_FILTERS: list[tuple[str, Any]] = []
 """[(规则族名, 规则过滤器)]，一个进程内同时持有多套规则"""
 
 _START_TIME = None
+
+_READ_COUNT_LOCK = threading.Lock()
+"""切句线程池会并发累加「词表初筛前读入数」，用一把模块级锁保护这一次自增"""
+
 
 ANY_HIT = "_any"
 """进度信息里表示“至少命中一套规则的句子数”的保留键"""
@@ -139,38 +143,114 @@ def _print_batch_progress(items: list[tuple[str, str | int]]) -> None:
 
 
 def get_sentences_list(article: str, vocabs: list[str] = None) -> list[str]:
-	sentences = StnSplit().split(article)
-	sentences = [s for s in sentences if config.SENTENCE_LEN_LOWER_BOUND <= len(s) <= config.SENTENCE_LEN_UPPER_BOUND]
-	sentences = [s for s in sentences if s.isascii() or re.search(r"[\u4e00-\u9fff]", s)]
-	sentences = [s for s in sentences if "【【【缺文】】】" not in s]
-	sentences = [s.strip() for s in sentences]
-	if vocabs:
-		sentences = [s for s in sentences if any(vocab in s for vocab in vocabs)]
-	# 纯空白片段在 strip 后为空串，必须剔除（旧写法 s.split()[-1] 会在此抛 IndexError）
-	return [s for s in sentences if s]
+	"""把一篇文本切成句子：句末标点 + 各种空格/不可见分隔符（规则见 sentence_split）
+
+	保留这个函数名是为了两个平台入口与既有测试继续有同一个接缝；真正的切分口径只有
+	sentence_split.split_sentences 一处真源。
+	"""
+	return sentence_split.split_sentences(article, vocabs)
 
 
-def iter_jsonl_file_sentences(input_file: str, position: int = 0, vocabs: list[str] = None):
+def _sentences_after_vocab(sentence_list: list[str], vocabs: list[str] | None, stats: dict[str, Any] | None) -> list[str]:
+	"""统计「词表初筛前读入数」，再按初筛词表过滤
+
+	可能在线程池的多个切句线程里并发调用：统计只做一次带锁自增，过滤仍在工作线程内
+	完成，跨线程返回的只是过滤后的句子（与改动前的内存上界一致）。
+	词表过滤本身走 sentence_split 的同一份子串口径。
+	"""
+	if stats is not None:
+		with _READ_COUNT_LOCK:
+			stats["read_sentences"] = int(stats.get("read_sentences", 0)) + len(sentence_list)
+	return sentence_split.filter_by_vocab(sentence_list, vocabs)
+
+
+def _iter_article_sentences(
+	articles: Iterable[dict[str, Any]],
+	vocabs: list[str] | None,
+	workers: int,
+	stats: dict[str, Any] | None = None,
+):
+	"""按批把文章交给线程池切句，限制在途批大小，避免一次性读完整个文件
+
+	ThreadPoolExecutor.map 会先把所有输入提交出去；直接 map 整个 reader 等于把整份 JSONL
+	读进内存。这里按 ``workers * 4`` 一批提交，批间产出，内存只随这一批增长。
+
+	调用 ``get_sentences_list`` 时仍传两个位置参数（第二个为 None：先不按词表过滤），
+	既保留既有测试/外部替换的调用形状，也拿到「初筛前」句子数；词表过滤随后在同一
+	工作线程里完成。
+	"""
+	batch_size = max(1, workers * 4)
+	batch: list[dict[str, Any]] = []
+	with ThreadPoolExecutor(max_workers=workers) as pool:
+		for obj in articles:
+			batch.append(obj)
+			if len(batch) >= batch_size:
+				for sentence_list in pool.map(
+					lambda item: _sentences_after_vocab(
+						get_sentences_list(item.get("content", ""), None), vocabs, stats
+					),
+					batch,
+				):
+					yield from sentence_list
+				batch = []
+		if batch:
+			for sentence_list in pool.map(
+				lambda item: _sentences_after_vocab(
+					get_sentences_list(item.get("content", ""), None), vocabs, stats
+				),
+				batch,
+			):
+				yield from sentence_list
+
+
+def iter_jsonl_file_sentences(
+	input_file: str,
+	position: int = 0,
+	vocabs: list[str] = None,
+	*,
+	workers: int | None = None,
+	stats: dict[str, Any] | None = None,
+):
 	extracted_count = 0
+	configured = int(config.EXTRACT_WORKERS if workers is None else workers)
+	workers = max(1, configured if configured > 0 else min(8, os.cpu_count() or 1))
 	with jsonlines.open(input_file) as reader:
-		for obj in reader:
-			article: str = obj["content"]
-			sentence_list = get_sentences_list(article, vocabs)
-			for sentence in sentence_list:
-				extracted_count += 1
-				yield {"sentence": sentence, "source_file": input_file}
+		if workers == 1:
+			sentence_iter = (
+				sentence
+				for obj in reader
+				for sentence in _sentences_after_vocab(
+					get_sentences_list(obj.get("content", ""), None), vocabs, stats
+				)
+			)
+		else:
+			sentence_iter = _iter_article_sentences(reader, vocabs, workers, stats)
+		for sentence in sentence_iter:
+			extracted_count += 1
+			yield {"sentence": sentence, "source_file": input_file}
 	print(f"从文件 {input_file} 中提取了 {extracted_count} 个句子")
 
 
-def iter_path_sentences(src_path: str, vocabs: list[str] = None, *, output_paths=()):
+def iter_path_sentences(
+	src_path: str,
+	vocabs: list[str] = None,
+	*,
+	output_paths=(),
+	workers: int | None = None,
+	stats: dict[str, Any] | None = None,
+):
 	"""目录（或单文件）下的 jsonl 逐文件流式产出句子
 
 	收集与遍历走 file_paths.iter_path_sentences（与 entry_in_win 同一份，理由见那里）。
-	本入口多带一个 position=文件序号，产物里因此知道这句出自第几个输入文件。
+	本入口多带一个 position=文件序号，产物里因此知道这句出自第几个输入文件；
+	workers 透传给单文件切句的线程池（0/None 取 config.EXTRACT_WORKERS）。
+	stats 是本轮漏斗统计（见 extraction_log）：在这里透传给切句层累加「读入总数」。
 	"""
 	return file_paths.iter_path_sentences(
 		src_path,
-		lambda file, index: iter_jsonl_file_sentences(str(file), position=index, vocabs=vocabs),
+		lambda file, index: iter_jsonl_file_sentences(
+			str(file), position=index, vocabs=vocabs, workers=workers, stats=stats
+		),
 		output_paths=output_paths,
 	)
 
