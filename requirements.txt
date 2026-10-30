@@ -67,6 +67,9 @@ xxhash==4.0.1
 zstandard==0.25.0
 
 # ---- 第二层：LLM 与 agent 框架 ----
+# 方位词参照物的语义闸门：OpenHowNet 读 ~/.openhownet（首次使用需 OpenHowNet.download()）
+OpenHowNet==2.0
+anytree==2.13.0
 anthropic==1.7.0
 anyio==4.12.1
 deepagents==0.7.17
