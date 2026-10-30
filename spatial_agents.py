@@ -518,8 +518,60 @@ def corpus_type_line(corpus_type: str | None) -> str:
     return f"{CORPUS_TYPE_LABEL}：{corpus_type}。" if corpus_type else ""
 
 
+GROUNDING_LABEL = "前序步骤整理的空间角色"
+"""user message 里三元组提示那一行的开头（verify 脚本按它定位）"""
+
+
+def grounding_block(focus_word: dict | None, *, side: str = "a") -> str:
+    """把前序「目标物／参照物／动词」三元组渲染成**独立一行**（没有就返回空串）
+
+    数据来自 `spatial_tools.select_grounding`，由 `pick_focus_words` 挂在关注词上，
+    所以七个 LLM agent 与 all_in_one 只要走 head_block / pair_head_block 就自动带上，
+    不需要每个 `_content()` 各接一个参数。
+
+    几个口径：
+    - 只在本位置确实有标注时出现，**不在下游推断**；方位词与趋向动词语料都会带这个块，
+      哪一条没有就整行省略。
+    - 趋向动词可以合法地没有依附动词（独立作谓语）；此时用 ``verb_optional`` 说明
+      「无」而不是「未识别」，避免模型把它当成抽取失败。
+    - keep=False/None 也照原样带上，并写明标注状态：它是「前序已经整理出的标注」，
+      不是「已确认的事实」，让模型自己判断可信度。
+    - b 侧（改写句）照带同一份，但明确说它属于原句、改写后未重新验证；下标也属于原句。
+    - 这一行追加在 head_block 已有的关注词行与语料类型行**之后**：提示语里
+      「第一行/紧接的下一行」「第三行是语料类型」这些锚点都不会移动。
+    """
+    grounding = (focus_word or {}).get("grounding")
+    if not isinstance(grounding, dict):
+        return ""
+    target = grounding.get("target") or {}
+    reference = grounding.get("reference") or {}
+    verb = grounding.get("verb") or {}
+    target_word = target.get("word") if isinstance(target, dict) else None
+    reference_word = reference.get("word") if isinstance(reference, dict) else None
+    verb_word = verb.get("word") if isinstance(verb, dict) else None
+    if not (target_word or reference_word):
+        return ""
+    target_tail = f"（角色 {target.get('role')}）" if target.get("role") else ""
+    reference_tail = f"（{reference.get('sdp')}）" if reference.get("sdp") else ""
+    if verb_word:
+        verb_text = verb_word
+    elif grounding.get("verb_optional"):
+        verb_text = "无（趋向动词独立作谓语，允许为空）"
+    else:
+        verb_text = "未识别"
+    keep = grounding.get("keep")
+    status = "keep=true" if keep is True else "keep=false" if keep is False else "keep=未判定"
+    note = "（属于原句；改写后未重新验证）" if side == "b" else "（属于原句）"
+    ambiguous = "；同一位置有多条标注，此处取第一条" if grounding.get("ambiguous") else ""
+    return (
+        f"{GROUNDING_LABEL}{note}：目标物「{target_word or '未识别'}」{target_tail}、"
+        f"参照物「{reference_word or '未识别'}」{reference_tail}、"
+        f"动词「{verb_text}」；标注状态 {status}{ambiguous}。"
+    )
+
+
 def head_block(focus_word: dict | None, *, corpus_type: str | None = None) -> str:
-    """user message 的开头块：关注词那段（1~2 行）+ 语料类型行（有类型时）
+    """user message 的开头块：关注词那段（1~2 行）+ 语料类型行（有类型时）+ 三元组行（有标注时）
 
     关注词那句按 source 自动选措辞（见 focus_role）：语料里取来的词与改写句里换上去的词，
     在 semantic / feature / schema 三个 agent 那里都要说成对应的一侧。
@@ -536,7 +588,15 @@ def head_block(focus_word: dict | None, *, corpus_type: str | None = None) -> st
     """
     return "\n".join(
         part
-        for part in (focus_line(focus_word, role=focus_role(focus_word)), corpus_type_line(corpus_type))
+        for part in (
+            focus_line(focus_word, role=focus_role(focus_word)),
+            corpus_type_line(corpus_type),
+            # 三元组固定排在既有两行之后：第 1 行仍是关注词、第 3 行仍是语料类型
+            grounding_block(
+                focus_word,
+                side="b" if focus_role(focus_word) == FOCUS_ROLE_REPLACEMENT else "a",
+            ),
+        )
         if part
     )
 
@@ -548,7 +608,7 @@ def pair_head_block(
     corpus_type: str | None = None,
     role_a: str = FOCUS_ROLE_ORIGINAL,
 ) -> str:
-    """两侧关注词的开头块：a 侧那份 + b 侧那份 + 语料类型行（有类型时）
+    """两侧关注词的开头块：a 侧那份 + b 侧那份 + 语料类型行（有类型时）+ 三元组行（有标注时）
 
     比其余三个 agent 多一段（各 2 行 + 类型行）：这里同时拿着原句与改写句的两份关注词——原句里
     被替换掉的那个，与改写句里换上去的那个（见 st.replacement_focus_word）。第 1 行仍是关注词
@@ -562,7 +622,8 @@ def pair_head_block(
 
     两侧各自没有关注词时用 FOCUS_A_ABSENT / FOCUS_B_ABSENT 占位（原句取不到词、没走到改写、
     状态是手工拼的），**行数不变**：focus_line 对空关注词只回一行中性说明，让它顶上去整体就少一行，
-    提示语里「第一行 / 紧接着的下一行」这些锚点全错位。两份占位都写成两行，四种组合都是 5 行。
+    提示语里「第一行 / 紧接着的下一行」这些锚点全错位。两份占位都写成两行，四种组合都是 5 行；
+    有前序三元组时再追加第 6 行（grounding_block），前五行不动。
     """
     return "\n".join(
         part
@@ -574,6 +635,14 @@ def pair_head_block(
             if isinstance(focus_word_b, dict) and focus_word_b.get("word")
             else FOCUS_B_ABSENT,
             corpus_type_line(corpus_type),
+            grounding_block(
+                focus_word if (focus_word or {}).get("grounding") else focus_word_b,
+                side="a"
+                if (focus_word or {}).get("grounding")
+                else "b"
+                if focus_role(focus_word_b) == FOCUS_ROLE_REPLACEMENT
+                else "a",
+            ),
         )
         if part
     )

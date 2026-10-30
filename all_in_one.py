@@ -325,9 +325,10 @@ def build_user_message(
     第 6 行起一律走行首标签（句法证据本身是多行，不能按行号数）：
 
         1-5  pair_head_block(a, b, role_a=RECORD)（含末行「本次跑批的语料类型：方位词。」）
-        6    （空行）
-        7    原句：<sentence_a>
-        8    原句句法证据：<st.parse_sentence_text(sentence_a)>   ← 多行，--no-syntax 时整段省掉
+        6    前序步骤整理的空间角色（有标注时；没有则整行不存在）
+        7    （空行）
+        8    原句：<sentence_a>
+        9    原句句法证据：<st.syntax_text(sentence_a)>   ← 多行，--no-syntax 时整段省掉
         …    改写句：<sentence_b>
         …    改写句句法证据：<...>
         …    原句的 schema 候选：<候选名单 或 自由命名要求>

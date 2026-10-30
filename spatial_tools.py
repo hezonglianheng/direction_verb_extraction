@@ -941,6 +941,17 @@ def pick_focus_word(record: dict, vocab: dict[str, set[str]] | None = None) -> d
 def pick_focus_words(record: dict, vocab: dict[str, set[str]] | None = None) -> list[dict]:
     """这条语料里**全部**要参与改写的词，按"先改哪个"的优先序排列
 
+    公开入口：在 `_pick_focus_words` 的结果上给每个位置挂一份前序空间标注
+    （`grounding`，见 select_grounding）。挂在这里而不是各个 agent 里，是因为所有图
+    （single / pair / alter_check / synonym）与 all_in_one 都从这一个函数取关注词；
+    同一条消息的拼法因此只有一处，缓存键也自然把标注算进去。
+    """
+    return [_with_grounding(entry, record) for entry in _pick_focus_words(record, vocab)]
+
+
+def _pick_focus_words(record: dict, vocab: dict[str, set[str]] | None = None) -> list[dict]:
+    """pick_focus_words 的正身（不挂前序空间标注）
+
     与 pick_focus_word 是同一个口径的两种读法：本函数返回全部位置（一条语料里每个目标词
     各是一个位置，改写时逐位置各出一批候选），pick_focus_word 就是本函数的首元素
     ——`pick_focus_words(r)[0] == pick_focus_word(r)` 对任何记录都成立，所以老调用点的
@@ -1039,6 +1050,71 @@ def _sampled_words(record: dict) -> set[str] | None:
     return None
 
 
+GROUNDING_BLOCK_KEY = "localization_grounding"
+"""旧名保留：方位词语料的前序空间角色整理块（见 localization_grounding.apply_grounding）"""
+
+GROUNDING_BLOCK_KEYS = ("direction_grounding", "localization_grounding")
+"""两类语料的前序三元组整理块；select_grounding 依次查找
+
+块内 candidates 的每一项形如
+``{"index", "word", "keep", "reference": {"index","word","sdp"},
+   "target": {"index","word","role"}, "verb": {"index","word"} | None, ...}``。
+它就是「目标物／参照物／动词」三元组的唯一来源；没有这个块时一律省略，不在下游推断。
+"""
+
+
+def select_grounding(record: dict, index, word: str | None = None) -> dict | None:
+    """取这条记录里**本关注位置**的前序空间标注（目标物／参照物／动词）
+
+    只用 ``index``（给了 word 时再核对词形）精确匹配：同一句里同一个词可能出现两次
+    （上@3 与 上@5），按词形选会把另一个位置的标注带过来。找不到精确项时返回 None，
+    **不回落**到第一个候选——把别人的三元组当成自己的，比没有提示更坏。
+
+    不要求 keep=True：keep=False 的候选同样是「前序步骤已经整理出的标注」，
+    照原样带上并标明 keep 状态，由模型自己判断它是否可信；下游不把它当成已确认事实。
+
+    Returns:
+        dict | None: ``{"index", "word", "keep", "target", "reference", "verb",
+        "verb_optional", "ambiguous"}``；target/reference/verb 保留原 dict（含下标、角色、sdp）。
+        ``ambiguous`` 为 True 表示同一位置有多条标注，调用方应如实说明。
+    """
+    matched: list[dict] = []
+    for block_key in GROUNDING_BLOCK_KEYS:
+        block = record.get(block_key)
+        if not isinstance(block, dict):
+            continue
+        candidates = block.get("candidates")
+        if not isinstance(candidates, list):
+            continue
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            if candidate.get("index") != index:
+                continue
+            if word and candidate.get("word") and candidate.get("word") != word:
+                continue
+            matched.append(candidate)
+    if not matched:
+        return None
+    return {
+        "index": matched[0].get("index"),
+        "word": matched[0].get("word"),
+        "keep": matched[0].get("keep"),
+        "target": matched[0].get("target") or None,
+        "reference": matched[0].get("reference") or None,
+        "verb": matched[0].get("verb") or None,
+        # 趋向动词允许独立作谓语；这里把「合法无动词」与「未识别」分开交给下游措辞。
+        "verb_optional": bool(matched[0].get("verb_optional")),
+        "ambiguous": len(matched) > 1,
+    }
+
+
+def _with_grounding(entry: dict, record: dict) -> dict:
+    """给一份关注词挂上本位置的前序空间标注（没有就不加这个键）"""
+    grounding = select_grounding(record, entry.get("index"), entry.get("word"))
+    return {**entry, "grounding": grounding} if grounding is not None else entry
+
+
 FOCUS_SOURCE_ALTER = "alter"
 """关注词的来源之一：改写句那侧的关注词，由规则表换上去的那个词重算（见 replacement_focus_word）
 
@@ -1077,12 +1153,18 @@ def replacement_focus_word(
         dict: {"index", "word", "kind", "source"}，形状与 pick_focus_word 的返回值一致，
             source 固定是 FOCUS_SOURCE_ALTER
     """
-    return {
+    result = {
         "index": (focus_word or {}).get("index"),
         "word": replacement,
         "kind": focus_kind(replacement, filter_methods),
         "source": FOCUS_SOURCE_ALTER,
     }
+    # 前序空间标注属于**原句**：改写句那一侧照带一份，措辞会说明它未经改写后重新验证
+    # （见 spatial_agents.grounding_block）。不带的话 b 侧的 semantic/feature/schema
+    # 消息就少了这条提示，与「各个输入都带」的要求不一致。
+    if isinstance(focus_word, dict) and focus_word.get("grounding"):
+        result["grounding"] = focus_word["grounding"]
+    return result
 
 
 # --------------------------------------------------------------------------
