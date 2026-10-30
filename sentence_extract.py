@@ -7,6 +7,7 @@ import sys
 
 import config
 import sentenceFilters
+import sentence_screening
 from entry_in_linux import run_linux_entry
 from entry_in_win import run_windows_entry
 
@@ -133,6 +134,13 @@ def main(
     filter_config_path: str | list[str] = DEFAULT_FILTER_CONFIG,
     vocab_config_path: str | list[str] | None = None,
     out_name: str | None = None,
+    *,
+    screen_llm: bool = True,
+    screen_model: str = config.SCREEN_MODEL,
+    screen_workers: int = config.SCREEN_WORKERS,
+    screen_kind: str | None = None,
+    extract_workers: int = config.EXTRACT_WORKERS,
+    filter_workers: int = config.FILTER_WORKERS,
 ):
     """提取语料中包含指定语言现象的句子
 
@@ -142,6 +150,13 @@ def main(
         filter_config_path (str | list[str]): 一套或多套筛选规则配置文件
         vocab_config_path (str | list[str] | None): 初筛词表文件，None 表示从筛选配置自动推导
         out_name (str | None): 输出文件名（多套规则时作为前缀）
+        screen_llm (bool): 是否启用规则命中后的 LLM 筛选；提示语为空时自动跳过（不发请求）
+        screen_model (str): LLM 筛选使用的模型配置名
+        screen_workers (int): LLM 筛选的并发线程数
+        screen_kind (str | None): 强制指定词类型（方位词/趋向动词）；None = 按规则配置名推断。
+            只能用于单套规则——多套规则各有各的词类型，不能共用一个强制值
+        extract_workers (int): 文本切句的并发线程数
+        filter_workers (int): 规则筛选的进程数（0 = 自动，1 = 串行）
     """
     filter_configs = _normalize_paths(filter_config_path) or ([DEFAULT_FILTER_CONFIG] if DEFAULT_FILTER_CONFIG else [])
     vocab_configs = _normalize_paths(vocab_config_path)
@@ -168,6 +183,21 @@ def main(
     vocabs = _resolve_screen_vocab(generators, vocab_configs)
     output_paths = _resolve_output_paths(tgt_path, families, out_name)
 
+    if screen_kind and len(filter_configs) > 1:
+        raise ValueError("--screen-kind 只能用于单套规则；多套规则请让程序按各自的配置文件名推断词类型")
+
+    screeners = sentence_screening.build_screeners(
+        generators,
+        model_key=screen_model,
+        llm=screen_llm,
+        workers=screen_workers,
+        kind=screen_kind,
+    )
+    for family, screener in screeners.items():
+        print(f"[LLM 筛选计划] {family}：{screener.describe()}")
+        # 提示语已填时提前建模型：模型配置错在启动时暴露，不留给筛选线程
+        screener.warm()
+
     print(f"[筛选计划] 共 {len(filter_configs)} 套规则：")
     for config_path, output_path in zip(filter_configs, output_paths):
         print(f"    {config_path}  ->  {output_path}")
@@ -177,9 +207,27 @@ def main(
         print("[筛选计划] 未使用初筛")
 
     if sys.platform.startswith("win"):
-        run_windows_entry(src_path, filter_configs, output_paths, vocabs)
+        run_windows_entry(
+            src_path,
+            filter_configs,
+            output_paths,
+            vocabs,
+            screeners=screeners,
+            extract_workers=extract_workers,
+            filter_workers=filter_workers,
+            screen_kind=screen_kind,
+        )
     else:
-        run_linux_entry(src_path, filter_configs, output_paths, vocabs)
+        run_linux_entry(
+            src_path,
+            filter_configs,
+            output_paths,
+            vocabs,
+            screeners=screeners,
+            extract_workers=extract_workers,
+            filter_workers=filter_workers,
+            screen_kind=screen_kind,
+        )
 
 
 if __name__ == "__main__":
@@ -201,5 +249,54 @@ if __name__ == "__main__":
         "-o", "--out_name", type=str, default=None,
         help="输出文件名；只传一个 -f 时即该文件名，传多个 -f 时作为前缀（如 -o out 得到 out_规则名.jsonl）",
     )
+    parser.add_argument(
+        "--no-llm-screen",
+        action="store_true",
+        help="关闭规则命中后的 LLM 筛选。默认开启，但只有 system_prompt/screen_localization.txt "
+        "或 screen_direction.txt 填了正文时才真正调模型；提示语为空时自动跳过、记录原样输出",
+    )
+    parser.add_argument(
+        "--screen-model",
+        default=config.SCREEN_MODEL,
+        help=f"LLM 筛选使用的模型配置名（model_config/api_keys.json 里的键），默认 {config.SCREEN_MODEL}",
+    )
+    parser.add_argument(
+        "--screen-workers",
+        type=int,
+        default=config.SCREEN_WORKERS,
+        help=f"LLM 筛选的并发线程数，默认 {config.SCREEN_WORKERS}（逐词判定是 IO 密集的）",
+    )
+    parser.add_argument(
+        "--screen-kind",
+        choices=sorted(sentence_screening.SCREEN_PROMPT_FILES),
+        default=None,
+        help="强制指定筛选提示语的词类型。默认按规则配置文件名推断（localization→方位词，"
+        "direction→趋向动词）；只能用于单套规则",
+    )
+    parser.add_argument(
+        "--extract-workers",
+        type=int,
+        default=config.EXTRACT_WORKERS,
+        help=f"文本切句的并发线程数，默认 {config.EXTRACT_WORKERS}（0 = 自动）",
+    )
+    parser.add_argument(
+        "--filter-workers",
+        type=int,
+        default=config.FILTER_WORKERS,
+        help=f"规则筛选的进程数，默认 {config.FILTER_WORKERS}（0 = 自动按 CPU 核数，1 = 串行）。"
+        "多进程会各持一份 LTP 模型，单卡上通常 1 更快；需要时再调大",
+    )
     args = parser.parse_args()
-    main(args.src_path, args.tgt_path, args.filter_config_path, args.vocab_config_path, args.out_name)
+    main(
+        args.src_path,
+        args.tgt_path,
+        args.filter_config_path,
+        args.vocab_config_path,
+        args.out_name,
+        screen_llm=not args.no_llm_screen,
+        screen_model=args.screen_model,
+        screen_workers=args.screen_workers,
+        screen_kind=args.screen_kind,
+        extract_workers=args.extract_workers,
+        filter_workers=args.filter_workers,
+    )
