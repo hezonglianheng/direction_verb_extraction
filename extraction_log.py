@@ -9,7 +9,7 @@
 统计口径（与 filter_sentences_streaming 的计数点对应）：
     read_sentences     切句 + 长度/空串/字符/缺文过滤后、**词表子串初筛前**的有效句数。
                        词表初筛掉的句子仍算「读入」，只是没进入规则筛选。
-    program_selected   规则引擎命中、再经过方位词语义闸门后、**送 LLM 前**的句子数；
+    program_selected   规则引擎命中、再经过方位词/趋向动词语义闸门后、**送 LLM 前**的句子数；
                        多套规则同时命中同一句时按句去重（用批内 _corpus_row_id）。
     corpus_written     实际落盘的语料数；false/error/limit/no_llm 也全部落盘。
     llm_kept           可用于判定工作流的句子数（LLM 判 true + 未使用 LLM）。
@@ -54,6 +54,8 @@ def new_stats() -> dict[str, Any]:
         "screening_status": {},
         "families": {},
         "grounding": {},
+        "direction_grounding": {},
+        "direction_sememe_policy": {},
     }
 
 
@@ -131,7 +133,7 @@ def render_log(
         f"输出文件: {', '.join(str(item) for item in output_paths) or '（无）'}",
         f"初筛词表词数: {int(vocab_count)}",
         "口径: 读入=切句及空串/长度/缺文过滤后、词表初筛前；"
-        "程序筛选=规则命中并过方位词语义闸门后、送 LLM 前（按句去重）；"
+        "程序筛选=规则命中并过方位词/趋向动词语义闸门后、送 LLM 前（按句去重）；"
         "所有筛选结果都落盘，false/error/limit 只标注、不进入判定工作流。",
         "",
         f"总共读入的句子数量: {read}",
@@ -182,6 +184,14 @@ def render_log(
     if grounding.get("records"):
         lines.append("")
         lines.append(f"方位词参照物语义闸门: {grounding}")
+
+    direction_grounding = stats.get("direction_grounding") or {}
+    if direction_grounding.get("records"):
+        lines.append("")
+        lines.append(f"趋向动词目标物语义闸门: {direction_grounding}")
+        policy = stats.get("direction_sememe_policy") or {}
+        if policy:
+            lines.append(f"  义原口径: {policy}")
     return "\n".join(lines) + "\n"
 
 

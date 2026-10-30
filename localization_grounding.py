@@ -977,10 +977,15 @@ def attach_analysis(
     *,
     kind: str | None,
 ) -> dict[str, Any]:
-    """把该句的 POS/DEP/SDP 附到记录上，供主进程做整理与语义闸门。
+    """按语料类型把该句的 POS/DEP/SDP 附到记录上，供主进程做整理与语义闸门。
 
-    只在方位词语料上附加。这里不导入 OpenHowNet，因此可以安全地在多进程 worker 中调用。
+    方位词写 ``_locative_analysis``，趋向动词转交 direction_grounding 写
+    ``_direction_analysis``。这里不导入 OpenHowNet，因此可以安全地在多进程 worker 中调用。
     """
+    if kind == "趋向动词":
+        import direction_grounding
+
+        return direction_grounding.attach_analysis(record, sentence, cache, kind=kind)
     if kind != "方位词" or not isinstance(sentence, str) or not sentence:
         return record
     try:
@@ -1001,16 +1006,18 @@ def prepare_families(
     classify_family,
     *,
     kind: str | None = None,
-) -> tuple[dict[str, dict[str, Any]], "PhysicalGate | None"]:
-    """为每个规则族准备词类型/方位词表，并在需要时初始化一次 OpenHowNet。
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    """为每个规则族准备词类型/目标词表，并在需要时初始化一次 OpenHowNet。
 
-    只给方位词族建闸门：趋向动词语料完全绕过，既不读词表也不加载 HowNet。
+    方位词与趋向动词各有一道语义闸门；两类同时出现时共用一个 HowNetDict，避免重复加载。
+    返回的第二个值是 ``{"localization": PhysicalGate|None, "direction": DirectionGate|None}``。
     ``kind`` 是命令行 ``--screen-kind`` 的显式覆盖，优先级高于按文件名推断。
     """
     from pathlib import Path
 
     metas: dict[str, dict[str, Any]] = {}
-    need_gate = False
+    need_locative = False
+    need_direction = False
     for path in filter_config_paths:
         family = Path(path).stem
         resolved = kind or classify_family(family)
@@ -1019,9 +1026,27 @@ def prepare_families(
             import word_sampler
 
             vocab = set(word_sampler.derive_vocab(str(path), None)[0])
-            need_gate = True
+            need_locative = True
+        elif resolved == "趋向动词":
+            import word_sampler
+
+            # 与 sentence_screening/word_sampler 同一口径：只取 direction_verb_ 前缀的
+            # 词表，避免把 accompany_/cause_/manner_ 里的搭配动词当成目标词。
+            vocab = set(word_sampler.derive_vocab(str(path), ("direction_verb_",))[0])
+            need_direction = True
         metas[family] = {"kind": resolved, "vocab": vocab}
-    return metas, (PhysicalGate() if need_gate else None)
+
+    gates: dict[str, Any] = {"localization": None, "direction": None}
+    if need_locative or need_direction:
+        hownet = None
+        if need_locative:
+            gates["localization"] = PhysicalGate()
+            hownet = gates["localization"].hownet
+        if need_direction:
+            import direction_grounding
+
+            gates["direction"] = direction_grounding.DirectionGate(hownet=hownet)
+    return metas, gates
 
 
 def gate_rows(

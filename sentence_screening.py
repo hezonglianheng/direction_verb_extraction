@@ -439,9 +439,12 @@ class SentenceScreener:
                 if isinstance(candidate, dict) and candidate.get("index") == index
             ]
             if candidates:
-                role_line = "前序步骤整理的方位角色（JSON，" + "参照物/目标物/动词）：" + json.dumps(
-                    candidates, ensure_ascii=False, sort_keys=True
-                ) + "\n"
+                role_line = (
+                    "前序步骤整理的空间角色（JSON，目标物/参照物/动词；"
+                    "趋向动词的动词允许为空）："
+                    + json.dumps(candidates, ensure_ascii=False, sort_keys=True)
+                    + "\n"
+                )
         return (
             f"本次语料类型：{self.kind}。\n"
             f"待提取的句子：{sentence}\n"
@@ -652,7 +655,8 @@ class SentenceScreener:
             sentence = _sentence_text(row)
             tree = row.get("match_tree") or []
             methods = list(row.get("filter_methods") or [])
-            grounding = row.get("localization_grounding")
+            # 两类语料各有一个前序整理块；本行只带本类型的那一块。
+            grounding = row.get("direction_grounding") or row.get("localization_grounding")
             targets = _target_nodes(row, self._vocab)
             if not targets:
                 row["screening"] = {
@@ -722,12 +726,17 @@ class SentenceScreener:
                     row.get("match_tree") or [], false_indices, true_indices | unknown_indices
                 )
                 try:
+                    import direction_grounding
                     import localization_grounding
 
+                    # 两类语料各有一个前序整理块；不存在的块会被模块内的形状检查直接跳过。
                     localization_grounding.prune_candidates(
                         row, false_indices, true_indices | unknown_indices
                     )
-                except Exception:  # noqa: BLE001 —— 定位整理块缺失/形状异常不影响筛选主流程
+                    direction_grounding.prune_candidates(
+                        row, false_indices, true_indices | unknown_indices
+                    )
+                except Exception:  # noqa: BLE001 —— 整理块缺失/形状异常不影响筛选主流程
                     pass
             self._note_record_status(status)
             kept.append(row)

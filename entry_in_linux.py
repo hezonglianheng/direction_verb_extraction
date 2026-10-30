@@ -13,6 +13,7 @@ import threading
 import time
 
 import config
+import direction_grounding
 import extraction_log
 import localization_grounding
 import sentenceFilters
@@ -321,18 +322,23 @@ def filter_sentences_streaming(
 		if screeners and family in screeners:
 			print(f"[LLM 筛选] {screeners[family].describe()}")
 
-	# 方位词族先备好词表与 OpenHowNet 闸门；趋向动词族完全不加载 HowNet。
-	family_meta, physical_gate = localization_grounding.prepare_families(
+	# 方位词/趋向动词两族各备好目标词表与 OpenHowNet 闸门；两类同时跑时共用一份词典。
+	family_meta, gates = localization_grounding.prepare_families(
 		_as_list(filter_config_paths), sentence_screening.classify_family, kind=screen_kind
 	)
-	grounding_total = localization_grounding.empty_stats()
-	if physical_gate is not None:
+	localization_total = localization_grounding.empty_stats()
+	direction_total = direction_grounding.empty_stats()
+	if gates.get("localization") is not None:
 		print("[方位词语义闸门] OpenHowNet 已就绪：逐词检查参照物是否至少有一个义项的义原表示实际物体")
+	if gates.get("direction") is not None:
+		print(
+			"[趋向动词目标物语义闸门] OpenHowNet 已就绪：只检查目标物 physical 义原；动词、参照物不参与筛选"
+		)
 	for family, meta in family_meta.items():
 		if meta.get("kind") is None:
 			print(
-				f"[方位词语义闸门] 警告：无法从规则配置名 {family!r} 判断词类型，"
-				"已跳过参照物语义检查；如确属方位词，请用 --screen-kind 方位词 显式指定"
+				f"[语义闸门] 警告：无法从规则配置名 {family!r} 判断词类型，"
+				"已跳过语义检查；如确属方位词/趋向动词，请用 --screen-kind 显式指定"
 			)
 
 	def _screen(rows: list[dict[str, Any]], family: str) -> list[dict[str, Any]]:
@@ -356,9 +362,14 @@ def filter_sentences_streaming(
 			meta = family_meta.get(family)
 			if meta and meta.get("kind") == "方位词":
 				rows, delta = localization_grounding.gate_rows(
-					rows, meta["vocab"], gate=physical_gate
+					rows, meta["vocab"], gate=gates.get("localization")
 				)
-				localization_grounding.merge_stats(grounding_total, delta)
+				localization_grounding.merge_stats(localization_total, delta)
+			elif meta and meta.get("kind") == "趋向动词":
+				rows, delta = direction_grounding.gate_rows(
+					rows, meta["vocab"], gate=gates.get("direction")
+				)
+				direction_grounding.merge_stats(direction_total, delta)
 			gated.append(rows)
 
 		# LLM 前：规则命中 + 语义闸门之后、真正送筛的句子数（按批内唯一键去重）。
@@ -493,10 +504,14 @@ def filter_sentences_streaming(
 	print(f"从 {candidate_count} 个备选句子中筛选出了 {hit_counts[ANY_HIT]} 个符合条件的句子")
 	for family in families:
 		print(f"    {family}：{hit_counts[family]} 个句子")
-	if grounding_total.get("records"):
-		print(f"[方位词参照物语义闸门] {localization_grounding.format_stats(grounding_total)}")
+	if localization_total.get("records"):
+		print(f"[方位词参照物语义闸门] {localization_grounding.format_stats(localization_total)}")
+	if direction_total.get("records"):
+		print(f"[趋向动词目标物语义闸门] {direction_grounding.format_stats(direction_total)}")
 	stats["vocab_candidates"] = candidate_count
-	stats["grounding"] = dict(grounding_total)
+	stats["grounding"] = dict(localization_total)
+	stats["direction_grounding"] = dict(direction_total)
+	stats["direction_sememe_policy"] = direction_grounding.policy_snapshot()
 	print(
 		f"[筛选漏斗] 读入 {stats['read_sentences']}，初筛后 {candidate_count}，"
 		f"程序筛选 {stats['program_selected']}，落盘 {stats['corpus_written']}，"

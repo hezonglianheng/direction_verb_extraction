@@ -189,6 +189,39 @@ SCREEN_CACHE_MAX = 10000
 缓存跨批保留，命中的重复句/重复词不再发请求；但语料是流式的，无上限的 dict 会一直吃内存，
 所以按插入顺序淘汰最旧的一条（近似 LRU 的 FIFO，足够应付重复句集中在邻近批次的情形）。"""
 
+# ---- 趋向动词三元组的目标物义原闸门（用户可直接改这一节）----
+# 判定口径：
+#   目标物：至少一个义项的义原沿 hypernym 到达 DIRECTION_TARGET_SEMEME_ROOTS 之一。
+#   动词  ：仍会抽取并写入三元组，但**不参与语义筛选**（可以为空）。
+#   参照物：仍会抽取并写入三元组，但**不参与语义筛选**（可以为空）。
+# 写法一律用 HowNet 的「英文|中文」义原名。写根义原会同时接受它的全部下位义原。
+# 改动后重新跑筛选即可；旧语料不会自动回溯重判。改完请把
+# DIRECTION_SEMEME_POLICY_VERSION 加 1，日志里才能区分是哪一版口径跑出来的。
+
+DIRECTION_TARGET_SEMEME_ROOTS = frozenset({"physical|物质"})
+"""目标物（发生位移的物体）必须是实际物体；只认 physical|物质 子树。
+
+人的义原链是 human|人 → AnimalHuman|动物 → animate|生物 → physical|物质，因此
+「他/她/孩子」这类会通过；organization|组织、fact|事情、mental|精神等不会通过。
+"""
+
+DIRECTION_SEMEME_POLICY_VERSION = 2
+"""本版义原口径的版本号；改上面的集合后请加 1（会写进每条语料与筛选日志）
+
+版本 2：移除动词义原筛选，只保留目标物 physical|物质 判定。
+"""
+
+
+def direction_sememe_policy() -> dict:
+    """当前趋向动词义原口径的可序列化快照，供语料与日志留痕"""
+    return {
+        "version": DIRECTION_SEMEME_POLICY_VERSION,
+        "target_roots": sorted(DIRECTION_TARGET_SEMEME_ROOTS),
+        "verb_filtering": False,
+        "reference_filtering": False,
+    }
+
+
 _PROJECT_ROOT = Path(__file__).resolve().parent
 """项目根目录（config.py 所在目录），与运行时 cwd 无关"""
 
