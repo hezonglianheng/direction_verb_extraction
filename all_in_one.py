@@ -1038,9 +1038,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--limit",
         type=int,
         default=DEFAULT_LIMIT,
-        help=f"最多处理多少条语料（默认 {DEFAULT_LIMIT}）——本脚本是单次调用的诊断入口，不是跑批工具",
+        help=f"最多处理多少条**可用判定语料**（screening=true/no_llm，过滤后计数；默认 {DEFAULT_LIMIT}）"
+        "——本脚本是单次调用的诊断入口，不是跑批工具；可用数量不足时会报告",
     )
-    parser.add_argument("--offset", type=int, default=0, help="跳过前多少条语料")
+    parser.add_argument("--offset", type=int, default=0, help="跳过前多少条可用判定语料（过滤后计数）")
     parser.add_argument(
         "--candidate-index",
         type=int,
@@ -1116,7 +1117,13 @@ def main(argv: list[str] | None = None) -> None:
     corpus_path = (
         Path(args.corpus) if args.corpus else _PROJECT_ROOT / "results" / st.CORPUS_TYPE_CORPORA[corpus_type]
     )
-    records = st.read_corpus(corpus_path, limit=args.limit, offset=args.offset)
+    records = st.read_corpus(corpus_path, limit=args.limit, offset=args.offset, judge_only=True)
+    if args.limit is not None and len(records) < args.limit:
+        print(
+            f"警告：可用判定语料只有 {len(records)} 条（true/no_llm），少于计数限制 {args.limit} 条；"
+            "已按实际数量运行"
+            + (f"（已跳过 offset={args.offset} 条可用语料）" if args.offset else "")
+        )
 
     out_dir = Path(args.out_dir) if args.out_dir else _PROJECT_ROOT / "results" / DEFAULT_OUT_PREFIX
     out_path = Path(args.out_file) if args.out_file else st.build_output_path(out_dir, prefix=DEFAULT_OUT_PREFIX)
@@ -1138,8 +1145,13 @@ def main(argv: list[str] | None = None) -> None:
     print(f"模型：{args.model}（{'--no-llm：不建、不调' if not ctx.llm else '每条记录至多一次调用'}）")
     print(f"输入语料：{corpus_path}（{len(records)} 条）")
     if not records:
-        print(f"没有从 {corpus_path} 读到记录")
+        print(f"没有从 {corpus_path} 读到可用于判定的记录")
         return
+    # 失败重跑提示要用“过滤后的可用语料序号”，不能再用物理行号：
+    # 过滤掉 false/error/limit 后，--offset 跳过的是可用记录数（见 spatial_tools.read_corpus）。
+    eligible_offset_by_line = {
+        record.get("line_no"): args.offset + index for index, record in enumerate(records)
+    }
     # 启动时逐张打印本次读的配置表（含 --alter-rules 换过的那张）：缺表/空表当场说清楚，
     # 与 pair 图同一处实现、同一套告警口径（alter_rules 空是警告，另三张空是提示）
     sr._print_config_tables(ctx.agents)
@@ -1258,7 +1270,11 @@ def main(argv: list[str] | None = None) -> None:
         # 400（assistant 消息里的 tool_calls 没有被逐条回应），重跑一次通常会好
         print(f"调用失败 {failed} 条（原因见记录里的 all_in_one.error）：语料第 {failed_lines} 行")
         for line_no in failed_lines:
-            print(f"    重跑：--offset {line_no - 1} --limit 1")
+            offset = eligible_offset_by_line.get(line_no)
+            if offset is None:
+                print(f"    重跑：找不到第 {line_no} 行对应的可用语料序号，请按 line_no 手工定位")
+            else:
+                print(f"    重跑：--offset {offset} --limit 1")
     if suppressed:
         print(f"被闸门挡下、未采信的模型答案：{dict(suppressed)}（原答案见 all_in_one.raw）")
     for name in sg.GRAPHS["pair"].counter_names:

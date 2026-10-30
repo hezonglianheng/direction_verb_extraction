@@ -387,8 +387,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "0 或负表示不限）。所有 agent 共用一份计数，达到上限后余下的调用一律不再发出，"
         "记录照常落盘并转入人工复核（A3）",
     )
-    parser.add_argument("--limit", type=int, default=100, help="最多处理多少条记录")
-    parser.add_argument("--offset", type=int, default=0, help="跳过前多少条记录")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=100,
+        help="最多处理多少条**可用判定语料**（screening= true/no_llm，过滤后计数）；"
+        "可用数量不足时会报告。默认 100",
+    )
+    parser.add_argument("--offset", type=int, default=0, help="跳过前多少条可用判定语料（过滤后计数）")
     model_group = parser.add_mutually_exclusive_group()
     model_group.add_argument("--model", default=DEFAULT_MODEL, help="model_config/api_keys.json 里的配置名（单模型模式）")
     model_group.add_argument(
@@ -1040,9 +1046,15 @@ def main(argv: list[str] | None = None) -> None:
     _warn_corpus_type_mismatch(corpus_path, corpus_type)
 
     spec = sg.get_graph(args.graph)
-    records = st.read_corpus(corpus_path, limit=args.limit, offset=args.offset)
+    records = st.read_corpus(corpus_path, limit=args.limit, offset=args.offset, judge_only=True)
+    if args.limit is not None and len(records) < args.limit:
+        print(
+            f"警告：可用判定语料只有 {len(records)} 条（true/no_llm），少于计数限制 {args.limit} 条；"
+            "已按实际数量运行"
+            + (f"（已跳过 offset={args.offset} 条可用语料）" if args.offset else "")
+        )
     if not records:
-        print(f"没有从 {corpus_path} 读到记录")
+        print(f"没有从 {corpus_path} 读到可用于判定的记录")
         return
 
     if args.feature_deep and "feature" not in spec.needs:

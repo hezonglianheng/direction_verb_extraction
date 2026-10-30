@@ -207,6 +207,52 @@ class StableIdentityTests(unittest.TestCase):
         self.assertNotEqual(self.st.candidate_key(sid, 2, "到"), self.st.candidate_key(sid, 7, "到"))
         self.assertIsNone(self.st.candidate_key(sid, 2, ""))   # 缺替换词时不拼半个键
 
+    def test_judge_only_filters_status_before_offset_and_limit(self):
+        def with_status(status):
+            return sample_record() | {"screening": {"status": status}}
+
+        path = self.write(
+            [
+                with_status("false"),
+                with_status("true"),
+                with_status("error"),
+                sample_record(),  # 旧语料无 screening：按 no_llm 放行
+                with_status("limit"),
+                sample_record() | {"screening": None},  # 形状损坏：必须排除
+                sample_record() | {"screening": {"status": "bogus", "extractable": True}},  # 显式未知：排除
+            ]
+        )
+        records = self.st.read_corpus(path, judge_only=True)
+        self.assertEqual([record["input_line_no"] for record in records], [2, 4])
+
+        # offset/limit 按“过滤后的可用记录”计数，而不是物理行号
+        page = self.st.read_corpus(path, judge_only=True, offset=1, limit=5)
+        self.assertEqual([record["input_line_no"] for record in page], [4])
+        first = self.st.read_corpus(path, judge_only=True, limit=1)
+        self.assertEqual([record["input_line_no"] for record in first], [2])
+
+    def test_judge_only_accepts_legacy_screening_without_status(self):
+        path = self.write(
+            [
+                sample_record()
+                | {"screening": {"extractable": True, "source": "llm"}},
+                sample_record()
+                | {"screening": {"extractable": False, "source": "llm"}},
+                sample_record()
+                | {"screening": {"extractable": None, "source": "limit"}},
+                sample_record()
+                | {"screening": {"extractable": None, "source": "no_llm"}},
+            ]
+        )
+        records = self.st.read_corpus(path, judge_only=True)
+        self.assertEqual([record["input_line_no"] for record in records], [1, 4])
+
+    def test_non_positive_limit_reads_nothing(self):
+        path = self.write([sample_record()])
+        self.assertEqual(self.st.read_corpus(path, limit=0), [])
+        self.assertEqual(self.st.read_corpus(path, limit=-1), [])
+        self.assertEqual(self.st.read_corpus(path, limit=0, judge_only=True), [])
+
 
 class RecordIdTests(unittest.TestCase):
     """记录 id：来源文档编号-源行号-第几个目标词位置-第几个替换句（各段从 1 起）"""

@@ -182,7 +182,7 @@ def load_runner():
     tools.write_pairs_csv = lambda records, path, columns: (0, 0)
     tools.build_output_path = lambda out_dir, prefix: Path(out_dir) / f"{prefix}.jsonl"
     tools.normalize_corpus_type = lambda value: value or "方位词"
-    tools.read_corpus = lambda path, limit=100, offset=0: [
+    tools.read_corpus = lambda path, limit=100, offset=0, judge_only=False: [
         {"line_no": index + 1, "sentence": ["上", "山"]}
         for index in range(2)
     ]

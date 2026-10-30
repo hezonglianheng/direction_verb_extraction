@@ -54,6 +54,7 @@ import json5
 from langchain.tools import tool
 
 import config
+import sentence_screening
 import word_sampler
 from sentenceTable import SentenceTaskCache
 
@@ -538,7 +539,13 @@ def load_judge_table(path: str | Path | None = None, *, corpus_type: str | None 
 # --------------------------------------------------------------------------
 
 
-def read_corpus(path: str | Path, limit: int | None = None, offset: int = 0) -> list[dict]:
+def read_corpus(
+    path: str | Path,
+    limit: int | None = None,
+    offset: int = 0,
+    *,
+    judge_only: bool = False,
+) -> list[dict]:
     """读 results/location_corpus.jsonl 一类语料
 
     每行形如：
@@ -547,8 +554,10 @@ def read_corpus(path: str | Path, limit: int | None = None, offset: int = 0) -> 
 
     Args:
         path (str | Path): 语料文件路径
-        limit (int, optional): 最多读多少行，None 表示不限
-        offset (int): 跳过前多少行
+        limit (int, optional): 最多读多少行，None 表示不限；<=0 明确返回空列表
+        offset (int): 跳过多少行；judge_only=True 时按**过滤后的可用语料**计数
+        judge_only (bool): True 时只返回 screening_status 为 true/no_llm 的记录；
+            旧语料（没有 screening 字段）按 no_llm 处理。默认 False 保持旧调用行为。
 
     行号分层保留（D2），三样各是各的口径，不要互相覆盖：
         source_line_no   源语料（抽样前那份）里的行号，由 word_sampler 写入，落到产物里不再变
@@ -568,13 +577,25 @@ def read_corpus(path: str | Path, limit: int | None = None, offset: int = 0) -> 
     Returns:
         list[dict]: 每条记录原样返回，另加上述三个行号字段
     """
+    if limit is not None and limit <= 0:
+        # 计数限制为非正数时明确表示“取 0 条”，不能先读入一条再因 len>=limit 退出。
+        return []
     records: list[dict] = []
     document_numbers: dict[str, int] = {}
+    eligible_seen = 0
     with open(path, "r", encoding="utf-8") as f:
         for line_no, line in enumerate(f, start=1):
-            if line_no <= offset or not line.strip():
+            if not line.strip():
+                continue
+            if not judge_only and line_no <= offset:
                 continue
             record = json.loads(line)
+            if judge_only:
+                if not sentence_screening.is_judgement_eligible(record):
+                    continue
+                eligible_seen += 1
+                if eligible_seen <= offset:
+                    continue
             # 记录里已带行号（抽样产物写的是源行号）就先把它留成 source_line_no，
             # 别用本次的物理行号顶掉它
             source_line_no = record.get("source_line_no")
