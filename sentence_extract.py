@@ -4,8 +4,10 @@ from pathlib import Path
 from typing import Any
 
 import sys
+import time
 
 import config
+import extraction_log
 import sentenceFilters
 import sentence_screening
 from entry_in_linux import run_linux_entry
@@ -141,6 +143,7 @@ def main(
     screen_kind: str | None = None,
     extract_workers: int = config.EXTRACT_WORKERS,
     filter_workers: int = config.FILTER_WORKERS,
+    log_dir: str | None = None,
 ):
     """提取语料中包含指定语言现象的句子
 
@@ -157,6 +160,7 @@ def main(
             只能用于单套规则——多套规则各有各的词类型，不能共用一个强制值
         extract_workers (int): 文本切句的并发线程数
         filter_workers (int): 规则筛选的进程数（0 = 自动，1 = 串行）
+        log_dir (str | None): 筛选日志目录；None = 项目根下的 log/（不存在会自动创建）
     """
     filter_configs = _normalize_paths(filter_config_path) or ([DEFAULT_FILTER_CONFIG] if DEFAULT_FILTER_CONFIG else [])
     vocab_configs = _normalize_paths(vocab_config_path)
@@ -206,8 +210,9 @@ def main(
     else:
         print("[筛选计划] 未使用初筛")
 
+    started_at = time.time()
     if sys.platform.startswith("win"):
-        run_windows_entry(
+        stats = run_windows_entry(
             src_path,
             filter_configs,
             output_paths,
@@ -218,7 +223,7 @@ def main(
             screen_kind=screen_kind,
         )
     else:
-        run_linux_entry(
+        stats = run_linux_entry(
             src_path,
             filter_configs,
             output_paths,
@@ -228,6 +233,20 @@ def main(
             filter_workers=filter_workers,
             screen_kind=screen_kind,
         )
+
+    # 两个平台共用同一个成功出口：语料文件已原子替换后才写漏斗日志。
+    # 运行中途抛错不会走到这里，避免留下一份“看起来完整”的统计。
+    extraction_log.write_extract_log(
+        stats,
+        src_path=src_path,
+        filter_configs=filter_configs,
+        output_paths=output_paths,
+        vocab_count=len(vocabs),
+        screening_stats={family: screener.stats() for family, screener in screeners.items()},
+        log_dir=log_dir,
+        started_at=started_at,
+        finished_at=time.time(),
+    )
 
 
 if __name__ == "__main__":

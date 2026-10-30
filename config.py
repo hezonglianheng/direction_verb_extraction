@@ -142,7 +142,8 @@ FILTER_WORKERS = 1
 
 实测单张 GPU 上开 2 个进程仅比单进程快约 1.2 倍，却要多一份 LTP 模型副本
 （约 0.66GB 显存）和约 5s 的进程启动开销；配合 LTP 批量推理后单进程已能打满单卡，
-故默认为 1。多进程分支仍保留在 entry_in_linux.py 中，需要时改回即可。"""
+故默认为 1。多进程分支保留在 entry_in_linux.py 与 entry_in_win.py 中，需要时改回即可；
+命令行 --filter-workers 可以临时覆盖，不必改文件。"""
 
 EXTRACT_WORKERS = 4
 """文本切句阶段的并发线程数（0 = 自动使用 CPU 核数，最多 8）

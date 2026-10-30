@@ -13,6 +13,7 @@ import threading
 import time
 
 import config
+import extraction_log
 import localization_grounding
 import sentenceFilters
 import sentence_split
@@ -262,7 +263,7 @@ def iter_path_sentences(
 	收集与遍历走 file_paths.iter_path_sentences（与 entry_in_win 同一份，理由见那里）。
 	本入口多带一个 position=文件序号，产物里因此知道这句出自第几个输入文件；
 	workers 透传给单文件切句的线程池（0/None 取 config.EXTRACT_WORKERS）。
-	stats 是本轮漏斗统计：在这里透传给切句层累加「读入总数」。
+	stats 是本轮漏斗统计（见 extraction_log）：在这里透传给切句层累加「读入总数」。
 	"""
 	return file_paths.iter_path_sentences(
 		src_path,
@@ -281,6 +282,7 @@ def filter_sentences_streaming(
 	screeners: dict[str, sentence_screening.SentenceScreener] | None = None,
 	filter_workers: int | None = None,
 	screen_kind: str | None = None,
+	stats: dict[str, Any] | None = None,
 ):
 	"""一次遍历、多套规则、各自落盘
 
@@ -293,7 +295,13 @@ def filter_sentences_streaming(
 		filter_workers (int | None): 规则筛选进程数；None 取 config.FILTER_WORKERS
 		screen_kind (str | None): 显式指定词类型（方位词/趋向动词）；None = 按配置文件名推断。
 			只能用于单套规则，且会同时决定是否启用方位词参照物语义闸门
+		stats (dict | None): 本轮漏斗统计（见 extraction_log）；缺省时新建一份仅供本函数
+			内部使用。抽取阶段已累加的 read_sentences 会原样保留。
+
+	Returns:
+		dict: 与传入的 stats 同一份对象（便于成功收尾时写 extract-log）。
 	"""
+	stats = extraction_log.ensure_stats(stats)
 	families = [Path(path).stem for path in _as_list(filter_config_paths)]
 	if len(families) != len(out_files):
 		raise ValueError(f"规则套数（{len(families)}）与输出文件数（{len(out_files)}）不一致")
@@ -353,15 +361,64 @@ def filter_sentences_streaming(
 				localization_grounding.merge_stats(grounding_total, delta)
 			gated.append(rows)
 
+		# LLM 前：规则命中 + 语义闸门之后、真正送筛的句子数（按批内唯一键去重）。
+		pre_keys = {row_key(row) for rows in gated for row in rows}
+		stats["program_selected"] += len(pre_keys)
+		for family, rows in zip(families, gated):
+			extraction_log.family_stats(stats, family)["program_selected"] += len(rows)
+
 		# screen_rows 现在返回与输入等长的记录：false/error/limit 也落盘，只是不进判定工作流。
 		screened = [_screen(rows, family) for family, rows in zip(families, gated)]
 		status_by_key: dict[Any, set[str]] = {}
-		for rows in screened:
+		for family, rows in zip(families, screened):
+			family_counts = extraction_log.family_stats(stats, family)
 			for row in rows:
 				key = row_key(row)
 				status = sentence_screening.screening_status(row)
 				status_by_key.setdefault(key, set()).add(status)
+				family_counts["written"] += 1
+				if status == sentence_screening.SCREENING_TRUE:
+					family_counts["llm_kept"] += 1
+				elif status == sentence_screening.SCREENING_FALSE:
+					family_counts["llm_excluded"] += 1
+				elif status == sentence_screening.SCREENING_ERROR:
+					family_counts["llm_error"] += 1
+				elif status == sentence_screening.SCREENING_LIMIT:
+					family_counts["llm_limit"] += 1
+				elif status == sentence_screening.SCREENING_NO_LLM:
+					family_counts["llm_kept"] += 1
+					family_counts["no_llm"] += 1
 
+		# 全局按句去重：任一族给出 true/no_llm 即视为可判定；false/error/limit 都仍落盘。
+		allowed_statuses = sentence_screening.JUDGEMENT_SCREENING_STATUSES
+		allowed_keys = {key for key, values in status_by_key.items() if values & allowed_statuses}
+		false_keys = {
+			key for key, values in status_by_key.items()
+			if sentence_screening.SCREENING_FALSE in values and key not in allowed_keys
+		}
+		error_keys = {
+			key for key, values in status_by_key.items()
+			if sentence_screening.SCREENING_ERROR in values and key not in allowed_keys
+		}
+		limit_keys = {
+			key for key, values in status_by_key.items()
+			if sentence_screening.SCREENING_LIMIT in values and key not in allowed_keys
+		}
+		no_llm_keys = {
+			key for key, values in status_by_key.items()
+			if sentence_screening.SCREENING_NO_LLM in values
+		}
+		stats["corpus_written"] += len(status_by_key)
+		stats["llm_kept"] += len(allowed_keys)
+		stats["llm_excluded"] += len(false_keys)
+		stats["llm_error"] += len(error_keys)
+		stats["llm_limit"] += len(limit_keys)
+		stats["no_llm"] += len(no_llm_keys)
+		for status in sentence_screening.SCREENING_STATUSES:
+			count = sum(1 for values in status_by_key.values() if status in values)
+			if count:
+				status_counts = stats.setdefault("screening_status", {})
+				status_counts[status] = status_counts.get(status, 0) + count
 		hit_counts[ANY_HIT] += len(status_by_key)
 		for idx, family in enumerate(families):
 			rows = screened[idx]
@@ -438,6 +495,15 @@ def filter_sentences_streaming(
 		print(f"    {family}：{hit_counts[family]} 个句子")
 	if grounding_total.get("records"):
 		print(f"[方位词参照物语义闸门] {localization_grounding.format_stats(grounding_total)}")
+	stats["vocab_candidates"] = candidate_count
+	stats["grounding"] = dict(grounding_total)
+	print(
+		f"[筛选漏斗] 读入 {stats['read_sentences']}，初筛后 {candidate_count}，"
+		f"程序筛选 {stats['program_selected']}，落盘 {stats['corpus_written']}，"
+		f"可判定 {stats['llm_kept']}（true/no_llm），LLM 判假 {stats['llm_excluded']}，"
+		f"LLM 错误 {stats['llm_error']}，超限 {stats['llm_limit']}，未用 LLM {stats['no_llm']}"
+	)
+	return stats
 
 
 def run(
@@ -459,8 +525,9 @@ def run(
 	if len(filter_config_paths) != len(paths):
 		raise ValueError(f"规则套数（{len(filter_config_paths)}）与输出文件数（{len(paths)}）不一致")
 
+	stats = extraction_log.new_stats()
 	sentences = iter_path_sentences(
-		src_path, vocabs=vocabs, output_paths=paths, workers=extract_workers
+		src_path, vocabs=vocabs, output_paths=paths, workers=extract_workers, stats=stats
 	)
 	# 抽取放到后台线程、与筛选重叠；队列有界（见 pipeline_utils.prefetch_iter），不会整份读入内存
 	sentences = prefetch_iter(sentences, config.EXTRACT_PREFETCH_ITEMS)
@@ -472,7 +539,12 @@ def run(
 		out_files = [stack.enter_context(atomic_write_text(path)) for path in paths]
 		if screeners is None and filter_workers is None and screen_kind is None:
 			# 旧调用形状（测试桩与外部脚本只接受三个参数）保持兼容
-			filter_sentences_streaming(sentences, filter_config_paths, out_files)
+			returned = filter_sentences_streaming(sentences, filter_config_paths, out_files)
+			if isinstance(returned, dict):
+				read_sentences = int(stats.get("read_sentences", 0))
+				stats.update(returned)
+				# 旧形状下 streaming 自己新建统计，不知道抽取阶段的读入数；保留较大的那个
+				stats["read_sentences"] = max(read_sentences, int(returned.get("read_sentences", 0)))
 		else:
 			filter_sentences_streaming(
 				sentences,
@@ -481,11 +553,13 @@ def run(
 				screeners=screeners,
 				filter_workers=filter_workers,
 				screen_kind=screen_kind,
+				stats=stats,
 			)
 
 	if screeners:
 		for family, screener in screeners.items():
 			print(f"[LLM 筛选统计] {family}：{screener.stats()}")
+	return stats
 
 
 def run_linux_entry(
