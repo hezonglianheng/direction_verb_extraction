@@ -81,6 +81,7 @@ from langchain.agents.structured_output import ToolStrategy
 from pydantic import BaseModel, Field, create_model
 
 import agents as agent_factory
+import batch_inference as bi
 import spatial_tools as st
 import utils
 
@@ -981,6 +982,9 @@ class BaseAgent:
     与四张表同一个目录、同一套分组口径（见 spatial_tools.CONFIG_PROMPT_FILES）。
     两种来源的读法与报错文案是同一套（utils.read_prompt_path），只有路径的来源不同。
     """
+    VERDICT_MODEL: type[BaseModel] | None = None
+    """同步与批量两条路共用的结构化输出模型（FeatureAgent 按类别表动态给）"""
+
     CACHEABLE_SOURCES: tuple[str, ...] = ()
     """哪些 source 的 run() 结果值得按 user message 缓存（空元组 = 本 agent 不缓存）
 
@@ -1076,6 +1080,11 @@ class BaseAgent:
             # 才能从汇总里一眼分出「模型慢」与「一直在超时重试」。
             "retries": 0,
             "retry_exhausted": 0,
+            # 批量推理（见 batch_inference）：登记进当前波次的请求数、从结果缓存回放的次数、
+            # 批量结果解析/执行失败后由同步回退接手的项。同步模式下三项恒为 0。
+            "batch_items": 0,
+            "batch_hits": 0,
+            "batch_failed": 0,
         }
         self._stats_lock = threading.Lock()
 
@@ -1108,6 +1117,21 @@ class BaseAgent:
         FeatureAgent._subagent_tools）。
         """
         return list(self._tools) if self._tools is not None else []
+
+    def response_model(self) -> type[BaseModel]:
+        """本 agent 的结构化输出模型（批量请求把它转成 tool schema，同步路径用它解析）"""
+        model = self.VERDICT_MODEL
+        if model is None:
+            raise NotImplementedError(f"{self.NAME or self.__class__.__name__} 没有声明 VERDICT_MODEL")
+        return model
+
+    def supports_batch(self) -> bool:
+        """本 agent 的一条请求能否直接交给原生 Batch API
+
+        默认可以。deep feature agent 的「主 agent 派发 task 工具、subagent 再各跑一轮」是
+        服务端批处理跑不了的多轮工具回合，只能同步回退（见 FeatureAgent）。
+        """
+        return True
 
     def _model(self):
         """惰性建底层 agent，双重检查加锁保证只建一份"""
@@ -1150,6 +1174,77 @@ class BaseAgent:
             _CURRENT_BUDGET.reset(token)
 
     def _invoke(self, content: str):
+        """取一条结构化输出：批量会话在跑时走登记/回放，否则走同步调用
+
+        批量波次的约定见 batch_inference：结果已回来就直接回放；还没发就登记进当前波次，
+        抛 BatchPending 让图重放。`BatchPending` 继承 BaseException，各 run() 的
+        `except Exception` 不会把它误记成一条 error 结果。
+        """
+        already_reserved = False
+        session = bi.current_session()
+        if session is not None:
+            hit = session.lookup(self, content)
+            if hit is not None:
+                dumps, error = hit
+                if error is not None:
+                    with self._stats_lock:
+                        self._stats["batch_failed"] += 1
+                    raise RuntimeError(f"批量推理失败：{error}")
+                with self._stats_lock:
+                    self._stats["batch_hits"] += 1
+                return self.response_model().model_validate(dumps)
+            if session.collecting:
+                if not self.supports_batch():
+                    # deep feature 的多轮工具回合不能进服务端批处理；只让这一条同步跑，
+                    # 不把整个会话打成回退模式（后面的 schema/judge 仍可原生批量）。
+                    if session.strict_native:
+                        raise RuntimeError(
+                            "该 agent 不支持原生批量（通常是 --feature-deep 的工具回合），"
+                            "但 --batch native 要求全部走原生批量"
+                        )
+                    verdict = self._invoke_sync(content)
+                    # 局部同步的结果也写进 sidecar：后续波次/续跑可直接回放，
+                    # 不会因为下游 batch 超时又把这一条 deep 请求重跑一遍。
+                    session.remember(self, content, verdict.model_dump())
+                    return verdict
+                session.add(self, content)
+                with self._stats_lock:
+                    self._stats["batch_items"] += 1
+                raise bi.BatchPending(
+                    self.NAME, bi.item_key(self.NAME, content, self.system_prompt)
+                )
+            # 同步回退：这一条在登记时已经扣过预算，别再扣第二次
+            already_reserved = session.consume_reservation(self, content)
+        return self._invoke_sync(content, check_budget=not already_reserved)
+
+    def reserve_batch_request(self) -> None:
+        """批量登记一条请求时先占预算（候选作用域 + 整批），口径与 _invoke_sync 一致
+
+        原生批量不发同步请求，所以预算检查不能等 _invoke_sync；但候选预算仍是
+        「一条候选最多问几次」的承诺，必须在这一层扣。同步回退时 _invoke_sync 会以
+        check_budget=False 调用，避免同一项被扣两次。
+        """
+        with self._stats_lock:
+            scope = _CURRENT_BUDGET.get()
+            candidate_reserved = False
+            if scope is not None:
+                if not scope.reserve(self, self.max_requests):
+                    self._stats["budget_exceeded"] += 1
+                    raise RequestBudgetExceeded(
+                        f"{self.NAME or self.__class__.__name__} 本候选已达请求预算 "
+                        f"{self.max_requests} 次，本次不再发请求"
+                    )
+                candidate_reserved = True
+            if self.batch_budget is not None:
+                try:
+                    self.batch_budget.reserve(self.NAME or self.__class__.__name__)
+                except RequestBudgetExceeded:
+                    if candidate_reserved:
+                        scope.release(self)
+                    self._stats["budget_exceeded"] += 1
+                    raise
+
+    def _invoke_sync(self, content: str, *, check_budget: bool = True):
         """跑一次底层 agent 并取结构化输出。异常不吞，由 run() 决定怎么如实记 source
 
         取不到结构化输出时抛 StructuredOutputMissing 而不是返回 None——这一处是 LLM agent
@@ -1176,7 +1271,16 @@ class BaseAgent:
         # 重试也是请求，必须同样扣预算——否则 BATCH_MAX_REQUESTS=1 时一次超时仍会发出 7 次请求。
         # 两层预约要么都成功、要么都不留痕：候选预算先约，整批预算拒绝时把候选名额退回去，
         # 避免“实际没发请求却白扣一个候选名额/整批名额”。
-        def reserve_budget() -> None:
+        attempt_no = 0
+
+        def reserve_budget_slot() -> None:
+            # check_budget=False 只豁免**首次**尝试（登记 batch 时已经扣过）；
+            # 超时/限流后的重试是新的真实请求，必须继续受预算约束。
+            nonlocal attempt_no
+            if attempt_no == 0 and not check_budget:
+                attempt_no = 1
+                return
+            attempt_no += 1
             with self._stats_lock:
                 scope = _CURRENT_BUDGET.get()
                 candidate_reserved = False
@@ -1202,7 +1306,7 @@ class BaseAgent:
 
         def invoke_once():
             nonlocal sent_any, last_error
-            reserve_budget()
+            reserve_budget_slot()
             sent_any = True
             try:
                 return self._model().invoke({"messages": [{"role": "user", "content": content}]})
@@ -1394,6 +1498,7 @@ class RealityAgent(BaseAgent):
     CONFIG_NOTE = "config_files/<语料类型>/reality.txt（提示语，与该组四张表同目录）"
     PROMPT_FILES = (REALITY_PROMPT_FILE,)
     PROMPT_SOURCE = PROMPT_SOURCE_CONFIG
+    VERDICT_MODEL = RealityVerdict
     CACHEABLE_SOURCES = ("llm",)
     """成功的判定按 user message 缓存：预填充整批判一次，节点按 message 读（见 prefill）"""
 
@@ -1705,6 +1810,7 @@ class SemanticAgent(BaseAgent):
     )
     CONFIG_NOTE = "无"
     PROMPT_FILES = ("semantic",)
+    VERDICT_MODEL = SemanticVerdict
     CACHEABLE_SOURCES = ("llm",)
     """成功的判定按 user message 缓存：a 侧输入只由语料决定，原样复用（b 侧句子不同、键不同）"""
 
@@ -1798,6 +1904,26 @@ class FeatureAgent(BaseAgent):
         else:
             self.system_prompt = self.prompts[FEATURE_UNFILLED_PROMPT_FILE]
             self.class_prompts = []
+        self._verdict_model: type[BaseModel] | None = None
+
+    def response_model(self) -> type[BaseModel]:
+        """特征输出模型：类别表已填 -> 按 key 建字段；未填 -> FreeFeatures
+
+        建一次就缓存：批量请求与同步路径必须拿到同一个 schema；每次重建会让 pydantic
+        类对象不同，既浪费也难排查。
+        """
+        if not self.feature_classes:
+            return FreeFeatures
+        if self._verdict_model is None:
+            self._verdict_model = _feature_model(self.feature_classes)
+        return self._verdict_model
+
+    def supports_batch(self) -> bool:
+        """deep 模式的主 agent 会派发 task 工具、subagent 在服务端批处理里跑不起来
+
+        默认 flat（单次调用）可以原生批处理；deep 保留为同步回退，启动时会明确说明。
+        """
+        return not (self.feature_classes and self.deep)
 
     def _build(self):
         if not self.feature_classes:
@@ -1809,7 +1935,7 @@ class FeatureAgent(BaseAgent):
                 self.model_key,
                 self.tools(),
                 self.system_prompt,
-                response_format=ToolStrategy(_feature_model(self.feature_classes)),
+                response_format=ToolStrategy(self.response_model()),
             )
         return _build_deep_feature_agent(
             self.model_key,
@@ -1917,6 +2043,7 @@ class SchemaAgent(BaseAgent):
     OUTPUTS = ("name", "reason", "source")
     CONFIG_NOTE = "config_files/<语料类型>/schema_table.json5（match 的键取自同目录的 feature_classes.json5）"
     PROMPT_FILES = ("schema",)
+    VERDICT_MODEL = SchemaVerdict
     CACHEABLE_SOURCES = ("llm", "llm_free")
     """成功选出的名字按 user message 缓存：a 侧输入只由语料决定，原样复用
     （查表命中在缓存之前就返回、不进缓存；llm_invalid 与 error 不入缓存，留待各候选重试）"""
@@ -2120,6 +2247,7 @@ class SynonymAgent(BaseAgent):
     OUTPUTS = ("same_meaning", "reason", "source")
     CONFIG_NOTE = "无配置表；system_prompt/synonym.txt 由用户填写，空提示语不调模型"
     PROMPT_FILES = ("synonym",)
+    VERDICT_MODEL = SynonymVerdict
     CACHEABLE_SOURCES = ("llm",)
 
     def _build(self):
@@ -2208,6 +2336,7 @@ class JudgeAgent(BaseAgent):
     OUTPUTS = ("same_meaning", "reason", "source", "lookup")
     CONFIG_NOTE = "config_files/<语料类型>/judge_table.csv（类型见 --corpus-type，默认 localization）"
     PROMPT_FILES = ("judge",)
+    VERDICT_MODEL = JudgeVerdict
 
     def __init__(self, *, table: dict | None = None, **kwargs):
         super().__init__(**kwargs)
@@ -2381,6 +2510,20 @@ class AgentSet(dict):
             for agent in self.values():
                 stack.enter_context(agent.budget_scope())
             yield
+
+    @staticmethod
+    def new_budget_scope():
+        """建一份候选预算作用域（批量波次要在**多条 graph.invoke** 之间保留同一份）"""
+        return _BudgetScope()
+
+    @contextmanager
+    def use_budget_scope(self, scope):
+        """把给定作用域下发给当前调用栈（run_waves 每条状态各用自己那一份）"""
+        token = _CURRENT_BUDGET.set(scope)
+        try:
+            yield
+        finally:
+            _CURRENT_BUDGET.reset(token)
 
 
 def build_agents(

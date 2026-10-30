@@ -85,6 +85,16 @@ group）标明这是第几个待选句、改的是句内哪个位置（一条记
     各模型并行执行（--model-workers，0 = 全部并行），每个模型内部仍按 --workers 并发；
     LTP 预填充是模型无关的，整批只做一次。
 
+批量推理（--batch，默认 auto）：
+    模型配置声明了原生批量入口时（OpenAI 文件式 Batch / OpenRouter 内联 Batch，或显式
+    `batch` 配置），LLM agent 的请求按「波次」整批提交：第一波判 reality、第二波 semantic
+    （a/b 同批）、第三波 feature、第四波 schema（仅查表未命中项）、第五波 judge（仅判定表
+    未给结论项）。闸门与查表仍由原图决定，批处理层不复制阶段判断。
+    没有原生入口、或原生入口调用失败时回退同步执行（--workers 生效），并在汇总里记成
+    fallback；`--batch native` 则在不可用时直接报错。结果 sidecar 见 `--batch-cache`，
+    `--batch-resume` 会复用已收结果并继续收上次未终结的 batch（batch ID 在
+    `<sidecar>.jobs.json` 里，不会因为轮询超时而重复提交）。
+
 四张配置表（改写规则 / 语义特征类别 / schema / 判定）**按语料类型分两组**存放在
 config_files/localization/（方位词）与 config_files/direction/（趋向动词）下，文件名相同；
 --corpus-type 决定读哪一组（默认方位词），启动时逐张打印实际路径与内容摘要，缺表/空表当场告警。
@@ -105,6 +115,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import agents as agent_factory
+import batch_inference as bi
 import config
 import file_paths
 import spatial_agents as sa
@@ -334,12 +345,60 @@ def _corpus_type_arg(value: str) -> str:
         raise argparse.ArgumentTypeError(str(exc)) from None
 
 
+def add_batch_args(parser: argparse.ArgumentParser) -> None:
+    """给跑批入口加上批量推理相关选项（spatial_runner 与 all_in_one 共用）
+
+    默认 auto：模型配置声明了可用批量入口（OpenAI/OpenRouter，或显式 batch 配置）就
+    走原生 Batch；没有就照旧同步执行。native 在不可用时直接报错，避免用户以为用了批量。
+    """
+    group = parser.add_argument_group("批量推理")
+    group.add_argument(
+        "--batch",
+        choices=("off", "auto", "native"),
+        default=config.BATCH_MODE,
+        help=f"批量推理：auto（默认 {config.BATCH_MODE}，有原生 Batch 入口就用，否则同步回退）／native（必须用原生，"
+        "不可用即报错）／off（完全走原来的同步链路）。原生入口按模型配置的 "
+        "provider 或 batch 字段判定，见 batch_inference.batch_profile",
+    )
+    group.add_argument(
+        "--batch-cache",
+        default=None,
+        help="批量结果 sidecar 路径（默认 <输出文件>.batch-cache.jsonl）；断点续跑时指向同一份",
+    )
+    group.add_argument(
+        "--batch-resume",
+        action="store_true",
+        help="复用 --batch-cache 里已有的结果，并继续收 --batch-jobs.json 里未终结的 batch。"
+        "默认每轮重新开始，避免旧结果混进新配置的产物",
+    )
+    group.add_argument(
+        "--batch-poll-seconds",
+        type=float,
+        default=config.BATCH_POLL_SECONDS,
+        help=f"轮询原生 batch 状态的间隔秒数（默认 {config.BATCH_POLL_SECONDS}）",
+    )
+    group.add_argument(
+        "--batch-timeout-seconds",
+        type=float,
+        default=config.BATCH_TIMEOUT_SECONDS,
+        help=f"等待单个原生 batch 完成的上限秒数（默认 {config.BATCH_TIMEOUT_SECONDS}，0 = 不限）；"
+        "超时不会重复提交，batch ID 已落盘，可加 --batch-resume 继续收",
+    )
+    group.add_argument(
+        "--batch-chunk-size",
+        type=int,
+        default=config.BATCH_CHUNK_SIZE,
+        help=f"一个原生 batch 最多包含多少条请求（默认 {config.BATCH_CHUNK_SIZE}）；超出会分片提交",
+    )
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="空间语义实验跑批：按指定的图把语料跑一遍，结果写入 jsonl",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__.split("用法：")[-1],
     )
+    add_batch_args(parser)
     parser.add_argument("--graph", default="pair", choices=sorted(sg.GRAPHS), help="跑哪张图（见 --list-graphs）")
     parser.add_argument("--list-graphs", action="store_true", help="打印可用的图与各自需要的 agent，然后退出")
     parser.add_argument(
@@ -540,6 +599,8 @@ def _print_agent_stats(stats: dict[str, dict]) -> None:
             part += f"／{item['budget_exceeded']} 次超预算未发"
         if item.get("retries"):
             part += f"／{item['retries']} 次重试"
+        if item.get("batch_items") or item.get("batch_hits"):
+            part += f"／批处理登记 {item.get('batch_items', 0)} 项、回放 {item.get('batch_hits', 0)} 次"
         parts.append(part + f"／{item['cache_hits']} 次命中")
     total = sum(item["roundtrips"] for item in stats.values())
     failed = sum(item.get("failed", 0) for item in stats.values())
@@ -743,12 +804,56 @@ def _execute_run(
             # 非 pair 图的记录里没有成对字段：默认开着也导不出东西，说清楚而不是静悄悄少一个产物
             print(f"提示：本图（{spec.name}）的记录不是成对形状，没有可导出的成对列，本次不导 csv")
 
+    batch_session = None
+    if (
+        not args.no_llm
+        and getattr(args, "batch", "off") == "native"
+        and getattr(args, "feature_deep", False)
+        and "feature" in spec.needs
+    ):
+        raise SystemExit(
+            "错误：--batch native 不能与 --feature-deep 同用（deep agent 的工具回合无法交给原生 Batch）"
+        )
+    if not args.no_llm and getattr(args, "batch", "off") != "off":
+        profile = bi.batch_profile(model_key)
+        if profile.enabled:
+            if getattr(args, "batch_cache", None):
+                cache_path = Path(args.batch_cache)
+                # 多模型投票时每个模型必须各用一份 sidecar，否则会把别的模型的结果回放进来
+                if getattr(args, "models", None) and len(args.models) > 1:
+                    cache_path = cache_path.with_name(
+                        f"{cache_path.stem}.{model_key}{cache_path.suffix}"
+                    )
+            else:
+                cache_path = out_path.parent / (out_path.name + ".batch-cache.jsonl")
+            batch_session = bi.BatchSession(
+                profile,
+                cache_path=cache_path,
+                poll_seconds=getattr(args, "batch_poll_seconds", config.BATCH_POLL_SECONDS),
+                timeout_seconds=getattr(args, "batch_timeout_seconds", config.BATCH_TIMEOUT_SECONDS),
+                chunk_size=getattr(args, "batch_chunk_size", config.BATCH_CHUNK_SIZE),
+                retry_policy=policy,
+                resume=bool(getattr(args, "batch_resume", False)),
+                strict_native=getattr(args, "batch", "auto") == "native",
+            )
+            if verbose:
+                print(f"批处理：{profile.describe()}")
+                if getattr(args, "feature_deep", False) and "feature" in spec.needs:
+                    print("批处理：--feature-deep 的特征子 agent 只能同步回退（原生 Batch 跑不了工具回合）")
+        elif getattr(args, "batch", "auto") == "native":
+            raise SystemExit(f"错误：--batch native 不可用 —— {profile.describe()}")
+        elif verbose:
+            print(f"批处理：{profile.describe()}（回退同步执行）")
+
     if not args.no_llm:
         if prefill_ltp:
             _prefill(records, agents, spec)
-        # 闸门的原句在这里一次判完（去重）。图已经建好——接线错在花钱之前就报出来，于是这份
-        # 去重账补写到 writer 上，与语料类型、配置表一并进汇总（见 ResultWriter.reality_prefill）
-        writer.reality_prefill = _prefill_reality(records, agents, spec, args.workers, verbose=verbose)
+        if batch_session is None:
+            # 闸门的原句在这里一次判完（去重）。图已经建好——接线错在花钱之前就报出来，于是这份
+            # 去重账补写到 writer 上，与语料类型、配置表一并进汇总（见 ResultWriter.reality_prefill）
+            writer.reality_prefill = _prefill_reality(records, agents, spec, args.workers, verbose=verbose)
+        elif verbose:
+            print("reality 预填充：批处理模式下由第一波批量请求统一提交（按 user message 去重）")
 
     # 一条语料的每个目标词位置各能改出好几个待选句，每个待选句一个状态、一条记录，
     # 所以状态数一般多于语料条数
@@ -760,16 +865,43 @@ def _execute_run(
     writer.expanded_states = len(states)
     started = time.time()
 
-    def run_state(state):
-        # 一条状态 = 一条候选，候选预算在这个作用域内累计（见 AgentSet.budget_scope）；
-        # 作用域按线程隔离，--workers N 下各条候选互不串账
-        with agents.budget_scope():
-            return graph.invoke(state, {"recursion_limit": 60})
+    if batch_session is not None:
+        if verbose:
+            print(f"批处理：{len(states)} 个状态进入波次执行（原生优先，失败回退同步）")
+        # 批量波次会把同一条候选重放多次；候选预算必须跨波次保留同一份，
+        # 否则每条候选每波都会拿到一份新预算，max_requests 形同虚设。
+        scopes = {id(state): agents.new_budget_scope() for state in states}
 
-    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
-        # 结果已在 save 节点落盘，这里只需驱动跑完；map 按输入顺序产出，异常会在此处抛出
-        for _ in pool.map(run_state, states):
-            pass
+        def run_batch_state(state):
+            with agents.use_budget_scope(scopes[id(state)]):
+                return graph.invoke(state, {"recursion_limit": 60})
+
+        bi.run_waves(
+            states,
+            run_batch_state,
+            batch_session,
+            fallback_workers=max(1, args.workers),
+        )
+        writer.extra_summary["batch"] = batch_session.summary()
+        if verbose:
+            batch_summary = batch_session.summary()
+            print(
+                f"批处理账：{batch_summary['waves']} 波／{batch_summary['items_collected']} 项"
+                f"／成功 {batch_summary['items_completed']}／失败 {batch_summary['items_failed']}"
+                f"／回退同步 {batch_summary['fallback_items']}／缓存回放 {batch_summary['cache_hits']}"
+            )
+    else:
+
+        def run_state(state):
+            # 一条状态 = 一条候选，候选预算在这个作用域内累计（见 AgentSet.budget_scope）；
+            # 作用域按线程隔离，--workers N 下各条候选互不串账
+            with agents.budget_scope():
+                return graph.invoke(state, {"recursion_limit": 60})
+
+        with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+            # 结果已在 save 节点落盘，这里只需驱动跑完；map 按输入顺序产出，异常会在此处抛出
+            for _ in pool.map(run_state, states):
+                pass
 
     # 各 agent 的调用账（往返数、重试数与缓存命中数）：跑完才齐，收尾补写到 writer 上、进汇总
     writer.agent_stats = {name: agent.stats() for name, agent in agents.items()}
@@ -964,6 +1096,7 @@ def _run_multi_model(
                 "agent_stats": results[name]["writer"].agent_stats,
                 "reality_prefill": results[name]["writer"].reality_prefill,
                 "request_policy": results[name]["writer"].extra_summary.get("request_policy"),
+                "batch": results[name]["writer"].extra_summary.get("batch"),
             }
             for name in model_names
         ],

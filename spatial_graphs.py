@@ -71,6 +71,7 @@ from typing import TYPE_CHECKING, Annotated, Any, Callable, NamedTuple, TypedDic
 
 from langgraph.graph import END, START, StateGraph
 
+import batch_inference as bi
 import spatial_tools as st
 
 if TYPE_CHECKING:  # 只为类型标注，避免与 spatial_runner 相互 import
@@ -283,10 +284,19 @@ def agent_node(
     def node_fn(state: dict) -> dict:
         started = time.perf_counter()
         if sides:
-            value = {
-                side: agent.run(**{name: _resolve(state, path, side) for name, path in inputs.items()})
-                for side in sides
-            }
+            # 批处理波次里两侧都可能待发：先把两侧都跑一遍、把待发请求都登记下来，
+            # 再一起抛出去。否则第一个 pending 会把第二侧挡住，每个节点都要多花一波。
+            value = {}
+            pending: list[bi.BatchPending] = []
+            for side in sides:
+                try:
+                    value[side] = agent.run(
+                        **{name: _resolve(state, path, side) for name, path in inputs.items()}
+                    )
+                except bi.BatchPending as exc:
+                    pending.append(exc)
+            if pending:
+                raise bi.BatchPendingGroup(pending)
         else:
             value = agent.run(**{name: _resolve(state, path, None) for name, path in inputs.items()})
 

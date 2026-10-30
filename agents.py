@@ -117,6 +117,17 @@ def _request_policy(model_cfg: dict, model_name: str) -> dict:
     }
 
 
+def disable_thinking_kwargs(model_cfg: dict) -> dict:
+    """该模型「关掉思考模式」要补的参数（供 get_model 与原生 Batch 请求共用）
+
+    模型配置里写了 "disable_thinking" 就整体以配置为准，否则按 provider 取默认值。
+    原生 Batch 走裸 HTTP，没有 langchain 的 extra_body 包装，调用方需要自行摊平
+    （见 batch_inference._flatten_extra）。
+    """
+    provider = str(model_cfg.get("provider") or "")
+    return dict(model_cfg.get("disable_thinking") or _DISABLE_THINKING_DEFAULTS.get(provider) or {})
+
+
 def get_model(model_name: str, disable_thinking: bool = False):
     """按配置初始化 chat model
 
@@ -154,9 +165,7 @@ def get_model(model_name: str, disable_thinking: bool = False):
         "max_retries": 0,
     }
     if disable_thinking:
-        disable_kwargs = model_cfg.get("disable_thinking") or _DISABLE_THINKING_DEFAULTS.get(
-            kwargs["model_provider"]
-        )
+        disable_kwargs = disable_thinking_kwargs(model_cfg) or None
         if disable_kwargs is None:
             raise ValueError(
                 f"不知道 provider '{kwargs['model_provider']}' 该怎么关思考模式，"

@@ -61,6 +61,7 @@ sg.alter_node 返回的 history 口径）是刻意的：它们是那套口径的
     .venv/bin/python all_in_one.py --corpus-type 趋向动词 --limit 3    # 换语料类型
     .venv/bin/python all_in_one.py --limit 5 --allow-retry            # 允许补发一次请求（默认不补）
     .venv/bin/python all_in_one.py --limit 200 --all-candidates --workers 8   # 全量：与 pair 图逐条对账
+    .venv/bin/python all_in_one.py --limit 200 --all-candidates --batch auto  # 整批提交（原生 Batch 优先）
 
 --workers 只改**同时有多少条记录在跑**，不改每条记录的语义：一条记录仍至多一次调用，
 落盘顺序也仍是输入顺序（pool.map 按输入顺序产出、由主线程逐条写）。与 pair 图对账按
@@ -87,6 +88,7 @@ from langchain_core.callbacks import BaseCallbackHandler
 from pydantic import Field, create_model
 
 import agents as agent_factory
+import batch_inference as bi
 import config
 import file_paths
 import retry
@@ -814,8 +816,20 @@ def _lookups(outcome: _Outcome) -> dict:
     }
 
 
-def process_state(state: dict, *, ctx: "_Context", args: argparse.Namespace, call_agent, counter: CallCounter) -> dict:
-    """跑一条记录：纯规则改写 →（改写成功才）一次调用 → 按闸门装配 → 落盘用的记录"""
+def process_state(
+    state: dict,
+    *,
+    ctx: "_Context",
+    args: argparse.Namespace,
+    call_agent,
+    counter: CallCounter,
+    precomputed: tuple[dict | None, str | None, int] | None = None,
+) -> dict:
+    """跑一条记录：纯规则改写 →（改写成功才）一次调用 → 按闸门装配 → 落盘用的记录
+
+    precomputed 是批量推理已经拿到的 (dumps, error, requests)：给了就不再发同步请求，
+    只把消息再拼一遍供 history 记录（纯本地、不调 LTP）。
+    """
     started = time.perf_counter()
     state = _apply(state, sg.alter_node(ctx.agents.need("alter"))(state))
 
@@ -827,6 +841,13 @@ def process_state(state: dict, *, ctx: "_Context", args: argparse.Namespace, cal
                 f"user message（第 {state['record'].get('line_no')} 行语料，待选句 {state.get('candidate_index')}）",
                 prepared.message,
             )
+        elif precomputed is not None:
+            dumps, error, requests = precomputed
+            # 原生批量不计入「同步请求数」；同步回退那一路已经由 call_once 记过账，
+            # 这里的 requests 恒为 0，避免同一批请求被算两次。
+            if requests:
+                counter.bump()
+                counter.add_requests(requests)
         elif ctx.llm:
             dumps, error, requests = call_once(
                 call_agent,
@@ -1068,6 +1089,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="并发处理的记录数（LLM 调用是 IO 密集）；默认 1 = 逐条跑。只改同时跑几条，"
         "不改每条记录的语义（仍至多一次调用），输出顺序也仍是输入顺序",
     )
+    sr.add_batch_args(parser)
     parser.add_argument(
         "--no-llm",
         action="store_true",
@@ -1221,6 +1243,77 @@ def main(argv: list[str] | None = None) -> None:
     pair_calls = 0
     """按每状态走到哪一步累加的 pair 侧朴素调用数（不计其按句/按消息的复用，见收尾打印）"""
     started = time.time()
+
+    # ---- 批量推理（原生 Batch 优先，失败回退同步）----
+    # 本脚本一条记录只有一次调用，天然适合整批提交：先把所有 altered 状态的消息拼好，
+    # 一次送出去，再按 key 回放到 process_state。闸门/查表仍在 assemble 里按原口径施加。
+    batch_session = None
+    prepared_keys: dict[int, str] = {}
+    if ctx.llm and getattr(args, "batch", "off") != "off":
+        profile = bi.batch_profile(args.model)
+        if profile.enabled:
+            cache_path = (
+                Path(args.batch_cache)
+                if getattr(args, "batch_cache", None)
+                else out_path.parent / (out_path.name + ".batch-cache.jsonl")
+            )
+            batch_session = bi.BatchSession(
+                profile,
+                cache_path=cache_path,
+                poll_seconds=getattr(args, "batch_poll_seconds", config.BATCH_POLL_SECONDS),
+                timeout_seconds=getattr(args, "batch_timeout_seconds", config.BATCH_TIMEOUT_SECONDS),
+                chunk_size=getattr(args, "batch_chunk_size", config.BATCH_CHUNK_SIZE),
+                retry_policy=ctx.retry_policy,
+                resume=bool(getattr(args, "batch_resume", False)),
+                strict_native=getattr(args, "batch", "auto") == "native",
+            )
+            print(f"批处理：{profile.describe()}")
+        elif getattr(args, "batch", "auto") == "native":
+            raise SystemExit(f"错误：--batch native 不可用 —— {profile.describe()}")
+        else:
+            print(f"批处理：{profile.describe()}（回退同步执行）")
+
+    if batch_session is not None:
+        alter_node = sg.alter_node(ctx.agents.need("alter"))
+        items_by_key: dict[str, bi.BatchItem] = {}
+        for index, state in enumerate(states):
+            applied = _apply(state, alter_node(state))
+            if applied.get("stage") != "altered":
+                continue
+            prepared = prepare(applied, ctx, args)
+            key = bi.item_key("all_in_one", prepared.message, ctx.system_prompt)
+            prepared_keys[index] = key
+
+            def _sync(message: str = prepared.message) -> tuple:
+                dumps, error, _requests = call_once(
+                    call_agent,
+                    message,
+                    counter,
+                    retry_policy=getattr(ctx, "retry_policy", None),
+                )
+                return dumps, error
+
+            # custom_id 必须唯一：重复语料/相同候选会拼出同一条消息，按 key 去重后
+            # 只提交一次，prepared_keys 仍把每个 state 映射到同一结果。
+            items_by_key[key] = bi.BatchItem(
+                key=key,
+                agent_name="all_in_one",
+                system_prompt=ctx.system_prompt,
+                content=prepared.message,
+                response_model=ctx.verdict_model,
+                sync_call=_sync,
+            )
+        items = list(items_by_key.values())
+        if items:
+            print(f"批处理：提交 {len(items)} 条请求（{batch_session.profile.describe()}）")
+            batch_session.submit_direct(items, fallback_workers=max(1, args.workers))
+        writer.extra_summary["batch"] = batch_session.summary()
+        print(
+            f"批处理完成：{batch_session.summary()['items_completed']} 条成功／"
+            f"{batch_session.summary()['items_failed']} 条失败（回退同步 "
+            f"{batch_session.summary()['fallback_items']} 条）"
+        )
+
     print(f"输出文件：{out_path}")
     if args.no_pairs_csv:
         print("成对信息 csv：本次不导出（--no-pairs-csv）")
@@ -1231,19 +1324,40 @@ def main(argv: list[str] | None = None) -> None:
     # 顺序是完成顺序，但两侧收尾都由 ResultWriter.finish 按同一个键重排，所以两份文件最终同序、
     # 可逐行对账（本侧的重排是兜底，顺序本来就对）。worker 里只有 CallCounter 在自加，
     # 它自带锁；异常照旧在此处抛出（与 runner 的 pool.map 同一行为），不吞进记录里。
-    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
-        for record in pool.map(
-            lambda state: process_state(state, ctx=ctx, args=args, call_agent=call_agent, counter=counter),
-            states,
-        ):
-            writer.write(record)
-            for name, blocked in record["all_in_one"]["suppressed"].items():
-                if blocked:
-                    suppressed[name] += 1
-            if record["all_in_one"]["error"]:
-                failed += 1
-                failed_lines.append(record["line_no"])
-            pair_calls += record["all_in_one"]["pair_llm_calls"]
+    def emit(record: dict) -> None:
+        nonlocal failed, pair_calls
+        writer.write(record)
+        for name, blocked in record["all_in_one"]["suppressed"].items():
+            if blocked:
+                suppressed[name] += 1
+        if record["all_in_one"]["error"]:
+            failed += 1
+            failed_lines.append(record["line_no"])
+        pair_calls += record["all_in_one"]["pair_llm_calls"]
+
+    if batch_session is not None:
+        # 结果已经全部在本地：顺序跑装配与落盘，输出顺序天然等于输入顺序
+        for index, state in enumerate(states):
+            key = prepared_keys.get(index)
+            hit = batch_session.results.get(key) if key else None
+            precomputed = (hit.get("dumps"), hit.get("error"), 0) if hit is not None else None
+            emit(
+                process_state(
+                    state,
+                    ctx=ctx,
+                    args=args,
+                    call_agent=call_agent,
+                    counter=counter,
+                    precomputed=precomputed,
+                )
+            )
+    else:
+        with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+            for record in pool.map(
+                lambda state: process_state(state, ctx=ctx, args=args, call_agent=call_agent, counter=counter),
+                states,
+            ):
+                emit(record)
 
     # 各 agent 的调用账：本脚本的 agent 一律 llm=False，数值恒为全零，但 summary 的形状与 pair 图一致
     writer.agent_stats = {name: agent.stats() for name, agent in ctx.agents.items()}

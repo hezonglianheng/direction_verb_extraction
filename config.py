@@ -113,6 +113,27 @@ LLM_RETRY_BACKOFF_MAX_SECONDS = 60.0
 LLM_RETRY_JITTER_SECONDS = 0.5
 """每次退避额外叠加的随机抖动上限，避免多个模型/候选同时重试把限流打得更死"""
 
+# ---- 批量推理（见 batch_inference.py）----
+BATCH_MODE = "auto"
+"""批量推理的默认模式：auto / native / off（命令行 --batch 可覆盖）
+
+auto：模型配置声明了可用批量入口（OpenAI、OpenRouter，或显式 batch 配置）就走原生
+Batch；否则同步执行。native：必须用原生，不可用即报错。off：完全走原同步链路。
+"""
+
+BATCH_POLL_SECONDS = 30.0
+"""轮询原生 batch 状态的间隔秒数"""
+
+BATCH_TIMEOUT_SECONDS = 86400.0
+"""等待单个原生 batch 完成的上限秒数（0 = 不限）
+
+超时不会重复提交：batch ID 已写进 `<结果>.batch-cache.jsonl.jobs.json`，下次加
+--batch-resume 先收旧批。原生 batch 的完成窗口通常是 24 小时，默认与它对齐。
+"""
+
+BATCH_CHUNK_SIZE = 5000
+"""一个原生 batch 最多包含多少条请求；超出会分片提交（每片一个 batch）"""
+
 VOTING_MODEL_WORKERS = 0
 """多模型投票时同时跑几个模型；0 = 配置了几个模型就同时跑几个
 
