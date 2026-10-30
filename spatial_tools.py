@@ -44,6 +44,7 @@ b 侧会收窄回原词那一组，判定表就永远只在自己那一组里打
 import csv
 import hashlib
 import json
+import threading
 import unicodedata
 from datetime import datetime
 from functools import lru_cache
@@ -2043,17 +2044,13 @@ def write_pairs_csv(
 # --------------------------------------------------------------------------
 
 
-def parse_sentence_text(sentence: str) -> str:
-    """对句子做分词、词性标注与依存句法分析，返回文本形式的句法证据
+def render_syntax(cws: list[str], pos: list[str], dep: dict) -> str:
+    """把一份已算好的 LTP 结果渲染成文本形式的句法证据（纯函数，不碰模型）
 
     每个 token 前面都打了它从 0 开始的下标（`3:进/v`）：一是让「第 N 个词」这种说法能直接核对，
     二是分词行按空格分隔，token 本身可能含空白（实测 location 语料的 token 里约 1.2% 带尾空格，
     如 `": "`），照着空格数会整体数错一位。
     """
-    cws = _cache.get_task_value(sentence, config.CWS)
-    pos = _cache.get_task_value(sentence, config.POS)
-    dep = _cache.get_task_value(sentence, config.DEP)
-
     dep_lines = []
     for idx, (head, label) in enumerate(zip(dep["head"], dep["label"])):
         # LTP 的 head 是从 1 开始的下标，0 表示指向根节点（核心谓词）
@@ -2071,39 +2068,152 @@ def parse_sentence_text(sentence: str) -> str:
     )
 
 
-def prefill_ltp(sentences: Iterable[str], chunk_size: int | None = None) -> int:
-    """批量预填充句法分析缓存
+def parse_sentence_text(sentence: str) -> str:
+    """对单句做 LTP 分析并渲染句法证据（**会触发单句推理**，仅供显式调用/兼容旧代码）
 
-    在跑 agent 之前把整批句子一次性喂给 LTP：一来避免每个句子首次调用时单句前向
-    （批量推理快约 4 倍，见 sentenceTable.py），二来让后续多线程跑 agent 时
-    不再有并发调用同一份 LTP 模型的窗口。返回实际推理的句子数。
+    LLM 标注链路不再调用本函数：消息里的句法证据一律从 prepare_syntax 建好的运行级证据表
+    读取（见 syntax_text），保证每个唯一句子只推理一次、worker 内不再补算。
+    """
+    cws = _cache.get_task_value(sentence, config.CWS)
+    pos = _cache.get_task_value(sentence, config.POS)
+    dep = _cache.get_task_value(sentence, config.DEP)
+    return render_syntax(cws, pos, dep)
+
+
+_SYNTAX_EVIDENCE: dict[str, dict] = {}
+"""运行级句法证据表：{句子: {"text": str | None, "error": str | None}}
+
+由 prepare_syntax 在跑批前填好，之后所有 agent 只读。它是「一次调用、处处使用」的落点：
+- 多模型投票时几个模型共用同一份（LTP 是模型无关的）；
+- 缓存条目被淘汰也不影响已渲染的文本；
+- 未准备的句子返回 None 并降级，绝不在 worker 里补算。
+"""
+_SYNTAX_LOCK = threading.Lock()
+_SYNTAX_WARNED = False
+"""未准备句子的告警只打一次，避免逐条刷屏"""
+
+
+def prepare_syntax(sentences: Iterable[str], chunk_size: int | None = None) -> dict:
+    """跑批前一次性准备整批句子的句法证据（每个唯一句子只做一次 LTP 推理）
+
+    分片预填充、**每片推理完立刻渲染并入证据表**：整批一次填进 LRU 后，超出容量时早期句子
+    会被淘汰，等到拼消息再渲染就又要单句推理。分片后每片的大小不超过缓存容量，渲染发生在
+    下一片预填充之前，因此不受淘汰影响。
+
+    Args:
+        sentences (Iterable[str]): 本图会让模型看到的全部句子（图自己的 plan 给出）
+        chunk_size (int, optional): 每片多少句；默认 config.LTP_BATCH_CHUNK
+
+    Returns:
+        dict: {"sentences", "inferred", "cached", "failed"}
+            inferred  实际送入 LTP 的句子数（其余是上次已准备/已缓存的）
+            cached    证据表里原本就有、这次跳过推理的句子数
+            failed    推理或渲染失败、只能降级的句子数（失败原因也记进证据表）
+    """
+    unique = [s for s in dict.fromkeys(sentences) if isinstance(s, str) and s]
+    missing = []
+    for sentence in unique:
+        with _SYNTAX_LOCK:
+            if sentence not in _SYNTAX_EVIDENCE:
+                missing.append(sentence)
+    stat = {"sentences": len(unique), "inferred": 0, "cached": len(unique) - len(missing), "failed": 0}
+    size = max(1, int(chunk_size or config.LTP_BATCH_CHUNK))
+    for start in range(0, len(missing), size):
+        chunk = missing[start : start + size]
+        stat["inferred"] += prefill_ltp(chunk, chunk_size=len(chunk))
+        for sentence in chunk:
+            text, error = _render_cached_syntax(sentence)
+            with _SYNTAX_LOCK:
+                _SYNTAX_EVIDENCE[sentence] = {"text": text, "error": error}
+            if error:
+                stat["failed"] += 1
+    return stat
+
+
+def _render_cached_syntax(sentence: str) -> tuple[str | None, str | None]:
+    """从 LTP 缓存**只读**渲染句法证据；缺任何一项都返回 (None, 原因)，不触发推理"""
+    cws = _cache.get_cached(sentence, config.CWS)
+    pos = _cache.get_cached(sentence, config.POS)
+    dep = _cache.get_cached(sentence, config.DEP)
+    missing = [name for name, value in ((config.CWS, cws), (config.POS, pos), (config.DEP, dep)) if value is None]
+    if missing:
+        return None, f"预填充后缓存里缺少 {'/'.join(missing)}（句子可能超出缓存容量）"
+    try:
+        return render_syntax(cws, pos, dep), None
+    except Exception as exc:  # noqa: BLE001 —— 渲染失败只降级，不让它决定这条记录跑不跑
+        return None, f"句法证据渲染失败：{exc!r}"
+
+
+def syntax_text(sentence: str) -> str | None:
+    """读取已准备的句法证据（纯内存查找；未准备时返回 None，绝不触发 LTP 推理）"""
+    with _SYNTAX_LOCK:
+        entry = _SYNTAX_EVIDENCE.get(sentence)
+    if entry is None:
+        global _SYNTAX_WARNED
+        if not _SYNTAX_WARNED:
+            _SYNTAX_WARNED = True
+            print(
+                "警告：有句子没有经过 prepare_syntax 准备，消息里将省略句法证据；"
+                "LLM 标注链路不再在线补算 LTP"
+            )
+        return None
+    return entry.get("text")
+
+
+def syntax_error(sentence: str) -> str | None:
+    """该句句法证据的准备失败原因（未准备或成功时为 None）"""
+    with _SYNTAX_LOCK:
+        entry = _SYNTAX_EVIDENCE.get(sentence) or {}
+    return entry.get("error")
+
+
+def syntax_ready(sentence: str) -> bool:
+    """该句的句法证据是否已准备（有文本）"""
+    with _SYNTAX_LOCK:
+        entry = _SYNTAX_EVIDENCE.get(sentence) or {}
+    return bool(entry.get("text"))
+
+
+def reset_syntax_evidence() -> None:
+    """清空运行级证据表（离线测试与对照实验用）"""
+    global _SYNTAX_WARNED
+    with _SYNTAX_LOCK:
+        _SYNTAX_EVIDENCE.clear()
+    _SYNTAX_WARNED = False
+
+
+def prefill_ltp(sentences: Iterable[str], chunk_size: int | None = None) -> int:
+    """批量预填充 LTP 原始任务缓存（只填 LRU，不渲染）
+
+    一般应直接用 prepare_syntax：它在本函数之上把渲染结果存进运行级证据表。
+    保留本函数供筛选阶段等只需要原始 LTP 结果的调用方使用。
     """
     return _cache.prefill(sentences, chunk_size=chunk_size)
 
 
 def cache_ready(sentence: str) -> bool:
-    """该句的句法分析结果是否都已在缓存里（预填充后的自检用）
-
-    推理是在锁外做的，所以"已经预填充过"这件事必须能查，不能只是假设。
-    """
+    """该句的 LTP 基础任务是否都还在缓存里（预填充后的自检用）"""
     return _cache.has_base_tasks(sentence)
 
 
 @tool
 def parse_sentence(sentence: str) -> str:
-    """对句子做中文分词、词性标注和依存句法分析，返回结构化的句法证据。
+    """读取该句**已准备**的句法证据（分词/词性 + 依存句法）。
 
-    每个 token 前面是它从 0 开始的下标（`3:进/v`），与「第几个词」这种说法可以逐位对上。
-    判断句子的语义特征或比较两句意义时，应当先调用本工具查看真实句法结构，
-    尤其是确认方位词/趋向动词与哪个成分搭配、承担什么句法角色。
+    本工具只读跑批前准备的证据，不会现场跑 LTP。每个 token 前面是它从 0 开始的下标
+    （`3:进/v`），与「第几个词」这种说法可以逐位对上。
 
     Args:
-        sentence (str): 待分析的单个句子
+        sentence (str): 待查看的单个句子（必须与消息里给出的句子逐字相同）
 
     Returns:
-        str: 分词（词/词性）、依存句法（词 —关系—> 中心词）
+        str: 分词（词/词性）、依存句法（词 —关系—> 中心词）；未准备时返回一句说明
     """
-    return parse_sentence_text(sentence)
+    text = syntax_text(sentence)
+    if text:
+        return text
+    reason = syntax_error(sentence)
+    return "该句的句法证据未在跑批前准备，无法在线补算" + (f"（{reason}）" if reason else "") + "；请仅凭句子作答。"
 
 
 @tool

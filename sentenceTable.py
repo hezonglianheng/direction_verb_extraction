@@ -107,6 +107,15 @@ class SentenceTaskCache:
         """
         return not self._need_base_tasks(sentence)
 
+    def get_cached(self, sentence: str, task: str):
+        """**只读**缓存值：没有就返回 None，绝不触发推理
+
+        与 get_task_value 的分工：后者是"取不到就算"，会在锁外补一次单句前向；
+        句法证据的渲染（spatial_tools._render_cached_syntax）必须走本方法——LLM 标注
+        链路承诺「一次准备、处处只读」，worker 里不允许再出现 LTP 推理。
+        """
+        return self._get_cached_value(sentence, task)
+
     def _infer_base(self, sentences: list[str]) -> list[dict]:
         """对一批句子跑基础四任务，并做方位词后缀切分修正
 

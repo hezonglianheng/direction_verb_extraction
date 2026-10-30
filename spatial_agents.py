@@ -654,16 +654,16 @@ def syntax_block(sentence: str) -> str | None:
     默认不给 agent 绑 parse_sentence 工具了：工具调用就是又一次 API 请求，而这边本地算好
     直接塞进消息（与 all_in_one._syntax_block 同一份文本），每一步的往返就少一次。
 
-    LTP 起不来（没装模型、显存不够）不该带走整批：省掉这一段，模型仍能凭句子作答，只是退化成
-    「只凭语感」。真出岔子时由 spatial_runner._prefill 在预填充那一步先报——跑批前整批句子都
-    要过一遍 LTP，那里失败是响的，这里的 None 只是单句失败时的兜底。
+    这里**只读**运行级证据表（spatial_tools.syntax_text），不再逐次调用 LTP 分析：
+    跑批前的 prepare_syntax 对每个唯一句子做一次分析，多模型、多候选、多 agent 共用同一份
+    文本；未准备或准备失败的句子返回 None 降级，worker 里不会出现补算。
 
-    做成模块级函数是为了给 verify_focus_wiring.py 留一个接缝：离线测试把它换成确定性假文本，
-    「全程不加载 LTP」这条承诺才继续成立（见该脚本的模块 docstring）。
+    做成模块级函数是为了给离线测试留一个接缝：把它换成确定性假文本时，
+    「全程不加载 LTP」这条承诺才继续成立。
     """
     try:
-        return st.parse_sentence_text(sentence)
-    except Exception:  # noqa: BLE001 —— 句法分析失败只降级，不让它决定这一条记录跑不跑
+        return st.syntax_text(sentence)
+    except Exception:  # noqa: BLE001 —— 句法证据缺失只降级，不让它决定这一条记录跑不跑
         return None
 
 

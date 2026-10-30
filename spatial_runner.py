@@ -564,30 +564,27 @@ def _print_agent_stats(stats: dict[str, dict]) -> None:
 
 
 def _prefill(records: list[dict], agents, spec: sg.GraphSpec) -> None:
-    """跑批前把整批句子一次性喂给 LTP
+    """跑批前把整批句子一次性分析好，并把**渲染后的句法证据**存进运行级证据表
 
-    一来省下逐句前向的开销（批量推理快约 4 倍，见 sentenceTable.py），
-    二来让后续多线程尽量直接读缓存；未命中的推理由 sentenceTable._infer_lock 串行保护。
-    哪些句子会被用到由图声明（spec.plan），预填充后再检查缓存命中情况。
+    与旧的「只预热 LRU」不同：prepare_syntax 每片推理完立刻渲染入表（见
+    spatial_tools.prepare_syntax），所以后面所有 agent/所有候选只读同一份文本：
+    - 不会因为 LRU 淘汰而在拼消息时重新推理；
+    - 多模型投票时几个模型共用同一份（LTP 与模型无关）；
+    - 每个唯一句子只调用一次 LTP（后缀切分内部重跑不算在「按句调用」里）。
+    哪些句子会被用到由图声明（spec.plan）。
     """
     sentences = [s for s in spec.plan(records, agents) if s]
-    unique = list(dict.fromkeys(sentences))
-    # 一次预填超过缓存容量会使早期句子被 LRU 淘汰；处理 state 尚未开始，
-    # 按容量分片预填也会让后片把前片淘汰。
-    # 继续使用整批预填，并在超过容量时明确提示，避免误报分片已解决重复推理。
-    filled = st.prefill_ltp(unique)
-    print(f"LTP 预填充：本图需 {len(unique)} 句，实际送入模型 {filled} 句（其余命中缓存）")
-
-    missing = [s for s in unique if not st.cache_ready(s)]
+    stat = st.prepare_syntax(sentences)
+    print(
+        f"LTP 预填充：本图需 {stat['sentences']} 句，实际送入模型 {stat['inferred']} 句"
+        f"（其余 {stat['cached']} 句已有证据）"
+    )
+    if stat["failed"]:
+        print(f"警告：{stat['failed']} 句的句法证据准备失败，消息里将省略这些句子的证据")
+        # 失败原因留在证据表里（spatial_tools.syntax_error），不在这里逐句打印
+    missing = [s for s in sentences if s and not st.syntax_ready(s)]
     if missing:
-        # 漏网的句子由 worker 现场补算，那一步走 sentenceTable._infer_lock 的串行边界，
-        # 不会退化成并发调同一份模型（见该锁的说明）
-        print(f"警告：预填充后仍有 {len(missing)} 句不在缓存里，多线程下可能补算（已串行保护）")
-    if len(unique) > config.CACHE_MAX_SIZE:
-        print(
-            f"警告：需预填充 {len(unique)} 句，超过缓存容量 {config.CACHE_MAX_SIZE}；"
-            "早期句子可能被淘汰并重新推理。可缩小 --limit，或提高 config.CACHE_MAX_SIZE"
-        )
+        print(f"警告：{len(missing)} 句没有可用句法证据；worker 不会再补算 LTP（消息里省略该段）")
 
 
 def _prefill_reality(records: list[dict], agents, spec: sg.GraphSpec, workers: int, *, verbose: bool = True) -> dict:

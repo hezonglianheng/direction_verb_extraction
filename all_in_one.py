@@ -41,7 +41,7 @@ st.PAIR_CSV_COLUMNS 给出，同一段语料跑下来两侧的 id 必然逐字�
 按消息的复用，故是上界；精确数看 pair 产物 summary 里的 agent_stats.roundtrips）。
 
 为什么不给 parse_sentence 工具：工具调用就是又一次 API 请求，八次往返正是要消掉的东西。
-句法证据由本地 st.parse_sentence_text 算好塞进消息（--no-syntax 可以省掉，但那样就与
+句法证据由跑批前一次 st.prepare_syntax 准备好、消息里只读 st.syntax_text（--no-syntax 可以省掉，但那样就与
 六 agent 那条路不可比了——那边同样把句法证据内联进消息，只是没有这个开关）。
 
 记录形状、status 词表、闸门顺序、查表优先级全部复用 spatial_graphs.py 与 spatial_agents.py
@@ -268,15 +268,16 @@ class _Prepared(NamedTuple):
 
 
 def _syntax_block(sentence: str) -> tuple:
-    """一段句法证据（分词/词性 + 依存句法），取不到时返回原因
+    """一段**已准备**的句法证据（分词/词性 + 依存句法），取不到时返回原因
 
-    LTP 起不来（没装模型、显存不够）不该带走整批：省掉这一段，模型仍能凭句子作答，
-    只是退化成「只凭语感」。事实记进 all_in_one.syntax，并在启动时打一条警告。
+    与 spatial_agents.syntax_block 同源：只读 spatial_tools.syntax_text，不在拼消息时
+    再跑 LTP。跑批前由 st.prepare_syntax 对每个唯一句子分析一次（见 main）。
+    LTP 失败时整批省略句法证据，事实记进 all_in_one.syntax。
     """
-    try:
-        return st.parse_sentence_text(sentence), None
-    except Exception as e:  # 句法分析失败只降级，不让它决定这一条记录跑不跑
-        return None, f"{e!r}"
+    text = st.syntax_text(sentence)
+    if text:
+        return text, None
+    return None, st.syntax_error(sentence) or "该句的句法证据未在跑批前准备"
 
 
 def _candidates_block(label: str, focus_word: dict | None, table: dict, candidates: dict) -> str:
@@ -1169,22 +1170,22 @@ def main(argv: list[str] | None = None) -> None:
         unique = [s for s in dict.fromkeys(plan_sentences(states)) if s]
         if unique:
             try:
-                filled = st.prefill_ltp(unique)
+                stat = st.prepare_syntax(unique)
             except Exception as e:
                 ctx = ctx._replace(syntax_error=f"LTP 预填充失败：{e!r}")
                 print(f"警告：{ctx.syntax_error}；本轮省略句法证据，继续处理。")
             else:
-                print(f"LTP 预填充：本次需 {len(unique)} 句，实际送入模型 {filled} 句（其余命中缓存）")
-                # 与 spatial_runner._prefill 同一套自检：推理是在锁外做的（见 sentenceTable.get_task_value），
-                # 预填充没兜住的句子会由 worker 线程现场补算，那正是「多线程并发调同一份模型」的窗口
-                missing = [s for s in unique if not st.cache_ready(s)]
+                print(
+                    f"LTP 预填充：本次需 {stat['sentences']} 句，实际送入模型 {stat['inferred']} 句"
+                    f"（其余 {stat['cached']} 句已有证据）"
+                )
+                if stat["failed"]:
+                    print(f"警告：{stat['failed']} 句的句法证据准备失败，消息里将省略这些句子的证据")
+                # 与 spatial_runner._prefill 同一套自检：证据表没兜住的句子在拼消息时只会降级，
+                # 不会再由 worker 现场补算（见 spatial_tools.syntax_text）
+                missing = [s for s in unique if not st.syntax_ready(s)]
                 if missing:
-                    print(f"警告：预填充后仍有 {len(missing)} 句不在缓存里，--workers 大于 1 时可能并发推理")
-                if len(unique) > config.CACHE_MAX_SIZE:
-                    print(
-                        f"警告：本次需 {len(unique)} 句，超过缓存容量 {config.CACHE_MAX_SIZE}，"
-                        "多线程下可能边填边淘汰；建议减小 --limit 或调大 config.CACHE_MAX_SIZE"
-                    )
+                    print(f"警告：{len(missing)} 句没有可用的句法证据，消息里将省略该段")
 
     if args.print_prompt:
         print_numbered("system prompt（all_in_one.txt 渲染后）", ctx.system_prompt)
