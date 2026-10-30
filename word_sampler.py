@@ -50,6 +50,7 @@ import random
 from pathlib import Path
 
 from sentenceFilters import FilterGenerator, load_vocab_file
+from sentence_screening import is_judgement_eligible
 
 _PROJECT_ROOT = Path(__file__).resolve().parent
 
@@ -239,14 +240,18 @@ def scan_by_word(corpus: Path, vocab: set[str]) -> tuple[dict[str, list[int]], d
         tuple[dict[str, list[int]], dict[str, int]]: (词 -> 行号列表，各计数)
     """
     lines_by_word: dict[str, list[int]] = {}
-    counts = {"total": 0, "blank": 0, "no_word": 0, "multi_word": 0}
+    counts = {"total": 0, "blank": 0, "ineligible": 0, "no_word": 0, "multi_word": 0}
     with open(corpus, "r", encoding="utf-8") as f:
         for line_no, line in enumerate(f, start=1):
             if not line.strip():
                 counts["blank"] += 1
                 continue
             counts["total"] += 1
-            words = target_words(json.loads(line), vocab)
+            record = json.loads(line)
+            if not is_judgement_eligible(record):
+                counts["ineligible"] += 1
+                continue
+            words = target_words(record, vocab)
             if not words:
                 counts["no_word"] += 1
                 continue
@@ -314,6 +319,9 @@ def write_sample(corpus: Path, chosen: dict[int, list[str]], out_path: Path) -> 
             if not words:
                 continue
             record = json.loads(line)
+            if not is_judgement_eligible(record):
+                # 正常情况下扫描阶段已排除；这里兜住两遍读取之间文件被换掉的情形。
+                continue
             out.write(
                 json.dumps(
                     record | {"sampled_words": sorted(words), "source_line_no": line_no, "line_no": line_no},
@@ -418,6 +426,11 @@ def run_corpus(corpus: Path, args: argparse.Namespace) -> dict:
         f"命中情况：{expanded} 条（展开后，含 {counts['multi_word']} 条含多个目标词）"
         f"，取不到目标词的 {counts['no_word']} 条"
     )
+    if counts["ineligible"]:
+        print(
+            f"已跳过 {counts['ineligible']} 条不可判定语料（LLM false/error/limit）；"
+            "只有 true/no_llm 进入抽样，避免挤占可用配额"
+        )
     print(f"抽样（ratio={args.ratio} seed={args.seed}）：{sampled} 条")
     for word in sorted(lines_by_word, key=lambda w: (-len(lines_by_word[w]), w)):
         print(f"  {word:<8}{len(lines_by_word[word]):>9} 条 → 抽 {sampled_by_word[word]:>7} 条")
@@ -438,6 +451,7 @@ def run_corpus(corpus: Path, args: argparse.Namespace) -> dict:
         "min_per_word": args.min_per_word,
         "total_records": counts["total"],
         "blank_lines": counts["blank"],
+        "ineligible_records": counts["ineligible"],
         "records_without_target_word": counts["no_word"],
         "records_with_multiple_words": counts["multi_word"],
         "distinct_words": len(lines_by_word),
