@@ -92,6 +92,13 @@ _FAMILY_HINTS: tuple[tuple[str, str], ...] = (
     ("方位", "方位词"),
 )
 
+_PROGRESS_LOCK = threading.Lock()
+"""LLM 批次进度行的输出锁：多套规则、多个筛选线程同时完成批次时，保证整行不交错。
+
+计时/计数仍在各线程内完成；锁只覆盖“累加完成数 + 打印这一行”这一小段，
+不包住模型调用，因此不会把并发筛选串行化。
+"""
+
 
 class ExtractionVerdict(BaseModel):
     """单条筛选结果：只允许 true/false，理由另附（批处理里的每个 item 仍是这个形状）"""
@@ -598,8 +605,43 @@ class SentenceScreener:
                     self._stats["requests"] += len(batches)
                     self._stats["batches"] += len(batches)
                 batch_inputs = [[first_task[key] for key in batch_keys] for batch_keys in batches]
+                total_batches = len(batch_inputs)
+                total_items = sum(len(batch) for batch in batch_inputs)
+                progress = {"done_batches": 0, "done_items": 0}
+
+                def ask_with_progress(batch_tasks: list[tuple[int, str, dict, Any, list[str], Any]]) -> list[dict]:
+                    """跑完一批后打印进度，再原样返回结果
+
+                    进度行只读计数、不改 verdict/缓存/预算；即使 stdout 被关闭、管道断开，
+                    或日志流由自定义对象接管后抛出普通异常，也吞掉输出异常，避免日志故障
+                    反过来中断筛选。线程池的 map 按输入顺序返回结果，但本包装函数在工作
+                    线程里完成一批就打印一批，因此慢批次不会拖住其他已完成批次的可见性。
+                    """
+                    results = self._ask_batch(batch_tasks)
+                    with _PROGRESS_LOCK:
+                        progress["done_batches"] += 1
+                        progress["done_items"] += len(batch_tasks)
+                        with self._stats_lock:
+                            items_sent = self._stats["items_sent"]
+                            cache_hits_total = self._stats["cache_hits"]
+                        try:
+                            print(
+                                f"[LLM 筛选] {self.family}：批次完成 "
+                                f"{progress['done_batches']}/{total_batches}，"
+                                f"本轮完成 {progress['done_items']}/{total_items} 条，"
+                                f"累计送判（已预占） {items_sent} 条，"
+                                f"累计缓存命中 {cache_hits_total} 条",
+                                flush=True,
+                            )
+                        except Exception:  # noqa: BLE001 —— 进度输出是附属产物，不能反过来
+                            # 影响筛选结果：管道断开、stdout 已关闭、或被日志适配器接管后抛出
+                            # 的普通异常都在这里止住；KeyboardInterrupt/SystemExit 仍会传播。
+                            # 下一批仍会尝试打印。
+                            pass
+                    return results
+
                 with ThreadPoolExecutor(max_workers=min(self.workers, len(batch_inputs))) as pool:
-                    batch_results = list(pool.map(self._ask_batch, batch_inputs))
+                    batch_results = list(pool.map(ask_with_progress, batch_inputs))
                 for batch_keys, results in zip(batches, batch_results):
                     for key, result in zip(batch_keys, results):
                         resolved[key] = result
