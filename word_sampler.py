@@ -35,7 +35,7 @@
 当成整个进程的内存。启动也多花约 3.5 秒。
 
 用法：
-    .venv/bin/python word_sampler.py                                  # 两份语料各抽 10%
+    .venv/bin/python word_sampler.py                                  # 两份语料各抽 1%
     .venv/bin/python word_sampler.py --ratio 0.05 --seed 0            # 换比例，固定种子
     .venv/bin/python word_sampler.py --corpus results/direction_corpus.jsonl
     .venv/bin/python word_sampler.py --dry-run                        # 只统计逐词计数，不落盘
@@ -49,6 +49,7 @@ import json
 import random
 from pathlib import Path
 
+import file_paths
 from sentenceFilters import FilterGenerator, load_vocab_file
 from sentence_screening import is_judgement_eligible
 
@@ -306,14 +307,21 @@ def write_sample(corpus: Path, chosen: dict[int, list[str]], out_path: Path) -> 
     会把 `line_no` 改写成当前文件的物理行号，并把原本的源行号留进 `source_line_no`。
     两份都在，重排、合并或换一份抽样文件之后仍能回查原句。
 
-    按语料原顺序输出，只重放一次文件、O(1) 内存。
+    对已经带 `source_line_no` 的记录再次抽样时**保留原值**，只更新当前文件的 `line_no`；
+    否则二次抽样会把「原句来自哪一行」覆盖成本文件的物理行号，下游回查就指错了。
+
+    按语料原顺序输出，只重放一次文件、O(1) 内存；先写同目录临时文件，成功后原子替换，
+    中途异常不会留下半份输出或截断上一版。
 
     这里没有调 spatial_tools.write_jsonl：它一次收一份完整的记录列表，要先把十几万条读进内存，
     正是本模块要避开的；spatial_tools.append_jsonl 每条都开关一次文件，十几万次也受不了。
     落盘写法（json.dumps(..., ensure_ascii=False) + "\\n"、encoding="utf-8"）与那两个函数一致。
     """
+    # 直接调用本函数（不经过 main）时也要先拒绝覆盖输入：原子写只保证失败不毁旧文件，
+    # 不负责判断目标是不是输入语料本身。
+    file_paths.validate_output_paths([corpus], [out_path])
     written = 0
-    with open(corpus, "r", encoding="utf-8") as f, open(out_path, "w", encoding="utf-8") as out:
+    with open(corpus, "r", encoding="utf-8") as f, file_paths.atomic_write_text(out_path) as out:
         for line_no, line in enumerate(f, start=1):
             words = chosen.get(line_no)
             if not words:
@@ -322,9 +330,12 @@ def write_sample(corpus: Path, chosen: dict[int, list[str]], out_path: Path) -> 
             if not is_judgement_eligible(record):
                 # 正常情况下扫描阶段已排除；这里兜住两遍读取之间文件被换掉的情形。
                 continue
+            source_line_no = record.get("source_line_no")
+            if isinstance(source_line_no, bool) or not isinstance(source_line_no, int) or source_line_no < 1:
+                source_line_no = line_no
             out.write(
                 json.dumps(
-                    record | {"sampled_words": sorted(words), "source_line_no": line_no, "line_no": line_no},
+                    record | {"sampled_words": sorted(words), "source_line_no": source_line_no, "line_no": line_no},
                     ensure_ascii=False,
                 )
                 + "\n"
@@ -414,6 +425,11 @@ def vocab_for(corpus: Path, override: str | None) -> tuple[set[str], str]:
 
 def run_corpus(corpus: Path, args: argparse.Namespace) -> dict:
     """处理一份语料：扫一遍统计 + 抽样 + （非 dry-run 时）再扫一遍落盘"""
+    out_dir = Path(args.out_dir)
+    out_file, summary_file = out_paths(corpus, out_dir)
+    # 在扫语料之前先拒绝「输出就是输入」：扫一遍大语料很贵，没必要等扫完才发现会覆盖它。
+    file_paths.validate_output_paths([corpus], [out_file, summary_file])
+
     vocab, vocab_source = vocab_for(corpus, args.vocab)
     lines_by_word, counts = scan_by_word(corpus, vocab)
     chosen, sampled_by_word = sample_lines(lines_by_word, args.ratio, args.seed, args.min_per_word)
@@ -482,9 +498,7 @@ def run_corpus(corpus: Path, args: argparse.Namespace) -> dict:
         print("（--dry-run：不落盘）")
         return summary
 
-    out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_file, summary_file = out_paths(corpus, out_dir)
     if out_file.exists():
         # 文件名是固定的（种子固定才谈得上复现），所以重跑必然覆盖；说一句免得以为在看上一版结果
         print(f"覆盖已有文件：{out_file}")
@@ -506,6 +520,18 @@ def main(argv: list[str] | None = None) -> None:
     for corpus in corpora:
         if not corpus.is_file():
             raise SystemExit(f"找不到语料文件 {corpus}")
+    # 多份输入若同名（例如不同目录下的 location_corpus.jsonl），out_paths 会生成同一个
+    # sampled_<name>.jsonl，后一份会静默覆盖前一份。开始跑之前一次性拒绝这种计划。
+    planned: list[Path] = []
+    for corpus in corpora:
+        out_file, summary_file = out_paths(corpus, Path(args.out_dir))
+        planned.extend((out_file, summary_file))
+    try:
+        # 一次比较**所有输入 × 所有输出**：只查输出之间会漏掉「第一份的输出正好是第二份
+        # 的输入（或符号链接别名）」，那样第一轮就把还没读的语料覆盖了。
+        file_paths.validate_output_paths(corpora, planned)
+    except ValueError as exc:
+        raise SystemExit(f"本次多个输入的输出路径冲突：{exc}") from exc
     for corpus in corpora:
         run_corpus(corpus, args)
 
