@@ -4,6 +4,7 @@
 配置文件
 """
 
+import hashlib
 import os
 from pathlib import Path
 
@@ -69,22 +70,48 @@ TOKENIZER_NAME = "ltp"
 """分词与句法分析的引擎名，与 LTP_MODEL_PATH 一并记进产物，用来判断旧产物能否复用"""
 
 
+def _resolve_local_path(path: str | Path) -> Path:
+    """按 locative_split 的口径解析相对路径：项目根目录优先，其次 cwd"""
+    candidate = Path(path)
+    if candidate.is_absolute():
+        return candidate
+    project_candidate = _PROJECT_ROOT / candidate
+    if project_candidate.is_file():
+        return project_candidate
+    return Path.cwd() / candidate
+
+
+def _file_sha256(path: str | Path) -> str:
+    """词表内容指纹；文件不存在时返回 "missing"，不阻断签名生成"""
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return "missing"
+
+
 def segmentation_signature() -> dict:
-    """本次分词口径的签名：引擎、模型路径、后缀切分开关与词表
+    """本次分词口径的签名：引擎、模型路径、后缀切分开关、词表与排除规则
 
     后缀切分会改变 tokens 与下标（见 LOCATIVE_SPLIT_ENABLED），所以**切分配置变了，旧产物
     的下标一律不可复用**。把这几项写进运行汇总，事后才能判断某份产物是哪个口径跑出来的、
     要不要整批重跑——光看「索引对不上」分不清是代码改了还是配置改了。
 
+    词表文件只记路径不够：同一路径下的内容被替换后，token 会变而签名不变。因此额外记录
+    词表内容的 sha256。后缀排除集与整词黑名单同样直接决定切分结果，也一并入签名。
+
     Returns:
         dict: 可直接 json 序列化的签名；值一律取字符串或有序列表，便于与历史产物逐字段比。
     """
+    vocab_path = _resolve_local_path(LOCATIVE_SPLIT_VOCAB_FILE)
     return {
         "tokenizer": TOKENIZER_NAME,
         "model_path": LTP_MODEL_PATH,
         "locative_split_enabled": LOCATIVE_SPLIT_ENABLED,
         "locative_split_vocab_file": LOCATIVE_SPLIT_VOCAB_FILE,
+        "locative_split_vocab_sha256": _file_sha256(vocab_path),
         "locative_split_allowed_pos": sorted(LOCATIVE_SPLIT_ALLOWED_POS),
+        "locative_split_suffix_exclude": sorted(LOCATIVE_SPLIT_SUFFIX_EXCLUDE),
+        "locative_split_token_blacklist": sorted(LOCATIVE_SPLIT_TOKEN_BLACKLIST),
     }
 
 

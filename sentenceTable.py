@@ -3,6 +3,7 @@
 from ltp import LTP
 import torch
 
+import numbers
 import threading
 from collections import OrderedDict
 from typing import Iterable
@@ -53,6 +54,22 @@ def _truncate_tail(value: dict, expected: int) -> dict:
     return trimmed
 
 
+def _tree_aligned(value: dict, expected: int) -> bool:
+    """dep/sdp 结果是否可安全索引：head/label 等长、head 在 0..expected 内
+
+    head 是 1-based 依存/语义中心下标（0 表示根）。越界头不会立刻报错，但会在下游
+    按 head-1 取词时越界或错位，所以宁可放弃本句切分。
+    """
+    head = value.get("head")
+    label = value.get("label")
+    if not isinstance(head, list) or not isinstance(label, list):
+        return False
+    if len(head) != expected or len(label) != expected:
+        return False
+    # LTP 可能返回 numpy 整数；用 numbers.Integral 兼容，不用裸 isinstance(..., int)
+    return all(isinstance(item, numbers.Integral) and 0 <= int(item) <= expected for item in head)
+
+
 def _warn_rerun_length_once(expected: int, lengths: tuple[int, ...]) -> None:
     """长度不一致只提示一次：触发它的句子每批都有，逐句打印会把日志刷爆"""
     global _rerun_length_warned
@@ -60,7 +77,8 @@ def _warn_rerun_length_once(expected: int, lengths: tuple[int, ...]) -> None:
         return
     _rerun_length_warned = True
     print(
-        f"[警告] 已分词模式下的 LTP 结果与词表长度不一致（词表 {expected}，pos/dep/sdp {list(lengths)}）。"
+        f"[警告] 已分词模式下的 LTP 结果与词表长度不一致（词表 {expected}，"
+        f"pos/dep.head/dep.label/sdp.head/sdp.label {list(lengths)}）。"
         "这是 LTP 对批内 padding 句子的已知行为：长于词表时多出的末尾一格会被截掉，"
         "短于词表时放弃该句切分。后续同类情况不再逐条提示。"
     )
@@ -182,16 +200,30 @@ class SentenceTaskCache:
             pos = rerun[config.POS][i]
             dep = rerun[config.DEP][i]
             sdp = rerun[config.SDP][i]
-            lengths = (len(pos), len(dep["head"]), len(sdp["head"]))
+            lengths = (
+                len(pos),
+                len(dep.get("head") or ()),
+                len(dep.get("label") or ()),
+                len(sdp.get("head") or ()),
+                len(sdp.get("label") or ()),
+            )
 
+            # 必须先查「短」再查「长」：旧写法用 if 长 / elif 短，同一句 pos 偏长、
+            # label 偏短时只截长的那一项，短的那项原样写回缓存，长度仍不一致。
+            if any(n < expected for n in lengths):
+                # 短于词表说明这句在 max_length 处被截断，补不回来也截不齐；
+                # 那就放弃本句的切分，保留 LTP 原本自洽的四项——绝不让长度不一致的结果进缓存。
+                _warn_rerun_length_once(expected, lengths)
+                continue
             if any(n > expected for n in lengths):
                 _warn_rerun_length_once(expected, lengths)
                 pos = pos[:expected]
                 dep = _truncate_tail(dep, expected)
                 sdp = _truncate_tail(sdp, expected)
-            elif any(n < expected for n in lengths):
-                # 短于词表说明这句在 max_length 处被截断，补不回来也截不齐；
-                # 那就放弃本句的切分，保留 LTP 原本自洽的四项——绝不让长度不一致的结果进缓存。
+
+            # 长度对齐后还要确认 dep/sdp 的结构可索引：head 是 1-based（0=根），
+            # label 与 head 等长。任何一项不合法都放弃切分，回退到 LTP 原本自洽的结果。
+            if not _tree_aligned(dep, expected) or not _tree_aligned(sdp, expected) or len(pos) != expected:
                 _warn_rerun_length_once(expected, lengths)
                 continue
 
