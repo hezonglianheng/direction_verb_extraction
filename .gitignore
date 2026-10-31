@@ -16,5 +16,5 @@ model_config/api_keys.json
 # 本机 AI 工具配置（各人自用，不入库）
 .opencode/
 
-# 本地单元测试文件
-tests/
+# 本地测试缓存（测试源码本身需要入库）
+tests/__pycache__/
