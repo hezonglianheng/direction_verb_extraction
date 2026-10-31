@@ -3,6 +3,7 @@
 """语料读写的路径检查，不依赖模型或规则引擎。"""
 
 import contextlib
+import os
 import tempfile
 from pathlib import Path
 from typing import Callable, Iterable
@@ -82,6 +83,26 @@ def atomic_write_text(path: str | Path, encoding: str = "utf-8"):
         temp.unlink(missing_ok=True)
 
 
+@contextlib.contextmanager
+def atomic_output_path(path: str | Path):
+    """给「按路径打开输出」的写入器（如 csv.writer）一个原子替换壳
+
+    与 atomic_write_text 同理，但这里不接管文件句柄：调用方拿到同目录临时路径，
+    自己用 ``open(temp, "w")`` 写；只有 with 正常退出才 replace 目标，中途异常时旧文件原样保留。
+    典型场景是流式读 JSONL 导出 CSV：解析到一半遇到坏行，不能让旧 CSV 先被截断。
+    """
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
+    os.close(fd)
+    temp = Path(temp_name)
+    try:
+        yield temp
+        temp.replace(target)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
 def iter_path_sentences(src_path: str | Path, per_file: Callable[[Path, int], Iterable], *, output_paths=()):
     """目录（或单文件）下 jsonl 的「收集 + 遍历」：**不能自身包含 yield**（E4）
 
@@ -109,6 +130,7 @@ def validate_run_outputs(
     csv_path: str | Path | None = None,
     *,
     overwrite: bool = False,
+    extra_outputs: Iterable[str | Path] = (),
 ) -> None:
     """跑批入口的输出路径总检查：在任何写入之前一次查完（E1）
 
@@ -120,9 +142,13 @@ def validate_run_outputs(
     查三件事，任一件不成立就在建文件之前退出：
       1. 输入与任何一个输出不能是同一个文件——`--out-file` 指向输入时，旧行为会把结果追加
          进输入，收尾再按 (line_no, candidate.index) 排序重写它，原始语料与结果混在一起。
-      2. 三个输出之间不能互撞：`--out-file result.csv` 时 `with_suffix(".csv")` 换出来还是
+      2. 几个输出之间不能互撞：`--out-file result.csv` 时 `with_suffix(".csv")` 换出来还是
          它自己，收尾导 csv 会覆盖刚写好的 jsonl（路径由调用方用 st.pairs_csv_path 错开）。
       3. 已有输出默认拒绝（overwrite=True 才允许）。
+
+    ``extra_outputs`` 是「本轮会写、但允许已存在」的附属文件（典型是 batch sidecar：缓存、
+    jobs 与 meta）。它们仍要参加输入/输出别名检查，否则 `--batch-cache` 误指语料时，
+    BatchSession 初始化会先截断语料；但它们不属于主产物，不能被「已有输出默认拒绝」误伤。
 
     Args:
         corpus_path: 输入语料路径（可以是目录吗——不行，跑批只吃单个 jsonl，传目录进来
@@ -130,15 +156,17 @@ def validate_run_outputs(
         out_path: 结果 jsonl 路径
         csv_path: 成对信息 csv 路径；本次不导出时给 None
         overwrite: 是否显式允许覆盖已有输出
+        extra_outputs: 本轮会写的附属文件；只查别名，不查是否已存在
     """
     out_path = Path(out_path)
-    outputs: list[Path] = [out_path]
+    main_outputs: list[Path] = [out_path]
     if csv_path is not None:
-        outputs.append(Path(csv_path))
-    outputs.append(out_path.with_suffix(".summary.json"))
+        main_outputs.append(Path(csv_path))
+    main_outputs.append(out_path.with_suffix(".summary.json"))
+    outputs = main_outputs + [Path(path) for path in extra_outputs]
     validate_output_paths([corpus_path], outputs)
     if not overwrite:
-        for output in outputs:
+        for output in main_outputs:
             if output.exists():
                 raise ValueError(
                     f"输出文件 {output} 已存在（默认拒绝覆盖，免得混入历史记录与重复 id）；"

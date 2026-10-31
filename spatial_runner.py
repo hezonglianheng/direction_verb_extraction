@@ -236,16 +236,38 @@ class ResultWriter:
         else:
             self.path.write_text("", encoding="utf-8")  # 显式覆盖：先清空，免得混入历史记录
         self.lock = threading.Lock()
+        # 常开追加句柄：write() 是长跑里的高频路径，每条都 open/close 在 Windows 上会
+        # 把文件系统开销放大到与模型调用同量级。buffering=1 是行缓冲，写一行即 flush，
+        # 保留「中途 tail 得到进度」的原行为；收尾排序前由 _close() 关闭。
+        self._handle = self.path.open("a", encoding="utf-8", buffering=1)
         self.count = 0
         self.counter_names = tuple(counter_names)
         self.counters: dict[str, Counter] = {name: Counter() for name in self.counter_names}
         self.tally = tally
         self.started_at = time.time()
 
+    def _close(self) -> None:
+        """关闭常开追加句柄；可重复调用（已关闭时什么也不做）"""
+        handle = getattr(self, "_handle", None)
+        if handle is None:
+            return
+        with self.lock:
+            if self._handle is not None:
+                self._handle.close()
+                self._handle = None
+
+    def __del__(self):
+        # 正常路径由 finish() -> _sort_records() 关闭；这里兜住异常退出或调用方中途放弃，
+        # 免得 Windows 上留下一个占用结果文件的句柄。
+        try:
+            self._close()
+        except Exception:
+            pass
+
     def write(self, record: dict) -> None:
         record = {**record, "model_name": self.model_name}
         with self.lock:
-            st.append_jsonl(record, self.path)
+            self._handle.write(json.dumps(record, ensure_ascii=False) + "\n")
             self.count += 1
             self.tally(record, self.counters)
             if self.count % 10 == 0:
@@ -265,6 +287,8 @@ class ResultWriter:
         内存里的记录写（见 finish）——csv 的行序于是**必然**等于重排后 jsonl 的行序，不必再读一遍
         文件，也不会有「两份文件次序不一致」的窗口。
         """
+        # 必须先关闭写入句柄，Windows 上文件仍被打开时 rename 会失败；也保证缓冲全部落盘。
+        self._close()
         if not self.path.exists():
             return []
         records = st.read_jsonl(self.path)
@@ -707,16 +731,16 @@ def _validate_run_outputs(
     *,
     csv_columns: tuple[tuple[str, str], ...] = (),
     overwrite: bool = False,
+    extra_outputs: tuple[str | Path, ...] = (),
 ) -> None:
     """在**首次写入之前**把这次跑批要写的几个路径一起查一遍（E1）
 
     查三件事，任一件不成立就在写盘之前退出：
-      1. 输入与任何一个输出（jsonl / 成对 csv / summary）不能是同一个文件——
-         显式 `--out-file` 与输入相同时，旧行为会把结果追加进输入、收尾再排序重写它，
-         原始语料与结果记录混在一个文件里。
+      1. 输入与任何一个输出（jsonl / 成对 csv / summary / batch sidecar）不能是同一个文件——
+         显式 `--out-file` 或 `--batch-cache` 与输入相同时，旧行为会把原始语料截断或混入结果。
       2. 几个输出之间不能互撞：`--out-file result.csv` 时 `with_suffix(".csv")` 换出来还是
          它自己，收尾导 csv 会覆盖刚写好的 jsonl（路径已由 st.pairs_csv_path 错开，这里复查）。
-      3. 已有输出默认拒绝（--overwrite 才允许），且拒绝发生在建文件之前。
+      3. 已有主产物默认拒绝（--overwrite 才允许），且拒绝发生在建文件之前；sidecar 允许复用。
 
     扩展名也在这里规定：jsonl 结果、csv 视图、summary.json 各归各位，不靠调用方自觉。
     """
@@ -728,6 +752,7 @@ def _validate_run_outputs(
         out_path,
         st.pairs_csv_path(out_path) if csv_columns else None,
         overwrite=overwrite,
+        extra_outputs=extra_outputs,
     )
 
 
@@ -806,6 +831,16 @@ def _build_model_agents(args, spec: sg.GraphSpec, corpus_type: str, model_key: s
     return agents
 
 
+def _batch_cache_path(args, out_path: str | Path, model_key: str) -> Path:
+    """单/多模型共用的 Batch sidecar 路径推导（实际写入与启动预检必须同源）"""
+    return bi.resolve_cache_path(
+        getattr(args, "batch_cache", None),
+        out_path,
+        model_key=model_key,
+        multi_model=bool(getattr(args, "models", None) and len(args.models) > 1),
+    )
+
+
 def _execute_run(
     args,
     spec: sg.GraphSpec,
@@ -850,172 +885,183 @@ def _execute_run(
         overwrite=args.overwrite,
         progress_prefix="" if verbose else f"[{model_key}] ",
     )
-    graph = spec.build(agents, writer)
-    # 实际生效的请求策略（超时/重试/退避）写进汇总：事后看到某轮特别慢，
-    # 能直接判断是模型慢还是重试多，不必翻 config.py 与模型配置去猜
-    first_agent = next(iter(agents.values()), None)
-    policy = getattr(first_agent, "retry_policy", None)
-    if policy:
-        writer.extra_summary["request_policy"] = dict(policy)
-    if log is not None:
-        # 把本轮 agent 日志的路径写进 .summary.json：事后拿到一份结果，能顺着汇总直接找到
-        # 它是哪一轮跑出来的、每个 agent 当时怎么判的，不必在 log/ 里按时间猜。
-        if getattr(log, "path", None) is not None:
-            writer.extra_summary["agent_log_file"] = str(log.path)
-        if getattr(log, "jsonl_path", None) is not None:
-            writer.extra_summary["agent_log_jsonl"] = str(log.jsonl_path)
+    try:
+        graph = spec.build(agents, writer)
+        # 实际生效的请求策略（超时/重试/退避）写进汇总：事后看到某轮特别慢，
+        # 能直接判断是模型慢还是重试多，不必翻 config.py 与模型配置去猜
+        first_agent = next(iter(agents.values()), None)
+        policy = getattr(first_agent, "retry_policy", None)
+        if policy:
+            writer.extra_summary["request_policy"] = dict(policy)
+        if log is not None:
+            # 把本轮 agent 日志的路径写进 .summary.json：事后拿到一份结果，能顺着汇总直接找到
+            # 它是哪一轮跑出来的、每个 agent 当时怎么判的，不必在 log/ 里按时间猜。
+            if getattr(log, "path", None) is not None:
+                writer.extra_summary["agent_log_file"] = str(log.path)
+            if getattr(log, "jsonl_path", None) is not None:
+                writer.extra_summary["agent_log_jsonl"] = str(log.jsonl_path)
 
-    if verbose:
-        print(f"输入语料：{corpus_path}（{len(records)} 条）")
-        print(f"输出文件：{out_path}")
-        print(f"图：{spec.name}（{spec.doc}）")
-        print("agent：" + "；".join(agent.describe() for agent in agents.values()))
-        # 逐张打印本次实际读的配置表（含 --alter-rules 换过的那张）：缺表/空表当场说清楚。
-        # 「表为空 → 一条都不改写却不提示」曾是最容易误读成「代码没接上」的情形，这一块就是
-        # 把「配置缺内容」与「代码有问题」分开的地方
-        _print_config_tables(agents)
-        # 关注词表推得出来吗：推不出来（筛选配置改名、取词表的前缀对不上）就该在这里报，
-        # 而不是等每条记录都静默回落成 match_tree[0]
-        print("关注词表：" + "；".join(f"{kind} {len(words)} 个" for kind, words in st.load_focus_vocab().items()))
-        if args.no_pairs_csv:
-            print("成对信息 csv：本次不导出（--no-pairs-csv）")
-        elif spec.csv_columns:
-            print(f"成对信息 csv：收尾导出到 {st.pairs_csv_path(out_path)}（--no-pairs-csv 可关）")
-        else:
-            # 非 pair 图的记录里没有成对字段：默认开着也导不出东西，说清楚而不是静悄悄少一个产物
-            print(f"提示：本图（{spec.name}）的记录不是成对形状，没有可导出的成对列，本次不导 csv")
-
-    batch_session = None
-    if (
-        not args.no_llm
-        and getattr(args, "batch", "off") == "native"
-        and getattr(args, "feature_deep", False)
-        and "feature" in spec.needs
-    ):
-        raise SystemExit(
-            "错误：--batch native 不能与 --feature-deep 同用（deep agent 的工具回合无法交给原生 Batch）"
-        )
-    if not args.no_llm and getattr(args, "batch", "off") != "off":
-        profile = bi.batch_profile(model_key)
-        if profile.enabled:
-            if getattr(args, "batch_cache", None):
-                cache_path = Path(args.batch_cache)
-                # 多模型投票时每个模型必须各用一份 sidecar，否则会把别的模型的结果回放进来
-                if getattr(args, "models", None) and len(args.models) > 1:
-                    cache_path = cache_path.with_name(
-                        f"{cache_path.stem}.{model_key}{cache_path.suffix}"
-                    )
+        if verbose:
+            print(f"输入语料：{corpus_path}（{len(records)} 条）")
+            print(f"输出文件：{out_path}")
+            print(f"图：{spec.name}（{spec.doc}）")
+            print("agent：" + "；".join(agent.describe() for agent in agents.values()))
+            # 逐张打印本次实际读的配置表（含 --alter-rules 换过的那张）：缺表/空表当场说清楚。
+            # 「表为空 → 一条都不改写却不提示」曾是最容易误读成「代码没接上」的情形，这一块就是
+            # 把「配置缺内容」与「代码有问题」分开的地方
+            _print_config_tables(agents)
+            # 关注词表推得出来吗：推不出来（筛选配置改名、取词表的前缀对不上）就该在这里报，
+            # 而不是等每条记录都静默回落成 match_tree[0]
+            print("关注词表：" + "；".join(f"{kind} {len(words)} 个" for kind, words in st.load_focus_vocab().items()))
+            if args.no_pairs_csv:
+                print("成对信息 csv：本次不导出（--no-pairs-csv）")
+            elif spec.csv_columns:
+                print(f"成对信息 csv：收尾导出到 {st.pairs_csv_path(out_path)}（--no-pairs-csv 可关）")
             else:
-                cache_path = out_path.parent / (out_path.name + ".batch-cache.jsonl")
-            batch_session = bi.BatchSession(
-                profile,
-                cache_path=cache_path,
-                poll_seconds=getattr(args, "batch_poll_seconds", config.BATCH_POLL_SECONDS),
-                timeout_seconds=getattr(args, "batch_timeout_seconds", config.BATCH_TIMEOUT_SECONDS),
-                chunk_size=getattr(args, "batch_chunk_size", config.BATCH_CHUNK_SIZE),
-                retry_policy=policy,
-                resume=bool(getattr(args, "batch_resume", False)),
-                strict_native=getattr(args, "batch", "auto") == "native",
+                # 非 pair 图的记录里没有成对字段：默认开着也导不出东西，说清楚而不是静悄悄少一个产物
+                print(f"提示：本图（{spec.name}）的记录不是成对形状，没有可导出的成对列，本次不导 csv")
+
+        batch_session = None
+        if (
+            not args.no_llm
+            and getattr(args, "batch", "off") == "native"
+            and getattr(args, "feature_deep", False)
+            and "feature" in spec.needs
+        ):
+            raise SystemExit(
+                "错误：--batch native 不能与 --feature-deep 同用（deep agent 的工具回合无法交给原生 Batch）"
             )
+        if not args.no_llm and getattr(args, "batch", "off") != "off":
+            profile = bi.batch_profile(model_key)
+            if profile.enabled:
+                # 多模型投票时每个模型必须各用一份 sidecar，否则会把别的模型的结果回放进来。
+                # 推导与启动前路径检查共用 _batch_cache_path，避免两处算出不同路径。
+                cache_path = _batch_cache_path(args, out_path, model_key)
+                batch_session = bi.BatchSession(
+                    profile,
+                    cache_path=cache_path,
+                    poll_seconds=getattr(args, "batch_poll_seconds", config.BATCH_POLL_SECONDS),
+                    timeout_seconds=getattr(args, "batch_timeout_seconds", config.BATCH_TIMEOUT_SECONDS),
+                    chunk_size=getattr(args, "batch_chunk_size", config.BATCH_CHUNK_SIZE),
+                    retry_policy=policy,
+                    resume=bool(getattr(args, "batch_resume", False)),
+                    strict_native=getattr(args, "batch", "auto") == "native",
+                )
+                if verbose:
+                    print(f"批处理：{profile.describe()}")
+                    if getattr(args, "feature_deep", False) and "feature" in spec.needs:
+                        print("批处理：--feature-deep 的特征子 agent 只能同步回退（原生 Batch 跑不了工具回合）")
+            elif getattr(args, "batch", "auto") == "native":
+                raise SystemExit(f"错误：--batch native 不可用 —— {profile.describe()}")
+            elif verbose:
+                print(f"批处理：{profile.describe()}（回退同步执行）")
+
+        if not args.no_llm:
+            if prefill_ltp:
+                # 句法证据必须在 worker 前准备好；--batch-inference 只决定 LTP 批大小。
+                _prefill(records, agents, spec, batch=args.batch_inference)
+            if batch_session is None:
+                # 闸门的原句在这里一次判完（去重）。图已经建好——接线错在花钱之前就报出来，于是这份
+                # 去重账补写到 writer 上，与语料类型、配置表一并进汇总（见 ResultWriter.reality_prefill）
+                writer.reality_prefill = _prefill_reality(records, agents, spec, args.workers, verbose=verbose)
+            elif verbose:
+                print("reality 预填充：批处理模式下由第一波批量请求统一提交（按 user message 去重）")
+
+        # 一条语料的每个目标词位置各能改出好几个待选句，每个待选句一个状态、一条记录，
+        # 所以状态数一般多于语料条数
+        states = spec.init_states(records, agents, str(out_path))
+        if verbose:
+            print(f"展开待选句：{len(records)} 条语料 → {len(states)} 个状态（每个状态落一条记录）")
+        # 转化链的两个分母（D5）补写到 writer 上、进汇总（与 reality_prefill / agent_stats 同一套路）
+        writer.input_records = len(records)
+        writer.expanded_states = len(states)
+        started = time.time()
+
+        if batch_session is not None:
             if verbose:
-                print(f"批处理：{profile.describe()}")
-                if getattr(args, "feature_deep", False) and "feature" in spec.needs:
-                    print("批处理：--feature-deep 的特征子 agent 只能同步回退（原生 Batch 跑不了工具回合）")
-        elif getattr(args, "batch", "auto") == "native":
-            raise SystemExit(f"错误：--batch native 不可用 —— {profile.describe()}")
-        elif verbose:
-            print(f"批处理：{profile.describe()}（回退同步执行）")
+                print(f"批处理：{len(states)} 个状态进入波次执行（原生优先，失败回退同步）")
+            # 批量波次会把同一条候选重放多次；候选预算必须跨波次保留同一份，
+            # 否则每条候选每波都会拿到一份新预算，max_requests 形同虚设。
+            scopes = {id(state): agents.new_budget_scope() for state in states}
 
-    if not args.no_llm:
-        if prefill_ltp:
-            # 句法证据必须在 worker 前准备好；--batch-inference 只决定 LTP 批大小。
-            _prefill(records, agents, spec, batch=args.batch_inference)
-        if batch_session is None:
-            # 闸门的原句在这里一次判完（去重）。图已经建好——接线错在花钱之前就报出来，于是这份
-            # 去重账补写到 writer 上，与语料类型、配置表一并进汇总（见 ResultWriter.reality_prefill）
-            writer.reality_prefill = _prefill_reality(records, agents, spec, args.workers, verbose=verbose)
-        elif verbose:
-            print("reality 预填充：批处理模式下由第一波批量请求统一提交（按 user message 去重）")
+            def run_batch_state(state):
+                with agents.use_budget_scope(scopes[id(state)]):
+                    return graph.invoke(state, {"recursion_limit": 60})
 
-    # 一条语料的每个目标词位置各能改出好几个待选句，每个待选句一个状态、一条记录，
-    # 所以状态数一般多于语料条数
-    states = spec.init_states(records, agents, str(out_path))
-    if verbose:
-        print(f"展开待选句：{len(records)} 条语料 → {len(states)} 个状态（每个状态落一条记录）")
-    # 转化链的两个分母（D5）补写到 writer 上、进汇总（与 reality_prefill / agent_stats 同一套路）
-    writer.input_records = len(records)
-    writer.expanded_states = len(states)
-    started = time.time()
-
-    if batch_session is not None:
-        if verbose:
-            print(f"批处理：{len(states)} 个状态进入波次执行（原生优先，失败回退同步）")
-        # 批量波次会把同一条候选重放多次；候选预算必须跨波次保留同一份，
-        # 否则每条候选每波都会拿到一份新预算，max_requests 形同虚设。
-        scopes = {id(state): agents.new_budget_scope() for state in states}
-
-        def run_batch_state(state):
-            with agents.use_budget_scope(scopes[id(state)]):
-                return graph.invoke(state, {"recursion_limit": 60})
-
-        bi.run_waves(
-            states,
-            run_batch_state,
-            batch_session,
-            fallback_workers=max(1, args.workers),
-        )
-        writer.extra_summary["batch"] = batch_session.summary()
-        if verbose:
-            batch_summary = batch_session.summary()
-            print(
-                f"批处理账：{batch_summary['waves']} 波／{batch_summary['items_collected']} 项"
-                f"／成功 {batch_summary['items_completed']}／失败 {batch_summary['items_failed']}"
-                f"／回退同步 {batch_summary['fallback_items']}／缓存回放 {batch_summary['cache_hits']}"
+            bi.run_waves(
+                states,
+                run_batch_state,
+                batch_session,
+                fallback_workers=max(1, args.workers),
             )
-    else:
+            writer.extra_summary["batch"] = batch_session.summary()
+            if verbose:
+                batch_summary = batch_session.summary()
+                print(
+                    f"批处理账：{batch_summary['waves']} 波／{batch_summary['items_collected']} 项"
+                    f"／成功 {batch_summary['items_completed']}／失败 {batch_summary['items_failed']}"
+                    f"／回退同步 {batch_summary['fallback_items']}／缓存回放 {batch_summary['cache_hits']}"
+                )
+        else:
 
-        def run_state(state):
-            # 一条状态 = 一条候选，候选预算在这个作用域内累计（见 AgentSet.budget_scope）；
-            # 作用域按线程隔离，--workers N 下各条候选互不串账
-            with agents.budget_scope():
-                return graph.invoke(state, {"recursion_limit": 60})
+            def run_state(state):
+                # 一条状态 = 一条候选，候选预算在这个作用域内累计（见 AgentSet.budget_scope）；
+                # 作用域按线程隔离，--workers N 下各条候选互不串账
+                with agents.budget_scope():
+                    return graph.invoke(state, {"recursion_limit": 60})
 
-        with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
-            # 结果已在 save 节点落盘，这里只需驱动跑完；map 按输入顺序产出，异常会在此处抛出
-            for _ in pool.map(run_state, states):
-                pass
+            with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+                # 结果已在 save 节点落盘，这里只需驱动跑完；map 按输入顺序产出，异常会在此处抛出
+                for _ in pool.map(run_state, states):
+                    pass
 
-    # 各 agent 的调用账（往返数、重试数与缓存命中数）：跑完才齐，收尾补写到 writer 上、进汇总
-    writer.agent_stats = {name: agent.stats() for name, agent in agents.items()}
-    summary = writer.finish()
-    if verbose:
-        print(
-            f"\n完成 {summary['count']} 条记录（{len(records)} 条语料），用时 {summary['elapsed_seconds']} 秒"
-            f"（总耗时 {round(time.time() - started, 1)} 秒）"
-        )
-        for name in spec.counter_names:
-            print(f"{name}：{summary[name]}")
-        _print_admission(summary)
-        _print_agent_stats(writer.agent_stats)
-        print(f"汇总文件：{summary['summary_file']}")
-    if log is not None:
-        log.event(
-            "stage_end",
-            stage="annotation",
-            model=model_key,
-            output_file=str(out_path),
-            count=summary.get("count", 0),
-            elapsed_seconds=summary.get("elapsed_seconds", 0),
-        )
-    return {"summary": summary, "writer": writer, "states": states}
+        # 各 agent 的调用账（往返数、重试数与缓存命中数）：跑完才齐，收尾补写到 writer 上、进汇总
+        writer.agent_stats = {name: agent.stats() for name, agent in agents.items()}
+        summary = writer.finish()
+        if verbose:
+            print(
+                f"\n完成 {summary['count']} 条记录（{len(records)} 条语料），用时 {summary['elapsed_seconds']} 秒"
+                f"（总耗时 {round(time.time() - started, 1)} 秒）"
+            )
+            for name in spec.counter_names:
+                print(f"{name}：{summary[name]}")
+            _print_admission(summary)
+            _print_agent_stats(writer.agent_stats)
+            print(f"汇总文件：{summary['summary_file']}")
+        if log is not None:
+            log.event(
+                "stage_end",
+                stage="annotation",
+                model=model_key,
+                output_file=str(out_path),
+                count=summary.get("count", 0),
+                elapsed_seconds=summary.get("elapsed_seconds", 0),
+            )
+        return {"summary": summary, "writer": writer, "states": states}
+    finally:
+        writer._close()
 
 
 def _run_single_model(args, spec, corpus_type, corpus_path, records, out_path: Path, model_key: str) -> dict:
     """原有单模型路径：行为、输出文件与汇总形状保持不变"""
+    csv_columns = spec.csv_columns if not args.no_pairs_csv else ()
+    cache_path = _batch_cache_path(args, out_path, model_key)
+    sidecars = (
+        bi.sidecar_paths(cache_path)
+        if not args.no_llm and getattr(args, "batch", "off") != "off"
+        else ()
+    )
+    # 先做无副作用的路径检查，再建模型/写任何文件：参数错了不该先花启动成本，
+    # 更不能让 BatchSession 在检查前截断恰好被 --batch-cache 指到的语料。
+    _validate_run_outputs(
+        corpus_path,
+        out_path,
+        csv_columns=csv_columns,
+        overwrite=args.overwrite,
+        extra_outputs=sidecars,
+    )
     overrides = _build_overrides(args, spec)
     agents = _build_model_agents(args, spec, corpus_type, model_key, overrides)
-    csv_columns = spec.csv_columns if not args.no_pairs_csv else ()
-    _validate_run_outputs(corpus_path, out_path, csv_columns=csv_columns, overwrite=args.overwrite)
     log = _start_agent_log(args, spec, corpus_type, corpus_path, out_path, model_key=model_key)
     result = None
     try:
@@ -1138,18 +1184,27 @@ def _run_multi_model_impl(
     # 所有输出（最终投票文件 + 各模型原始文件及其 csv/summary）放进同一张清单，
     # 一次检查输入/输出别名与已有文件：分开逐组检查看不出“最终文件”和某个原始文件
     # 其实是同一个硬链接/软链接的情况。
-    outputs: list[Path] = [out_path]
+    main_outputs: list[Path] = [out_path]
     if csv_columns:
-        outputs.append(st.pairs_csv_path(out_path))
-    outputs.append(out_path.with_suffix(".summary.json"))
+        main_outputs.append(st.pairs_csv_path(out_path))
+    main_outputs.append(out_path.with_suffix(".summary.json"))
     for raw_path in raw_paths.values():
-        outputs.append(raw_path)
+        main_outputs.append(raw_path)
         if csv_columns:
-            outputs.append(st.pairs_csv_path(raw_path))
-        outputs.append(raw_path.with_suffix(".summary.json"))
-    file_paths.validate_output_paths([corpus_path], outputs)
+            main_outputs.append(st.pairs_csv_path(raw_path))
+        main_outputs.append(raw_path.with_suffix(".summary.json"))
+    sidecars: list[Path] = []
+    if not args.no_llm and getattr(args, "batch", "off") != "off":
+        for name in model_names:
+            # 执行阶段 _execute_run 拿到的是 raw_paths[name]，不是最终投票 out_path；
+            # 默认 sidecar 跟着实际输出文件走，预检必须用同一个基路径。
+            cache_path = _batch_cache_path(args, raw_paths[name], name)
+            sidecars.extend(bi.sidecar_paths(cache_path))
+    # sidecar 允许已存在（--batch-resume 要复用），但绝不能与语料或任一主产物同路径：
+    # 否则每个模型建会话时会截断别人的结果/原始语料。
+    file_paths.validate_output_paths([corpus_path], main_outputs + sidecars)
     if not args.overwrite:
-        for output in outputs:
+        for output in main_outputs:
             if output.exists():
                 raise ValueError(
                     f"输出文件 {output} 已存在（默认拒绝覆盖，免得混入历史记录与重复 id）；"

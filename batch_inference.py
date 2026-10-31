@@ -75,6 +75,42 @@ _TERMINAL_BAD = frozenset({"failed", "expired", "cancelled"})
 """cancelling 不算终态：取消请求还在处理时远端可能继续产出结果，继续轮询到 cancelled"""
 
 
+def resolve_cache_path(
+    cache_path: str | Path | None,
+    out_path: str | Path,
+    *,
+    model_key: str | None = None,
+    multi_model: bool = False,
+) -> Path:
+    """本轮 Batch sidecar 的缓存路径（缓存、jobs、meta 三件套的主路径）
+
+    两个入口（spatial_runner / all_in_one）必须用同一套推导：默认放在结果文件旁，
+    多模型投票时再按模型名派生，否则两个模型会抢同一份 sidecar、互相回放对方的结果。
+    推导集中在这里，路径安全检查与实际写入才不会各算一份。
+    """
+    if cache_path:
+        path = Path(cache_path)
+    else:
+        out_path = Path(out_path)
+        path = out_path.parent / (out_path.name + ".batch-cache.jsonl")
+    if multi_model and model_key:
+        path = path.with_name(f"{path.stem}.{model_key}{path.suffix}")
+    return path
+
+
+def sidecar_paths(cache_path: str | Path) -> tuple[Path, Path, Path]:
+    """BatchSession 会写出的三个文件：缓存、jobs、meta
+
+    路径规则与 BatchSession.__init__ 保持一致（with_suffix 追加后缀，不替换原后缀）。
+    """
+    path = Path(cache_path)
+    return (
+        path,
+        path.with_suffix(path.suffix + ".jobs.json"),
+        path.with_suffix(path.suffix + ".meta.json"),
+    )
+
+
 class BatchUnavailable(RuntimeError):
     """当前模型/端点没有可用的原生批量入口，调用方应回退同步执行"""
 
