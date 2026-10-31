@@ -76,14 +76,17 @@ group）标明这是第几个待选句、改的是句内哪个位置（一条记
     .venv/bin/python spatial_runner.py --corpus results/direction_corpus.jsonl --corpus-type 趋向动词 --limit 20
     .venv/bin/python spatial_runner.py --corpus-type 趋向动词 --alter-rules <路径> --limit 5   # 换改写的表
     .venv/bin/python spatial_runner.py --models model-a model-b --workers 4   # 多模型加权投票
+    .venv/bin/python spatial_runner.py --batch-inference --limit 5            # LTP 一次前向准备整批句子（默认逐句准备）
 
 多模型投票（--models）：
     每个模型独立跑完整张图，原始结果写到 ``<输出主干>.models/00_<模型>.jsonl``；
     最终投票结果写到 ``--out-file`` 指定的文件，记录形状与单模型一致，另带 voting 块。
     模型配置里的 ``voting_weight`` 是票数（缺省 1，必须 >= 1）；加权得分唯一最高的标签
     被采纳，最高分并列即平票，该条 status=discarded、admission 转人工复核。
-    各模型并行执行（--model-workers，0 = 全部并行），每个模型内部仍按 --workers 并发；
-    LTP 预填充是模型无关的，整批只做一次。
+    各模型并行执行（--model-workers，0 = 全部并行），每个模型内部仍按 --workers 并发。
+    LTP 句法证据总会在模型线程开跑前准备好（消息侧只读，worker 不再补算）；
+    --batch-inference 只决定一次前向的批大小：默认逐句准备，显式开启后按
+    config.LTP_BATCH_CHUNK 批量送入。多模型时整批只准备一次（LTP 与模型无关）。
 
 批量推理（--batch，默认 auto）：
     模型配置声明了原生批量入口时（OpenAI 文件式 Batch / OpenRouter 内联 Batch，或显式
@@ -475,6 +478,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--workers", type=int, default=1, help="并发处理的记录数（LLM 调用是 IO 密集）")
     parser.add_argument(
+        "--batch-inference",
+        action="store_true",
+        help="LTP 句法证据按批准备（默认逐句准备）。只影响一次前向的批大小，"
+        "不影响消息与记录内容；多模型时整批只准备一次；--no-llm 时不执行",
+    )
+    parser.add_argument(
         "--no-llm",
         action="store_true",
         help="不调任何模型：只跑纯规则改写、查表与落盘，用于验证规则表与接线",
@@ -624,7 +633,7 @@ def _print_agent_stats(stats: dict[str, dict]) -> None:
     print("      逐条失败原因见各记录的 status_reason；若全部是同一条 403/超时，先查模型可达性再重跑")
 
 
-def _prefill(records: list[dict], agents, spec: sg.GraphSpec) -> None:
+def _prefill(records: list[dict], agents, spec: sg.GraphSpec, *, batch: bool = True) -> None:
     """跑批前把整批句子一次性分析好，并把**渲染后的句法证据**存进运行级证据表
 
     与旧的「只预热 LRU」不同：prepare_syntax 每片推理完立刻渲染入表（见
@@ -633,11 +642,17 @@ def _prefill(records: list[dict], agents, spec: sg.GraphSpec) -> None:
     - 多模型投票时几个模型共用同一份（LTP 与模型无关）；
     - 每个唯一句子只调用一次 LTP（后缀切分内部重跑不算在「按句调用」里）。
     哪些句子会被用到由图声明（spec.plan）。
+
+    ``batch`` 只控制 LTP 一次前向的批大小：True 用 config.LTP_BATCH_CHUNK，
+    False 用 chunk_size=1 逐句准备。两种方式都会在 worker 开跑前把证据表填好，
+    因为消息侧只读 st.syntax_text，worker 里不再补算 LTP。
     """
     sentences = [s for s in spec.plan(records, agents) if s]
-    stat = st.prepare_syntax(sentences)
+    chunk_size = config.LTP_BATCH_CHUNK if batch else 1
+    stat = st.prepare_syntax(sentences, chunk_size=chunk_size)
+    mode = "批量" if batch else "逐句"
     print(
-        f"LTP 预填充：本图需 {stat['sentences']} 句，实际送入模型 {stat['inferred']} 句"
+        f"LTP {mode}准备：本图需 {stat['sentences']} 句，实际送入模型 {stat['inferred']} 句"
         f"（其余 {stat['cached']} 句已有证据）"
     )
     if stat["failed"]:
@@ -847,7 +862,8 @@ def _execute_run(
 
     if not args.no_llm:
         if prefill_ltp:
-            _prefill(records, agents, spec)
+            # 句法证据必须在 worker 前准备好；--batch-inference 只决定 LTP 批大小。
+            _prefill(records, agents, spec, batch=args.batch_inference)
         if batch_session is None:
             # 闸门的原句在这里一次判完（去重）。图已经建好——接线错在花钱之前就报出来，于是这份
             # 去重账补写到 writer 上，与语料类型、配置表一并进汇总（见 ResultWriter.reality_prefill）
@@ -1014,9 +1030,11 @@ def _run_multi_model(
     else:
         print(f"提示：本图（{spec.name}）的记录不是成对形状，没有可导出的成对列，本次不导 csv")
 
-    # LTP 是模型无关的：整批只预填充一次，避免几个模型线程重复做同一批句法分析
+    # LTP 是模型无关的：整批只准备一次，避免几个模型线程重复做同一批句法分析。
+    # 证据必须在模型线程开跑前准备好（消息侧只读 st.syntax_text）；--batch-inference
+    # 只决定 LTP 一次前向的批大小，关闭时逐句准备（chunk_size=1）。
     if not args.no_llm:
-        _prefill(records, first_agents, spec)
+        _prefill(records, first_agents, spec, batch=args.batch_inference)
 
     started = time.time()
     results: dict[str, dict] = {}

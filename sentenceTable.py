@@ -20,8 +20,8 @@ _infer_lock = threading.Lock()
 并发的多次、互相抢占显存与算力。这里给推理划一条明确的串行边界：并发的调用排队过这一把锁，
 于是"在途推理"恒为一组，与线程池里的在途候选数解耦。
 
-预填充（spatial_runner._prefill）仍然是首选路径——它把整批句子一次喂进去，根本不走这个锁；
-这条边界只是兜住漏网的那些句子。"""
+批量预填充（spatial_runner._prefill / spatial_tools.prefill_ltp）把整批句子按组分批送模型，
+走的也是 _infer_base 的同一把锁；这条边界同时兜住预填充未覆盖、按需单句推理的句子。"""
 
 
 def _get_ltp() -> LTP:

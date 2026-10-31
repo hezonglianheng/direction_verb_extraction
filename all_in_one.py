@@ -60,6 +60,7 @@ sg.alter_node 返回的 history 口径）是刻意的：它们是那套口径的
     .venv/bin/python all_in_one.py --limit 5 --no-llm                 # 纯规则+查表，0 次调用
     .venv/bin/python all_in_one.py --corpus-type 趋向动词 --limit 3    # 换语料类型
     .venv/bin/python all_in_one.py --limit 5 --allow-retry            # 允许补发一次请求（默认不补）
+    .venv/bin/python all_in_one.py --limit 5 --batch-inference        # LTP 一次前向准备整批句子（默认逐句准备）
     .venv/bin/python all_in_one.py --limit 200 --all-candidates --workers 8   # 全量：与 pair 图逐条对账
     .venv/bin/python all_in_one.py --limit 200 --all-candidates --batch auto  # 整批提交（原生 Batch 优先）
 
@@ -70,8 +71,10 @@ spatial_runner._sort_records），所以跑完之后两个文件顺序完全一�
 （记录里的顶层 id 两侧同值，逐条对账时可以直接拿它当标识用）。
 默认 1 = 逐条跑；
 只有全量对照时才需要它：--all-candidates 会把 200 条语料展开成上千个状态，逐条发请求
-按 4 秒/条算接近两小时。并发有个前提——预填充必须真兜住全部句子（推理在锁外做，见
-sentenceTable.get_task_value），装不下缓存时启动会像 runner 那样告警，见 main 里那段自检。
+按 4 秒/条算接近两小时。LTP 句法证据总会在 worker 开跑前准备好（消息侧只读
+st.syntax_text，worker 不再补算）；--batch-inference 只决定准备时一次前向送几句：
+默认逐句（chunk_size=1），显式开启后按 config.LTP_BATCH_CHUNK 批量送入。
+两种方式的记录内容相同，只是批量前向通常更快。
 """
 
 import argparse
@@ -1114,6 +1117,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="不把句法证据放进消息：与六 agent 那条路不可比（那边把句法证据内联进消息，且没有这个开关）",
     )
     parser.add_argument(
+        "--batch-inference",
+        action="store_true",
+        help="LTP 句法证据按批准备（默认逐句准备）。只影响 LTP 一次前向的批大小，"
+        "不影响消息与记录内容；--no-syntax 时不执行",
+    )
+    parser.add_argument(
         "--print-prompt",
         action="store_true",
         help="只带行号打印 system prompt 与 user message，0 次调用、不落盘",
@@ -1188,17 +1197,22 @@ def main(argv: list[str] | None = None) -> None:
 
     if (ctx.llm or args.print_prompt) and not args.no_syntax:
         # 不调模型、也不打印消息时根本不碰 LTP：那些消息只为模型而拼。
-        # --no-syntax 时消息里根本不放句法证据，预填充就是白算一遍（prepare 那边同样跳过）
+        # --no-syntax 时消息里根本不放句法证据，预填充就是白算一遍（prepare 那边同样跳过）。
+        # 句法证据必须在 worker 开跑前全部准备好：远程版本把消息侧改成了只读
+        # st.syntax_text，worker 里不再补算 LTP。--batch-inference 只控制 LTP 一次
+        # 前向的批大小（关闭时 chunk_size=1 逐句准备），不能再关掉准备本身。
         unique = [s for s in dict.fromkeys(plan_sentences(states)) if s]
         if unique:
+            chunk_size = config.LTP_BATCH_CHUNK if args.batch_inference else 1
             try:
-                stat = st.prepare_syntax(unique)
+                stat = st.prepare_syntax(unique, chunk_size=chunk_size)
             except Exception as e:
                 ctx = ctx._replace(syntax_error=f"LTP 预填充失败：{e!r}")
                 print(f"警告：{ctx.syntax_error}；本轮省略句法证据，继续处理。")
             else:
+                mode = "批量" if args.batch_inference else "逐句"
                 print(
-                    f"LTP 预填充：本次需 {stat['sentences']} 句，实际送入模型 {stat['inferred']} 句"
+                    f"LTP {mode}准备：本次需 {stat['sentences']} 句，实际送入模型 {stat['inferred']} 句"
                     f"（其余 {stat['cached']} 句已有证据）"
                 )
                 if stat["failed"]:
