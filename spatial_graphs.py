@@ -197,6 +197,83 @@ def _resolve(state: dict, path, side: str | None):
     return value
 
 
+def _log_context(state: dict) -> dict:
+    """从图状态里取日志用的记录级上下文（行号、候选、来源文档）。
+
+    只读状态里已经有的字段，不调用 spatial_tools 的 ID/哈希函数：日志不该为了记一个
+    标识而改变节点的计算量，也不该依赖测试桩里未必存在的工具函数。
+    """
+    record = state.get("record") if isinstance(state, dict) else None
+    record = record if isinstance(record, dict) else {}
+    source = record.get("source") if isinstance(record.get("source"), dict) else {}
+    candidate = state.get("candidate") if isinstance(state, dict) else None
+    candidate = candidate if isinstance(candidate, dict) else {}
+    index = state.get("candidate_index") if isinstance(state, dict) else None
+    # alter 节点执行时状态里还没有 candidate（它正是本节点要选出来的那一条），
+    # 但跑批入口已经把整份候选表放进了 state["candidates"]；按 index 取一份来记日志，
+    # 免得每条 alter 记录的 word/replacement 都是 null。
+    candidates = state.get("candidates") if isinstance(state, dict) else None
+    if not candidate and isinstance(candidates, list) and isinstance(index, int):
+        if 0 <= index < len(candidates) and isinstance(candidates[index], dict):
+            candidate = candidates[index]
+    context = {
+        "line_no": record.get("line_no") if record.get("line_no") is not None else source.get("line_no"),
+        "source_document_id": record.get("source_document_id") or source.get("source_document_id"),
+    }
+    if index is None and candidate.get("candidate_index") is not None:
+        index = candidate.get("candidate_index")
+    if index is not None or candidate:
+        context["candidate"] = {
+            "index": index,
+            "total": candidate.get("candidate_total"),
+            "word": candidate.get("word"),
+            "replacement": candidate.get("replacement"),
+        }
+    return {key: value for key, value in context.items() if value is not None}
+
+
+def _log_agent_run(
+    agent,
+    *,
+    node: str,
+    side: str | None,
+    state: dict,
+    result=None,
+    inputs=None,
+    elapsed_seconds: float = 0.0,
+    status: str | None = None,
+    source: str | None = None,
+    output=None,
+    error: str | None = None,
+) -> None:
+    """把一次 agent 执行交给挂在 agent 上的日志写入器；任何失败都不影响标注主流程。
+
+    图节点是「一次 agent 执行」的唯一公共边界（alter 节点不走 agent_node，单独调用本函数）：
+    agent.run 一返回就在这里落一条，调用方不需要自己拼日志字段。
+    """
+    log = getattr(agent, "log", None)
+    if log is None:
+        return
+    try:
+        log.agent_finished(
+            agent=getattr(agent, "NAME", None) or agent.__class__.__name__,
+            node=node,
+            side=side,
+            result=result,
+            status=status,
+            source=source,
+            elapsed_seconds=elapsed_seconds,
+            model=getattr(agent, "model_key", None),
+            llm=bool(getattr(agent, "llm", False)),
+            inputs=inputs,
+            output=output,
+            error=error,
+            context=_log_context(state),
+        )
+    except Exception:  # noqa: BLE001 —— 日志写不了不能反过来中断标注
+        pass
+
+
 def agent_node(
     agent,
     *,
@@ -289,16 +366,71 @@ def agent_node(
             value = {}
             pending: list[bi.BatchPending] = []
             for side in sides:
+                side_inputs = {name: _resolve(state, path, side) for name, path in inputs.items()}
+                side_started = time.perf_counter()
                 try:
-                    value[side] = agent.run(
-                        **{name: _resolve(state, path, side) for name, path in inputs.items()}
-                    )
+                    result = agent.run(**side_inputs)
                 except bi.BatchPending as exc:
+                    # 登记待发请求不是失败：不写 error 日志，等这一波结果回来后重放再记。
                     pending.append(exc)
+                    continue
+                except BaseException as exc:
+                    # 先记下这次失败再原样抛出：图该失败还是失败，但日志里要能查到是哪条记录、
+                    # 哪一侧、什么异常，而不是只留下一个从线程池里冒出来的 traceback。
+                    _log_agent_run(
+                        agent,
+                        node=node,
+                        side=side,
+                        state=state,
+                        inputs=side_inputs,
+                        elapsed_seconds=time.perf_counter() - side_started,
+                        status="error",
+                        source="error",
+                        error=repr(exc),
+                    )
+                    raise
+                value[side] = result
+                _log_agent_run(
+                    agent,
+                    node=node,
+                    side=side,
+                    state=state,
+                    result=result,
+                    inputs=side_inputs,
+                    elapsed_seconds=time.perf_counter() - side_started,
+                )
             if pending:
                 raise bi.BatchPendingGroup(pending)
         else:
-            value = agent.run(**{name: _resolve(state, path, None) for name, path in inputs.items()})
+            side_inputs = {name: _resolve(state, path, None) for name, path in inputs.items()}
+            side_started = time.perf_counter()
+            try:
+                value = agent.run(**side_inputs)
+            except bi.BatchPending:
+                # 单侧同样只是登记待发请求，原样抛给波次执行器，不记成失败。
+                raise
+            except BaseException as exc:
+                _log_agent_run(
+                    agent,
+                    node=node,
+                    side=None,
+                    state=state,
+                    inputs=side_inputs,
+                    elapsed_seconds=time.perf_counter() - side_started,
+                    status="error",
+                    source="error",
+                    error=repr(exc),
+                )
+                raise
+            _log_agent_run(
+                agent,
+                node=node,
+                side=None,
+                state=state,
+                result=value,
+                inputs=side_inputs,
+                elapsed_seconds=time.perf_counter() - side_started,
+            )
 
         wrote = update(state, value) if update else None
         fields: dict = {"elapsed": round(time.perf_counter() - started, 2)}
@@ -552,13 +684,26 @@ def alter_node(agent) -> Callable[[dict], dict]:
         record = state["record"]
         sentence_slice = record.get("sentence") or []
         if not isinstance(sentence_slice, list) or not sentence_slice:
+            focus_word = state.get("focus_word") or st.pick_focus_word(record)
+            reason = "记录的 sentence 字段缺失或不是分词切片"
+            _log_agent_run(
+                agent,
+                node="alter",
+                side=None,
+                state=state,
+                inputs={"sentence_slice": sentence_slice, "focus_word": focus_word},
+                elapsed_seconds=time.perf_counter() - started,
+                status="skipped",
+                source="bad_record",
+                output={"stage": "bad_record", "reason": reason},
+            )
             return {
                 "stage": "bad_record",
                 # 句子用不了，但关注词仍按 record 记上：落盘口径与正常记录一致（见 _save_node）
-                "focus_word": state.get("focus_word") or st.pick_focus_word(record),
+                "focus_word": focus_word,
                 # 没改写过，b 侧自然没有替换词可看
                 "focus_word_b": None,
-                "status_reason": "记录的 sentence 字段缺失或不是分词切片",
+                "status_reason": reason,
                 "history": [
                     _step("alter", stage="bad_record", elapsed=round(time.perf_counter() - started, 2))
                 ],
@@ -575,7 +720,21 @@ def alter_node(agent) -> Callable[[dict], dict]:
         elapsed = round(time.perf_counter() - started, 2)
 
         # 与展开同源（同一个纯函数），句内每个位置各一批候选，这里只挑本状态那一条
-        candidates, details = agent.expand_positions(sentence_slice, focus_words)
+        try:
+            candidates, details = agent.expand_positions(sentence_slice, focus_words)
+        except BaseException as exc:
+            _log_agent_run(
+                agent,
+                node="alter",
+                side=None,
+                state=state,
+                inputs={"sentence_slice": sentence_slice, "focus_words": focus_words},
+                elapsed_seconds=time.perf_counter() - started,
+                status="error",
+                source="error",
+                error=repr(exc),
+            )
+            raise
         index = state.get("candidate_index") or 0
         chosen = candidates[index] if 0 <= index < len(candidates) else None
         if chosen is None:
@@ -586,6 +745,22 @@ def alter_node(agent) -> Callable[[dict], dict]:
             # 与改写成功那条分支同形状：alter 块里都带 kind，免得下游按 alter["kind"] 读时
             # 在 alter_missed 的记录上取到缺失值
             detail["kind"] = (focus_word or {}).get("kind")
+            _log_agent_run(
+                agent,
+                node="alter",
+                side=None,
+                state=state,
+                inputs={"sentence_slice": sentence_slice, "focus_words": focus_words},
+                elapsed_seconds=time.perf_counter() - started,
+                status="skipped",
+                source="alter_missed",
+                output={
+                    "stage": "alter_missed",
+                    "candidate_count": len(candidates),
+                    "candidate_index": index,
+                    "reason": detail["reason"],
+                },
+            )
             return {
                 "stage": "alter_missed",
                 "status_reason": detail["reason"],
@@ -634,6 +809,28 @@ def alter_node(agent) -> Callable[[dict], dict]:
         # b 侧才真的一条候选都收不到，那属于配置该补的内容。
         focus_word_b = st.replacement_focus_word(
             focus_word, chosen["replacement"], record.get("filter_methods") or []
+        )
+        _log_agent_run(
+            agent,
+            node="alter",
+            side=None,
+            state=state,
+            inputs={"sentence_slice": sentence_slice, "focus_words": focus_words},
+            elapsed_seconds=time.perf_counter() - started,
+            status="ok",
+            source="rule",
+            output={
+                "stage": "altered",
+                "candidate_count": len(candidates),
+                "candidate": {
+                    "index": chosen["candidate_index"],
+                    "total": chosen["candidate_total"],
+                    "focus_index": chosen["focus_index"],
+                    "word": focus_word.get("word") if isinstance(focus_word, dict) else None,
+                    "replacement": chosen["replacement"],
+                    "source": chosen["source"],
+                },
+            },
         )
         return {
             "stage": "altered",

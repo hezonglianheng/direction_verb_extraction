@@ -65,6 +65,11 @@ group）标明这是第几个待选句、改的是句内哪个位置（一条记
 列序见 spatial_tools.PAIR_CSV_COLUMNS），默认开启，--no-pairs-csv 可关。两份文件出自同一份排好序的
 记录，行序必然一致；只有 pair 图的记录有这些成对字段，换别的图本就不导，启动时会说明一句。
 
+每跑完一个 agent（含纯规则的 alter、reality 闸门的批量预填充），还会在 log/ 下留一条执行记录：
+    log/agent-log-YYYYMMDD-HHMMSS-ffffff.log     人读：一次执行一段，收尾带按 agent 的汇总
+    log/agent-log-YYYYMMDD-HHMMSS-ffffff.jsonl   机器读：一条执行一个 JSON 对象
+记录字段、截断口径与写失败策略见 agent_log.py。日志是附属产物，写不进去只警告，不影响结果落盘。
+
 用法：
     .venv/bin/python spatial_runner.py --limit 5                        # 跑前 5 条（pair 图，方位词）
     .venv/bin/python spatial_runner.py --limit 5 --no-llm               # 只跑纯规则与查表，不花钱
@@ -110,6 +115,7 @@ config_files/localization/（方位词）与 config_files/direction/（趋向动
 import argparse
 import json
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -117,6 +123,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+import agent_log
 import agents as agent_factory
 import batch_inference as bi
 import config
@@ -737,6 +744,47 @@ def _build_overrides(args, spec: sg.GraphSpec) -> dict[str, dict]:
     return overrides
 
 
+def _start_agent_log(
+    args,
+    spec: sg.GraphSpec,
+    corpus_type: str,
+    corpus_path: Path,
+    out_path: Path,
+    *,
+    model_key: str,
+    extra: dict | None = None,
+) -> agent_log.AgentLog:
+    """为本轮跑批开一份 agent 执行日志（写不了也只是空对象，不影响标注）。
+
+    元数据在跑批开始时就固定下来：图、模型、语料类型、输入输出、并发数、分词口径。
+    多模型时 model_key 传合起来的说明，每个模型的原始输出另在 stage_start 事件里记。
+    """
+    meta = {
+        "graph": spec.name,
+        "model": model_key,
+        "corpus_type": corpus_type,
+        "corpus_file": str(corpus_path),
+        "output_file": str(out_path),
+        "workers": max(1, int(getattr(args, "workers", 1) or 1)),
+        "no_llm": bool(getattr(args, "no_llm", False)),
+        "schema_version": st.RESULT_SCHEMA_VERSION,
+        "segmentation": config.segmentation_signature(),
+        "command": " ".join(sys.argv),
+        "pid": os.getpid(),
+    }
+    if extra:
+        meta.update(extra)
+    return agent_log.AgentLog(run_meta=meta)
+
+
+def _attach_agent_log(agents, log: agent_log.AgentLog) -> None:
+    """把同一份日志挂到一套 agent 上（每个 agent 的节点在 run 完成时写自己的记录）。"""
+    for agent in agents.values():
+        attach = getattr(agent, "attach_log", None)
+        if callable(attach):
+            attach(log)
+
+
 def _build_model_agents(args, spec: sg.GraphSpec, corpus_type: str, model_key: str, overrides: dict[str, dict]):
     """按模型建一套 agent 并预热：配置错在启动时就报，不留给线程池去抢着建"""
     agents = sa.build_agents(
@@ -768,16 +816,27 @@ def _execute_run(
     out_path: str | Path,
     *,
     model_key: str,
-    prefill_ltp: bool = True,
+    prefill_ltp: bool = False,
     verbose: bool = True,
+    log: agent_log.AgentLog | None = None,
 ) -> dict:
     """用一套已建好的 agent 跑完整张图并落盘
 
-    单模型与多模型的单模型分支共用这一段；多模型模式下 verbose=False（各模型的启动打印
-    由协调层统一出，避免几个线程的日志交错），prefill_ltp=False（LTP 是模型无关的，
-    整批只在协调层预填充一次）。
+    单模型与多模型的单模型分支共用这一段。``prefill_ltp`` 只表示**这个分支是否负责**
+    准备 LTP 句法证据；批大小由 ``--batch-inference`` 决定。多模型模式下协调层统一
+    准备一次，各模型分支传 False。
+    ``log`` 是跑批入口建好的 agent 日志；本函数只补两个阶段事件，逐 agent 的记录由图节点写。
     """
     out_path = Path(out_path)
+    if log is not None:
+        log.event(
+            "stage_start",
+            stage="annotation",
+            model=model_key,
+            output_file=str(out_path),
+            input_records=len(records),
+            workers=max(1, int(args.workers)),
+        )
     csv_columns = spec.csv_columns if not args.no_pairs_csv else ()
     writer = ResultWriter(
         out_path,
@@ -798,6 +857,13 @@ def _execute_run(
     policy = getattr(first_agent, "retry_policy", None)
     if policy:
         writer.extra_summary["request_policy"] = dict(policy)
+    if log is not None:
+        # 把本轮 agent 日志的路径写进 .summary.json：事后拿到一份结果，能顺着汇总直接找到
+        # 它是哪一轮跑出来的、每个 agent 当时怎么判的，不必在 log/ 里按时间猜。
+        if getattr(log, "path", None) is not None:
+            writer.extra_summary["agent_log_file"] = str(log.path)
+        if getattr(log, "jsonl_path", None) is not None:
+            writer.extra_summary["agent_log_jsonl"] = str(log.jsonl_path)
 
     if verbose:
         print(f"输入语料：{corpus_path}（{len(records)} 条）")
@@ -932,6 +998,15 @@ def _execute_run(
         _print_admission(summary)
         _print_agent_stats(writer.agent_stats)
         print(f"汇总文件：{summary['summary_file']}")
+    if log is not None:
+        log.event(
+            "stage_end",
+            stage="annotation",
+            model=model_key,
+            output_file=str(out_path),
+            count=summary.get("count", 0),
+            elapsed_seconds=summary.get("elapsed_seconds", 0),
+        )
     return {"summary": summary, "writer": writer, "states": states}
 
 
@@ -941,18 +1016,34 @@ def _run_single_model(args, spec, corpus_type, corpus_path, records, out_path: P
     agents = _build_model_agents(args, spec, corpus_type, model_key, overrides)
     csv_columns = spec.csv_columns if not args.no_pairs_csv else ()
     _validate_run_outputs(corpus_path, out_path, csv_columns=csv_columns, overwrite=args.overwrite)
-    return _execute_run(
-        args,
-        spec,
-        corpus_type,
-        corpus_path,
-        records,
-        agents,
-        out_path,
-        model_key=model_key,
-        prefill_ltp=True,
-        verbose=True,
-    )
+    log = _start_agent_log(args, spec, corpus_type, corpus_path, out_path, model_key=model_key)
+    result = None
+    try:
+        _attach_agent_log(agents, log)
+        log.agents_ready(agents)
+        result = _execute_run(
+            args,
+            spec,
+            corpus_type,
+            corpus_path,
+            records,
+            agents,
+            out_path,
+            model_key=model_key,
+            # 这个分支允许预填充；是否真的执行由 args.batch_inference 决定（见 _execute_run）。
+            prefill_ltp=True,
+            verbose=True,
+            log=log,
+        )
+        return result
+    except BaseException as exc:
+        log.event("run_error", stage="single", error=repr(exc))
+        raise
+    finally:
+        stats = result["writer"].agent_stats if result is not None else {}
+        summary = log.finish(agent_stats=stats)
+        if summary.get("log_file"):
+            print(f"[Agent日志] 已写入 {summary['log_file']}（同名 .jsonl 为机器可读版本）")
 
 
 def _run_multi_model(
@@ -964,6 +1055,62 @@ def _run_multi_model(
     out_path: Path,
     model_names: list[str],
     weights: dict[str, int],
+) -> dict:
+    """多模型投票的日志外壳：建一份共享日志，跑完（或失败）都把汇总收尾。
+
+    每个模型的原始输出、投票结果都写在同一份 agent-log 里，记录用 model 字段与
+    stage_start 的 output_file 区分；这样一次 --models 只会留下一个时间戳、两份文件，
+    不必在 log/ 里按模型再拼文件名。
+    """
+    log = _start_agent_log(
+        args,
+        spec,
+        corpus_type,
+        corpus_path,
+        Path(out_path),
+        model_key="、".join(model_names),
+        extra={"models": list(model_names), "voting_weights": dict(weights)},
+    )
+    results: dict[str, dict] = {}
+    try:
+        return _run_multi_model_impl(
+            args,
+            spec,
+            corpus_type,
+            corpus_path,
+            records,
+            out_path,
+            model_names,
+            weights,
+            log=log,
+            results=results,
+        )
+    except BaseException as exc:
+        log.event("run_error", stage="multi", error=repr(exc))
+        raise
+    finally:
+        merged: dict[str, dict] = {}
+        for name, result in results.items():
+            writer = result.get("writer")
+            for agent_name, item in ((getattr(writer, "agent_stats", None) or {}).items()):
+                merged[f"{name}.{agent_name}"] = item
+        summary = log.finish(agent_stats=merged)
+        if summary.get("log_file"):
+            print(f"[Agent日志] 已写入 {summary['log_file']}（同名 .jsonl 为机器可读版本）")
+
+
+def _run_multi_model_impl(
+    args,
+    spec,
+    corpus_type,
+    corpus_path,
+    records: list[dict],
+    out_path: Path,
+    model_names: list[str],
+    weights: dict[str, int],
+    *,
+    log: agent_log.AgentLog,
+    results: dict[str, dict],
 ) -> dict:
     """多模型投票：每个模型独立跑完整张图，再逐候选加权投票
 
@@ -1019,6 +1166,17 @@ def _run_multi_model(
     for name in model_names:
         print(f"  准备模型 {name}（voting_weight={weights[name]}）")
         agents_by_model[name] = _build_model_agents(args, spec, corpus_type, name, overrides)
+        _attach_agent_log(agents_by_model[name], log)
+
+    # 清单按「模型.agent」命名，同一个 agent 名在不同模型下各有一条，事后能看出
+    # 这一轮到底建了几套、各自读哪份提示语与配置表。
+    log.agents_ready(
+        {
+            f"{model_name}.{agent_name}": agent
+            for model_name, model_agents in agents_by_model.items()
+            for agent_name, agent in model_agents.items()
+        }
+    )
 
     first_agents = agents_by_model[model_names[0]]
     _print_config_tables(first_agents)
@@ -1037,8 +1195,9 @@ def _run_multi_model(
         _prefill(records, first_agents, spec, batch=args.batch_inference)
 
     started = time.time()
-    results: dict[str, dict] = {}
+    results.clear()
     errors: list[tuple[str, BaseException]] = []
+    log.event("voting_start", models=list(model_names), weights=dict(weights))
     with ThreadPoolExecutor(max_workers=max(1, model_workers)) as pool:
         futures = {
             pool.submit(
@@ -1053,6 +1212,7 @@ def _run_multi_model(
                 model_key=name,
                 prefill_ltp=False,
                 verbose=False,
+                log=log,
             ): name
             for name in model_names
         }
@@ -1085,6 +1245,7 @@ def _run_multi_model(
     )
     if not final_records:
         print("警告：所有模型都没有产出可投票的记录，未生成最终结果")
+        log.event("voting_end", status="empty", models=list(model_names))
         return {}
 
     voting_writer = ResultWriter(
@@ -1104,6 +1265,11 @@ def _run_multi_model(
         "voting": voting.summarize_voting(final_records),
         "model_names": list(model_names),
         "voting_weights": dict(weights),
+        **(
+            {"agent_log_file": str(log.path), "agent_log_jsonl": str(log.jsonl_path)}
+            if log.path is not None and log.jsonl_path is not None
+            else {}
+        ),
         "models": [
             {
                 "name": name,
@@ -1122,6 +1288,14 @@ def _run_multi_model(
     for record in final_records:
         voting_writer.write(record)
     summary = voting_writer.finish()
+    log.event(
+        "voting_end",
+        status="ok",
+        models=list(model_names),
+        count=summary.get("count", 0),
+        voting=summary.get("voting"),
+        output_file=str(out_path),
+    )
 
     print(
         f"\n完成 {summary['count']} 条最终记录（{len(records)} 条语料），"

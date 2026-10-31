@@ -1047,6 +1047,12 @@ class BaseAgent:
         }
         self.system_prompt: str = self.prompts[self.PROMPT_FILES[0]] if self.PROMPT_FILES else ""
         self._agent = None  # 惰性：第一次 run（或 warm）才建底层 agent
+        self.log = None
+        """本轮跑批的日志写入器（见 agent_log.AgentLog）；None = 不记日志。
+
+        跑批入口在建好 agent 后调用 attach_log 挂上，随后每个 graph 节点在 agent.run
+        完成时写一条记录。单独构造 agent（测试、对照实验）不挂日志，行为与从前一致。
+        """
         self._lock = threading.Lock()  # 多线程下避免同时建出好几份（对 deep agent 尤其重要）
         # 按 user message 的结果缓存（见 CACHEABLE_SOURCES）。键就是渲染好的 message 本身——
         # 命中即等价于「问的是逐字节相同的那一句」，所以日后改措辞不会留下陈旧命中
@@ -1145,6 +1151,24 @@ class BaseAgent:
         """提前把底层 agent 建好：配置错在启动时就暴露，且不留给多线程去抢着建"""
         if self.llm:
             self._model()
+
+    def attach_log(self, log) -> None:
+        """挂上本轮跑批的日志写入器（跑批入口调用；None = 关闭本 agent 的日志）
+
+        日志写入器由 spatial_runner 创建，所有 agent 共用一份；这里只保存引用，
+        不主动写任何东西——真正的记录点在 agent_node / alter_node / prefill。
+        """
+        self.log = log
+
+    def _log_agent_event(self, event: str, **fields) -> None:
+        """写一条非 run 级事件（如 reality 预填充汇总）；没有日志或写失败都静默跳过"""
+        log = getattr(self, "log", None)
+        if log is None:
+            return
+        try:
+            log.event(event, agent=self.NAME, model=self.model_key, llm=self.llm, **fields)
+        except Exception:  # noqa: BLE001 —— 日志是附属产物，不能反过来中断标注
+            pass
 
     @contextmanager
     def budget_scope(self):
@@ -1551,6 +1575,7 @@ class RealityAgent(BaseAgent):
         """
         stat = {"queries": len(queries), "unique": 0, "asked": 0, "failed": 0, "skipped": 0}
         if not self.llm:
+            self._log_agent_event("prefill_finished", **stat)
             return stat
         contents: dict[str, None] = {}  # 去重且保序（dict 自 3.7 起保插入序）
         for sentence, focus_word in queries:
@@ -1562,6 +1587,11 @@ class RealityAgent(BaseAgent):
         stat["unique"] = len(contents)
         todo = [content for content in contents if self._cache_get(content) is None]
         stat["asked"] = len(todo)
+        if todo:
+            # 先报「开始」再进线程池：下面的汇总行要等全部判完才打印，而单条请求
+            # 卡住时（接口超时/重试）屏幕上会只剩 LTP 预填充那一行，看不出已经
+            # 进到闸门阶段。这条把「卡在 reality 预填充」与「根本没走到」分开。
+            print(f"  reality 预填充开始：{len(todo)} 个请求（workers={max(1, workers)}）", flush=True)
         done = 0
         with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
             for content, result in zip(todo, pool.map(self._ask, todo)):
@@ -1569,8 +1599,9 @@ class RealityAgent(BaseAgent):
                 if result.get("source") != "llm":
                     stat["failed"] += 1
                 done += 1
-                if done % 10 == 0:
+                if done == 1 or done % 10 == 0:
                     print(f"  reality 预填充已判 {done}/{len(todo)}", flush=True)
+        self._log_agent_event("prefill_finished", **stat)
         return stat
 
     def run(self, sentence: str, focus_word: dict) -> dict:
