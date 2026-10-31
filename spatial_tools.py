@@ -49,7 +49,7 @@ import unicodedata
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 import json5
 from langchain.tools import tool
@@ -1942,18 +1942,26 @@ def append_jsonl(record: dict, path: str | Path) -> None:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def iter_jsonl(path: str | Path) -> Iterator[dict]:
+    """流式逐条读取结果 jsonl（不把整份文件读进内存，空行跳过）
+
+    与 read_jsonl 共用同一套解析口径。导出、过滤等只消费一遍的场景应走这里；
+    需要排序或随机访问时再用 read_jsonl。
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                yield json.loads(line)
+
+
 def read_jsonl(path: str | Path) -> list[dict]:
     """读一份结果 jsonl，逐行解析（空行跳过）
 
     与 write_jsonl / append_jsonl 并列，是仓库里唯一的 jsonl 读法：收尾排序（见
     spatial_runner.ResultWriter._sort_records）与对账脚本（compare_runs.py）都走它。
+    只消费一遍的调用方优先用 iter_jsonl，避免额外一份列表内存。
     """
-    records = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            if line.strip():
-                records.append(json.loads(line))
-    return records
+    return list(iter_jsonl(path))
 
 
 PAIR_CSV_COLUMNS: tuple[tuple[str, str], ...] = (

@@ -52,6 +52,7 @@ from pydantic import BaseModel, Field
 
 import config
 import utils
+from pipeline_utils import prune_tree
 
 SCREEN_PROMPT_FILES: dict[str, str] = {
     "方位词": "screen_localization",
@@ -272,30 +273,10 @@ def _target_nodes(record: dict, vocab: set[str]) -> list[dict]:
 def _prune_tree(tree: Iterable[dict], false_indices: set[int], keep_indices: set[int]) -> list[dict]:
     """把被明确判为不可提取的目标词从 match_tree 里摘掉
 
-    返回列表而不是单节点：一个 false 节点若还带着要保留的下级目标词（明确 true 或
-    fail-open 的 unknown），把该节点整个删掉会连它一起丢掉；把它提到根层又会留下一个
-    词表内的 false 父节点，而下游取词口径是「父节点在词表里时不再认子节点」
-    （见 word_sampler.target_nodes）——被保留的子节点反而会被当成结构上下文忽略。
-    所以这里**删掉 false 节点、把含保留目标词的子节点提上一层**。
+    实现已收归 pipeline_utils.prune_tree：两个 grounding 模块与本模块共用同一份递归语义。
+    保留这个私有名作为薄包装，避免外部测试/旧调用方按名字导入时断掉。
     """
-
-    def walk(node: Any) -> list[dict]:
-        if not isinstance(node, dict):
-            return []
-        index = node.get("index")
-        children = [kept for child in (node.get("children") or []) for kept in walk(child)]
-        if index in false_indices and index not in keep_indices:
-            # 本节点判 false：自身删掉；只把仍含保留目标词的子树提上来
-            return [child for child in children if _contains_index(child, keep_indices)]
-        return [{**node, "children": children}]
-
-    return [kept for node in tree for kept in walk(node)]
-
-
-def _contains_index(node: dict, indices: set[int]) -> bool:
-    if node.get("index") in indices:
-        return True
-    return any(_contains_index(child, indices) for child in node.get("children") or [] if isinstance(child, dict))
+    return prune_tree(tree, false_indices, keep_indices)
 
 
 class SentenceScreener:

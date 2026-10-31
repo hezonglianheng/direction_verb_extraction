@@ -37,7 +37,7 @@ import argparse
 from pathlib import Path
 
 import spatial_tools as st
-from file_paths import validate_output_paths
+from file_paths import atomic_output_path, validate_output_paths
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -62,8 +62,10 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
 
-    records = st.read_jsonl(in_path)
-    total, judged = st.write_pairs_csv(records, out_path)
+    # 导出只消费一遍，流式读：不必先为整份结果再建一个 list（大文件下是双份内存）。
+    # 但仍写临时文件再原子替换：流式解析到中途遇到坏行时，旧 CSV 必须原样保留。
+    with atomic_output_path(out_path) as temp_csv:
+        total, judged = st.write_pairs_csv(st.iter_jsonl(in_path), temp_csv)
     print(f"已写出 {out_path}：共 {total} 行，其中 {judged} 行有同义判断，{total - judged} 行留空")
     return 0
 
