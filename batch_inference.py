@@ -154,6 +154,13 @@ class BatchProfile:
     enabled: bool = False
     disabled_reason: str = ""
     extra: dict = field(default_factory=dict)
+    proxy_mode: str = "env"
+    """原生 Batch 的代理口径，与 agents.get_model 的 proxy 字段同一套语义：
+
+    env = 沿用 requests 的环境代理；direct = 强制直连；url = 使用 proxy_url。
+    原生 Batch 走裸 requests，不经过 langchain 的 http_client，所以必须在这里显式带上。
+    """
+    proxy_url: str | None = None
 
     def describe(self) -> str:
         if self.enabled:
@@ -192,7 +199,11 @@ def batch_profile(model_key: str) -> BatchProfile:
         3. 其余 provider 默认关闭，理由写进 disabled_reason。
     """
     cfg = agent_factory.load_model_config(model_key)
-    provider = str(cfg.get("provider") or "")
+    # 与 agents.get_model 同一套取法：优先 model_provider，其次 provider。
+    provider = str(cfg.get("model_provider") or cfg.get("provider") or "")
+    # 原生 Batch 不走 langchain，必须把模型的 proxy 口径显式带过来，否则
+    # api_keys.json 里的 proxy=false / 显式代理不会作用于批量请求。
+    proxy_mode, proxy_url = agent_factory.proxy_policy(cfg, model_key)
     batch = cfg.get("batch")
     if batch is False:
         return BatchProfile(
@@ -203,6 +214,8 @@ def batch_profile(model_key: str) -> BatchProfile:
             api_key=str(cfg.get("api_key") or ""),
             protocol=_default_protocol(provider),
             disabled_reason="模型配置里 batch 显式关闭",
+            proxy_mode=proxy_mode,
+            proxy_url=proxy_url,
         )
     if isinstance(batch, dict):
         enabled = bool(batch.get("enabled", True))
@@ -230,6 +243,8 @@ def batch_profile(model_key: str) -> BatchProfile:
             protocol=_default_protocol(provider),
             disabled_reason=f"provider {provider!r} 未声明 batch 配置；如该端点兼容 OpenAI Batch，"
             '请在模型配置里加 "batch": {"enabled": true, "base_url": ...}',
+            proxy_mode=proxy_mode,
+            proxy_url=proxy_url,
         )
     if enabled and not base_url:
         raise ValueError(f"模型 {model_key!r} 启用了批处理但 base_url 为空")
@@ -257,6 +272,8 @@ def batch_profile(model_key: str) -> BatchProfile:
         enabled=enabled,
         disabled_reason=reason,
         extra=extra,
+        proxy_mode=proxy_mode,
+        proxy_url=proxy_url,
     )
 
 
@@ -428,6 +445,19 @@ class NativeBatchClient:
         self.chunk_size = max(1, int(chunk_size))
         self.retry_policy = dict(retry_policy or {"max_retries": 0})
         self.logger = logger
+        # 原生 Batch 走裸 requests；这里复刻 agents.get_model 的 proxy 口径：
+        # env 交给 requests 自己读环境变量，direct/url 则关掉环境代理、显式设置。
+        self.session = requests.Session()
+        if profile.proxy_mode == "direct":
+            self.session.trust_env = False
+            self.session.proxies.clear()
+        elif profile.proxy_mode == "url":
+            if not profile.proxy_url:
+                raise ValueError("原生 Batch 的 proxy_mode=url 但 proxy_url 为空")
+            self.session.trust_env = False
+            self.session.proxies.update(
+                {"http": profile.proxy_url, "https": profile.proxy_url}
+            )
 
     # -- HTTP --------------------------------------------------------------
     def _headers(self) -> dict:
@@ -442,7 +472,7 @@ class NativeBatchClient:
         policy = self.retry_policy if idempotent else {**self.retry_policy, "max_retries": 0}
 
         def call():
-            response = requests.request(method, url, headers=headers, **kwargs)
+            response = self.session.request(method, url, headers=headers, **kwargs)
             if response.status_code in (404, 405):
                 raise BatchUnavailable(f"{method} {url} 不是可用的批量接口（HTTP {response.status_code}）")
             if response.status_code >= 400:
