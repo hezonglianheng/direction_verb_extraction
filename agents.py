@@ -52,6 +52,8 @@ _DISABLE_THINKING_DEFAULTS: dict[str, dict] = {
     # "Reasoning is mandatory for this endpoint and cannot be disabled"。
     # 这里保持空字典 = 不补任何参数，沿用模型默认；需要压成本/延迟的模型
     # 在自己的配置里写 "disable_thinking": {"reasoning": {"effort": "minimal"}}。
+    # 注意：空字典是合法的「不补参数」策略，不是「未知 provider」；是否缺少
+    # 可用的策略由 _has_disable_thinking_policy 判断，不能拿结果是否为空来判。
     "openrouter": {},
 }
 """关闭思考模式时，往 init_chat_model 里补的参数，按 provider 索引
@@ -352,16 +354,36 @@ def _proxy_client_kwargs(
     )
 
 
+def _has_disable_thinking_policy(model_cfg: dict) -> bool:
+    """该模型是否有可用的「关思考」参数来源
+
+    两种情况都算已知：配置里显式写了 "disable_thinking"（空字典表示显式不补
+    参数），或 provider 在 _DISABLE_THINKING_DEFAULTS 里有默认值。OpenRouter
+    的默认值就是空字典——它代表「沿用模型默认、不补参数」，是合法策略，不能
+    因为结果为空就当成「不知道该 provider 怎么关思考」。
+    """
+    if model_cfg.get("disable_thinking") is not None:
+        return True
+    return _model_provider(model_cfg) in _DISABLE_THINKING_DEFAULTS
+
+
 def disable_thinking_kwargs(model_cfg: dict) -> dict:
     """该模型「关掉思考模式」要补的参数（供 get_model 与原生 Batch 请求共用）
 
     模型配置里写了 "disable_thinking" 就整体以配置为准，否则按 provider 取默认值。
-    原生 Batch 走裸 HTTP，没有 langchain 的 extra_body 包装，调用方需要自行摊平
-    （见 batch_inference._flatten_extra）。
+    返回空字典可能是合法结果（例如 OpenRouter 默认不补参数），调用方不要用
+    「结果为空」判断 provider 是否未知；需要报错时先用 _has_disable_thinking_policy
+    判断。原生 Batch 走裸 HTTP，没有 langchain 的 extra_body 包装，调用方需要自行
+    摊平（见 batch_inference._flatten_extra）。
     """
     # 兼容 model_provider 这个 LangChain 名称，与 get_model 的取法保持一致。
+    configured = model_cfg.get("disable_thinking")
+    if configured is not None:
+        # 显式配置优先，包括空字典（明确表示不补参数）；不能因为它是 falsy
+        # 就退回到 provider 默认值。
+        return dict(configured)
     provider = _model_provider(model_cfg)
-    return dict(model_cfg.get("disable_thinking") or _DISABLE_THINKING_DEFAULTS.get(provider) or {})
+    return dict(_DISABLE_THINKING_DEFAULTS.get(provider) or {})
 
 
 def get_model(model_name: str, disable_thinking: bool = False):
@@ -374,8 +396,10 @@ def get_model(model_name: str, disable_thinking: bool = False):
             而 ToolStrategy 结构化输出正是靠强制调用结构化输出工具实现的，两者冲突；
             所以凡是要结构化输出就必须关掉思考。代价是失去思维链。
             具体补什么参数按 provider 取 _DISABLE_THINKING_DEFAULTS，配置里写了
-            "disable_thinking" 则整个以配置为准。OpenRouter 没有通用的关闭开关
-            （部分端点要求 reasoning 必须开启），默认不补参数。
+            "disable_thinking" 则整个以配置为准（空字典表示显式不补参数）。
+            OpenRouter 没有通用的关闭开关（部分端点要求 reasoning 必须开启），
+            默认不补参数；这是合法的空策略。只有 provider 既没有默认值、配置里
+            又没写 "disable_thinking" 时才会报错。
 
     代理口径：模型配置可选 ``"proxy"`` 字段，不同模型可以各配各的：
 
@@ -414,13 +438,15 @@ def get_model(model_name: str, disable_thinking: bool = False):
         "max_retries": 0,
     }
     if disable_thinking:
-        disable_kwargs = disable_thinking_kwargs(model_cfg) or None
-        if disable_kwargs is None:
+        # 只有「provider 未知且配置没写 disable_thinking」才报错。已知 provider
+        # 的默认值可以是空字典（OpenRouter 即如此，表示不补参数），不能把空
+        # 字典当成缺失策略。
+        if not _has_disable_thinking_policy(model_cfg):
             raise ValueError(
                 f"不知道 provider '{kwargs['model_provider']}' 该怎么关思考模式，"
                 f"请在 {_MODEL_CONFIG_PATH} 的 {model_name} 配置里加 \"disable_thinking\" 字段。"
             )
-        kwargs.update(disable_kwargs)
+        kwargs.update(disable_thinking_kwargs(model_cfg))
 
     # OpenRouter 的两处 provider 差异在这里统一适配：timeout 用毫秒，
     # 并显式关掉 SDK 的隐藏重试（见 _openrouter_client_kwargs）。
