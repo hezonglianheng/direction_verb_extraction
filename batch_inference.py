@@ -642,11 +642,50 @@ class NativeBatchClient:
         self.logger(f"  原生 batch 已提交：{batch_id}（{len(items)} 项）")
         return job
 
+    def _with_transient_retry(self, action: str, job: BatchJob, started: float, call):
+        """执行一次查询/下载；网络或服务端短暂故障时继续等，而不是立刻丢掉整批
+
+        `_request` 内部已有有限次退避重试，但代理重启、DNS 抖动这类故障常超过
+        一分钟，只靠单次请求的重试仍会让已经受理的 batch 在本地被误判成失败。
+        这里把「重试」限制在**只读**的轮询/下载上；建批本身仍然只发一次，绝不
+        因为网络错误重复提交、重复计费。
+
+        非可重试错误（401/403/404 等）原样抛出；持续故障超过 timeout_seconds
+        才转成 BatchTimeout，并把 batch ID 留进 jobs 文件供 --batch-resume 续收。
+        """
+        while True:
+            try:
+                return call()
+            except Exception as exc:  # noqa: BLE001 —— 只对可重试错误放行
+                if not retry.is_retryable_error(exc):
+                    raise
+                elapsed = time.time() - started
+                if self.timeout_seconds and elapsed > self.timeout_seconds:
+                    raise BatchTimeout(
+                        f"{action} batch {job.batch_id} 连续失败（{exc!r}），"
+                        f"已超过 {self.timeout_seconds:.0f} 秒；batch ID 已记入 "
+                        ".batch-jobs.json，可加 --batch-resume 继续收。"
+                        "如果是代理故障，请先确认代理可用或去掉 HTTP(S)_PROXY 后重试",
+                        job=job,
+                    ) from exc
+                delay = self.poll_seconds
+                if self.timeout_seconds:
+                    delay = max(0.0, min(delay, self.timeout_seconds - elapsed))
+                self.logger(
+                    f"  警告：{action} batch {job.batch_id} 暂时失败（{exc!r}）；"
+                    f"{delay:.0f} 秒后继续，不会重新提交"
+                )
+                time.sleep(delay)
+
     def wait(self, job: BatchJob) -> BatchJob:
         started = time.time()
         while True:
-            response = self._request("GET", f"/batches/{job.batch_id}")
-            payload = response.json()
+            payload = self._with_transient_retry(
+                "查询",
+                job,
+                started,
+                lambda: self._request("GET", f"/batches/{job.batch_id}").json(),
+            )
             job.status = str(payload.get("status") or job.status)
             job.output_file_id = str(payload.get("output_file_id") or job.output_file_id or "")
             job.error_file_id = str(payload.get("error_file_id") or job.error_file_id or "")
@@ -674,9 +713,14 @@ class NativeBatchClient:
 
     def collect(self, job: BatchJob) -> dict[str, tuple[dict | None, str | None]]:
         """取回结果，返回 {key: (body, error)}；缺项按错误处理，不猜答案"""
+        started = time.time()
         if job.protocol == "openrouter":
-            return self._collect_openrouter(job)
-        return self._collect_openai(job)
+            return self._with_transient_retry(
+                "读取", job, started, lambda: self._collect_openrouter(job)
+            )
+        return self._with_transient_retry(
+            "下载", job, started, lambda: self._collect_openai(job)
+        )
 
     def _collect_openrouter(self, job: BatchJob) -> dict[str, tuple[dict | None, str | None]]:
         """OpenRouter 的 results 直接在 GET /batches/{id} 里，没有文件下载"""
