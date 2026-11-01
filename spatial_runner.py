@@ -498,7 +498,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="多模型投票模式：指定 model_config/api_keys.json 里的多个配置名。"
         "每个模型独立跑完整张图（各自的 agent、缓存与原始结果），再按 voting_weight "
         "对每条候选做加权简单多数；平票记为 discarded。只给一个名字时等价于 --model。"
-        "不能与 --no-llm 同用（投票必须有模型判定）",
+        "单个模型失败不会作废整轮：它的票按缺票计入并转人工复核，其余模型照常投票；"
+        "只有全部模型都失败才报错。不能与 --no-llm 同用（投票必须有模型判定）",
     )
     parser.add_argument(
         "--model-workers",
@@ -1145,6 +1146,45 @@ def _run_multi_model(
             print(f"[Agent日志] 已写入 {summary['log_file']}（同名 .jsonl 为机器可读版本）")
 
 
+def _model_summary_entry(
+    name: str,
+    weights: dict[str, int],
+    raw_paths: dict[str, Path],
+    results: dict[str, dict],
+    failed: dict[str, BaseException],
+    model_records: dict[str, list[dict]],
+) -> dict:
+    """汇总里每个模型一条：跑成功的照旧，失败的标 status=failed 并留下错误与已参与票数
+
+    失败模型也占一条，是为了让事后拿到 .summary.json 的人能一眼区分
+    “这个模型没票”是它整轮都没跑起来，还是它跑了但一直弃权。
+    """
+    result = results.get(name)
+    if result is not None:
+        writer = result["writer"]
+        return {
+            "name": name,
+            "weight": weights[name],
+            "output_file": str(raw_paths[name]),
+            "status": "ok",
+            "count": result["summary"]["count"],
+            "elapsed_seconds": result["summary"]["elapsed_seconds"],
+            "agent_stats": writer.agent_stats,
+            "reality_prefill": writer.reality_prefill,
+            "request_policy": writer.extra_summary.get("request_policy"),
+            "batch": writer.extra_summary.get("batch"),
+        }
+    exc = failed.get(name)
+    return {
+        "name": name,
+        "weight": weights[name],
+        "output_file": str(raw_paths[name]),
+        "status": "failed",
+        "error": repr(exc) if exc is not None else "未运行",
+        "count": len(model_records.get(name) or []),
+    }
+
+
 def _run_multi_model_impl(
     args,
     spec,
@@ -1163,6 +1203,10 @@ def _run_multi_model_impl(
     并行边界在**模型**这一层：模型之间互不共享 agent、缓存与 writer；
     每个模型内部仍按 --workers 并发跑候选。原始结果各写自己的文件，
     最终投票结果写用户 --out-file 指定的那一个，下游读取方式与单模型一致。
+
+    **单个模型失败不作废整轮**：失败模型已落盘的记录照常参与投票，没落盘的按缺票
+    计（见 voting.aggregate_votes 的 missing_models / incomplete），受影响记录转人工
+    复核；只有全部模型都失败、没有可投的票时才抛错。
     """
     if args.model_workers < 0:
         raise SystemExit("错误：--model-workers 不能为负数")
@@ -1280,16 +1324,46 @@ def _run_multi_model_impl(
             except BaseException as exc:  # 先收集，等其余模型收尾后再抛
                 errors.append((name, exc))
                 print(f"[{name}] 失败：{exc!r}")
-    if errors:
-        failed_model, exc = errors[0]
-        raise RuntimeError(f"多模型投票中模型 {failed_model} 运行失败：{exc!r}") from exc
+    # 单个模型失败不再作废整轮：它的票按“缺票”记在 voting.missing_models 上，
+    # 其余模型照常投票，受影响的记录由 aggregate_votes 标 incomplete 并转人工复核。
+    # 只有**全部**模型都失败时才没有可投的票，那时才报错。
+    failed: dict[str, BaseException] = dict(errors)
+    if failed:
+        if len(failed) == len(model_names):
+            first_name, first_exc = errors[0]
+            raise RuntimeError(
+                f"多模型投票中全部模型运行失败（首个：{first_name}）：{first_exc!r}"
+            ) from first_exc
+        print(
+            f"警告：{len(failed)}/{len(model_names)} 个模型失败，按缺票继续投票 —— "
+            + "；".join(f"{name}: {exc!r}" for name, exc in errors)
+        )
+        log.event(
+            "model_failed",
+            models=list(failed),
+            errors={name: repr(exc) for name, exc in errors},
+            note="失败模型按缺票参与投票，其余模型继续",
+        )
 
-    model_records = {}
+    model_records: dict[str, list[dict]] = {}
     for name in model_names:
         path = raw_paths[name]
         if not path.exists():
+            if name in failed:
+                # 还没开始落盘就失败了：整份缺票，aggregate_votes 会把它记进 missing_models
+                continue
             raise RuntimeError(f"模型 {name} 没有产出结果文件：{path}")
-        model_records[name] = st.read_jsonl(path)
+        try:
+            model_records[name] = st.read_jsonl(path)
+        except (OSError, json.JSONDecodeError) as exc:
+            if name in failed:
+                # 失败那次的收尾可能留下一行半截记录：读不全就整份按缺票处理，
+                # 不能因为一行坏数据把其余四个模型的成果一起扔掉
+                print(f"警告：模型 {name} 的部分结果读不出来（{exc!r}），整份按缺票处理")
+                continue
+            raise
+        if name in failed:
+            print(f"模型 {name} 失败前已落盘 {len(model_records[name])} 条，按现有记录参与投票")
 
     final_records = voting.combine_model_records(
         spec.name,
@@ -1300,9 +1374,16 @@ def _run_multi_model_impl(
     )
     if not final_records:
         print("警告：所有模型都没有产出可投票的记录，未生成最终结果")
-        log.event("voting_end", status="empty", models=list(model_names))
+        log.event(
+            "voting_end",
+            status="empty",
+            models=list(model_names),
+            **({"failed_models": {name: repr(exc) for name, exc in failed.items()}} if failed else {}),
+        )
         return {}
 
+    # 状态数取第一个**跑成功**的模型：失败模型的 results 条目不存在（也可能恰好是 model_names[0]）
+    first_states = next((results[name]["states"] for name in model_names if name in results), [])
     voting_writer = ResultWriter(
         out_path,
         counter_names=spec.counter_names,
@@ -1313,30 +1394,23 @@ def _run_multi_model_impl(
         model_name="voting",
         overwrite=args.overwrite,
         input_records=len(records),
-        expanded_states=len(results[model_names[0]]["states"]),
+        expanded_states=len(first_states),
         progress_prefix="[voting] ",
     )
     voting_writer.extra_summary = {
         "voting": voting.summarize_voting(final_records),
         "model_names": list(model_names),
         "voting_weights": dict(weights),
+        **({"failed_models": {name: repr(exc) for name, exc in failed.items()}} if failed else {}),
         **(
             {"agent_log_file": str(log.path), "agent_log_jsonl": str(log.jsonl_path)}
             if log.path is not None and log.jsonl_path is not None
             else {}
         ),
+        # 失败模型也留一条（status=failed + error）：事后看汇总能直接分辨
+        # “这个模型没票”是设计如此，还是它那一轮炸了
         "models": [
-            {
-                "name": name,
-                "weight": weights[name],
-                "output_file": str(raw_paths[name]),
-                "count": results[name]["summary"]["count"],
-                "elapsed_seconds": results[name]["summary"]["elapsed_seconds"],
-                "agent_stats": results[name]["writer"].agent_stats,
-                "reality_prefill": results[name]["writer"].reality_prefill,
-                "request_policy": results[name]["writer"].extra_summary.get("request_policy"),
-                "batch": results[name]["writer"].extra_summary.get("batch"),
-            }
+            _model_summary_entry(name, weights, raw_paths, results, failed, model_records)
             for name in model_names
         ],
     }
@@ -1357,13 +1431,20 @@ def _run_multi_model_impl(
         f"用时 {summary['elapsed_seconds']} 秒（总耗时 {round(time.time() - started, 1)} 秒）"
     )
     for name in model_names:
-        stats = results[name]["writer"].agent_stats
+        result = results.get(name)
+        if result is None:
+            print(
+                f"  模型 {name}（权重 {weights[name]}）：运行失败，按缺票处理"
+                f"（已落盘 {len(model_records.get(name) or [])} 条参与投票）"
+            )
+            continue
+        stats = result["writer"].agent_stats
         roundtrips = sum(item.get("roundtrips", 0) for item in stats.values())
-        failed = sum(item.get("failed", 0) for item in stats.values())
+        call_failed = sum(item.get("failed", 0) for item in stats.values())
         retries = sum(item.get("retries", 0) for item in stats.values())
         print(
             f"  模型 {name}（权重 {weights[name]}）：{roundtrips} 次往返"
-            + (f"／{failed} 次失败" if failed else "")
+            + (f"／{call_failed} 次失败" if call_failed else "")
             + (f"／{retries} 次重试" if retries else "")
         )
     vote_stats = summary["voting"]
