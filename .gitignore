@@ -18,3 +18,6 @@ model_config/api_keys.json
 
 # 本地测试缓存（测试源码本身需要入库）
 tests/__pycache__/
+
+# 忽略.doc中的说明文档
+.docs/*

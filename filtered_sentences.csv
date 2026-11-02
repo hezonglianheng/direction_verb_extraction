@@ -1,0 +1,6 @@
+sentence,source_file,filter_methods
+"魏仲时这时从里间的重症病房出来,见了张团长就拱手道:""不知团长驾到,有失远迎,请多多包涵...""",F:\智源语料文件\wudao2_0_sample\wudao2_0\日报.jsonl,"['', '', 'root', 'direction_verb_as_root', 'direction_verb_as_root', 'direction_verb_as_root']"
+"第二天一大早,高龄产妇就进了手术室.",F:\智源语料文件\wudao2_0_sample\wudao2_0\日报.jsonl,"['', '', 'root', 'direction_verb_as_root', 'direction_verb_as_root', 'direction_verb_as_root']"
+"第二天上课时,她一走进教室,发现学生们的眼神和往常不一样,有一种期待.",F:\智源语料文件\wudao2_0_sample\wudao2_0\日报.jsonl,"['', '', 'root', 'manner_verb_as_root', 'manner_verbs', 'manner_verbs', 'manner_verbs', 'direction_verb_as_complement', 'direction_verb_as_single_complement']"
+"手牵手去街头漫步,相伴着走过一盏盏路灯,看着天上的星星,月亮,说着一些关于人间烟火的很世俗的话题,你不用给我太多的风花雪月,也不用给我任何的荣华富贵,只要你记得在冬夜为我买一个烤红薯,夏夜为我买一支雪糕,我们就可以一起把这平凡清苦的日子演绎成人间传奇,相守到天荒地老...",F:\智源语料文件\wudao2_0_sample\wudao2_0\日报.jsonl,"['', '', 'root', 'accompany_verb_as_root', 'accompany_verbs', 'accompany_verbs', 'accompany_verbs', 'direction_verb_as_complement', 'direction_verb_as_single_complement']"
+"还有些看去很有""身份""的人,趁着夜深人静时,从宾馆里走出来,东张西望后,机警地走进性保健品柜台前,以极快的速度买了药品后,再神色镇定地回到宾馆...",F:\智源语料文件\wudao2_0_sample\wudao2_0\日报.jsonl,"['', '', 'root', 'manner_verb_as_root', 'manner_verbs', 'manner_verbs', 'manner_verbs', 'direction_verb_as_complement', 'direction_verb_as_single_complement']"
