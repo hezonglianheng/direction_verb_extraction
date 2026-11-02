@@ -1,115 +1,28 @@
 # encoding: utf8
 
-"""空间语义实验的跑批入口：读语料 → 建图 → 并发跑 → 落盘 → 汇总。
+"""空间语义标注跑批：读取合格句对 → feature → schema → judge → 落盘汇总。
 
-三层分工：
-    spatial_agents.py   六个 agent：输入什么、产出什么（不 import langgraph）
-    spatial_graphs.py   状态、节点适配器、各图 builder、图注册表
-    spatial_runner.py   本文件：驱动、并发、落盘、命令行
+语料提取见 sentence_extract.py，机械替换及两侧语法/空间义检查见 sentence_replace.py。
+正式 pair/synonym 图只消费替换阶段的句对，不展开候选、不重新筛选、不准备句法证据。
+原句和替换句各用自己的关注词与三元组，特征/图式示例从 system_prompt/examples 按词选择。
+single/alter_check 保留为显式诊断图，不是正式句对标注入口。
 
-pair 图（默认，--graph pair）的数据流：
-
-    START ──► alter ──改写未命中──► save ──► END
-                │改写成功
-                ▼
-             reality ──不是现实空间用法──► save ──► END
-                │是（或没判出来）
-                ▼
-             semantic ──任一句不通顺──► save ──► END
-                │两句都通顺
-                ▼
-             feature ──► schema ──► judge ──► save ──► END
-
-三张图**都在各自的入口节点（alter / read）之后、LLM agent 之前**插了一个 reality 闸门：
-只看关注词在这一句里是不是用来说现实世界中的空间场景，判 false 就经 save 落盘后结束
-（判不好的记录也留着，好回头查是被哪条判据挡下的）；判不出来时一律放行，理由见
-spatial_graphs.reality_gate —— 闸门的错法只能是漏掉几句引申用法，不能是把整批记录挡在门外。
-
-这道闸门判的只是**原句、且只是本记录要替换的那个位置上的词**（a 侧的 focus_word，与改写句
-换上去的词无关）。一条语料会展开出多个候选状态、每个状态都要过一遍：**同一位置**的几个候选
-问的是逐字相同的一句原话，**不同位置**（如「上@5」与「上@3」）问的却是不同的问题。所以它在
-跑批前判完并按整条 user message（含位置词）去重（见 _prefill_reality）：节点位置与产物形状都
-不变（仍在 alter 之后，改写未命中的记录照旧没有 reality 块），省下的是同位置那几个候选的重复
-调用（实测 1782 条记录只对应 200 个原句）。这份去重账写进 .summary.json 的 reality_prefill
-——事后核对调用数时先看它。
-
-semantic / feature / schema 三个节点都是**原句与改写句各跑一遍**（两侧各一份结果，落盘时记在 a/b
-两个键下），judge 是两侧合并的地方：它一份记录只跑一次，同时读两侧的 schema 与关注词。
-这三者的 a 侧输入只由语料与本记录那个位置决定（同一句原话、**同一位置**上的候选问的是逐字相同的
-一条消息），所以结果按 user message 缓存在各自的 agent 实例里（见 spatial_agents.CACHEABLE_SOURCES）——第一次问过之后，同一条消息不再重复发请求；每次跑批各 agent 的往返数与命中数写进
-.summary.json 的 agent_stats。同一句原话若有两个位置（上@5 与 上@3），那是两条不同的 a 侧消息，
-各问一次。
-两侧**各看各的关注词**——原句那侧看语料记录里那个词（focus_word），改写句那侧看规则表换上去的
-那个词（focus_word_b，由 alter 节点算出）。所以 b 侧的 schema 收窄到的是**替换词**所属的词组，
-判定表里 上12 × 里1 这样按两组名字写的格子才对得上；两侧共用一个词的话 b 侧会收窄回原词那一组，
-判定就退化成同组自比了（见 spatial_tools.replacement_focus_word）。两处的下标都落在原句的
-分词结果上（b 侧是照搬 a 侧的），消息里对 b 侧的措辞已交代不要拿它去数改写句的分词行
-（改写句要重新分词，替换点可能并词，见 spatial_agents.FOCUS_INDEX_NOTE_ALTER）。
-
-一条语料里的方位词往往能换成规则表里好几个替换词（见 spatial_tools.alter_sentence），
-而且句内**每个**目标词位置都要参与改写（「他从山上掉到山谷里」的「上」与「里」各是一个位置，
-见 spatial_tools.pick_focus_words）。所以跑批时会先把它展开成多个待选句、每个待选句一个状态：
-**一条语料通常产出多条记录**，记录里的 candidate 块（index/total/focus_index/word/replacement/
-group）标明这是第几个待选句、改的是句内哪个位置（一条记录只改一个位置，其余目标词原样保留）。
---limit / --offset 仍按语料条数算，不按展开后的状态数算。
-
-每跑一次产出一个 jsonl，一条记录就是一条完整链路的结果（两个句子、各自的语义特征、
-各自对应的 schema、两侧各自的关注词、判定信息，外加逐节点的上下文历史），
-另在同目录写一份 .summary.json 汇总。
-记录在 save 节点流式落盘，长跑中途也能 tail 到进度；并发跑时落盘顺序等于完成顺序、不等于
-输入顺序，但**收尾时 ResultWriter.finish 会把文件按 (line_no, candidate.index) 重排**
-（键见 spatial_graphs.record_order_key），所以跑完之后两份输出（本图与 all_in_one.py 那边）
-顺序完全一致，可以逐行对账。中途 tail 到的仍是完成顺序——这是刻意保留的取舍。
-
-那份重排后的记录**顺手还导出一份同名 .csv**（成对信息：原句/替换句/图式/同义判断，供 Excel 看，
-列序见 spatial_tools.PAIR_CSV_COLUMNS），默认开启，--no-pairs-csv 可关。两份文件出自同一份排好序的
-记录，行序必然一致；只有 pair 图的记录有这些成对字段，换别的图本就不导，启动时会说明一句。
-
-每跑完一个 agent（含纯规则的 alter、reality 闸门的批量预填充），还会在 log/ 下留一条执行记录：
-    log/agent-log-YYYYMMDD-HHMMSS-ffffff.log     人读：一次执行一段，收尾带按 agent 的汇总
-    log/agent-log-YYYYMMDD-HHMMSS-ffffff.jsonl   机器读：一条执行一个 JSON 对象
-记录字段、截断口径与写失败策略见 agent_log.py。日志是附属产物，写不进去只警告，不影响结果落盘。
+默认输入：results/location_pairs.jsonl（方位词）、results/direction_pairs.jsonl（趋向动词）。
+--limit/--offset 按通过两侧检查的句对计数。结果为 JSONL、同名 CSV（可关闭）及 summary.json，
+收尾按 (line_no, candidate.index) 排序，可与 all_in_one.py 对账。模型执行日志见 log/。
 
 用法：
-    .venv/bin/python spatial_runner.py --limit 5                        # 跑前 5 条（pair 图，方位词）
-    .venv/bin/python spatial_runner.py --limit 5 --no-llm               # 只跑纯规则与查表，不花钱
-    .venv/bin/python spatial_runner.py --limit 5 --no-pairs-csv         # 不导成对信息 csv（默认导）
-    .venv/bin/python spatial_runner.py --workers 4 --limit 200          # 并发跑
-    .venv/bin/python spatial_runner.py --graph single --limit 5         # 换一张图
-    .venv/bin/python spatial_runner.py --list-graphs                    # 有哪些图可用
-    .venv/bin/python spatial_runner.py --corpus-type 趋向动词 --limit 20   # 换语料类型（别名 direction 也行）
-    .venv/bin/python spatial_runner.py --corpus results/direction_corpus.jsonl --corpus-type 趋向动词 --limit 20
-    .venv/bin/python spatial_runner.py --corpus-type 趋向动词 --alter-rules <路径> --limit 5   # 换改写的表
-    .venv/bin/python spatial_runner.py --models model-a model-b --workers 4   # 多模型加权投票
-    .venv/bin/python spatial_runner.py --batch-inference --limit 5            # LTP 一次前向准备整批句子（默认逐句准备）
+    python spatial_runner.py --corpus results/location_pairs.jsonl --limit 5
+    python spatial_runner.py --corpus results/direction_pairs.jsonl --corpus-type 趋向动词 --limit 20
+    python spatial_runner.py --workers 4 --limit 200
+    python spatial_runner.py --no-llm --batch off --limit 5
+    python spatial_runner.py --models model-a model-b --workers 4
+    python spatial_runner.py --batch native --batch-resume --batch-cache results/run.batch-cache.jsonl
+    python spatial_runner.py --list-graphs
 
-多模型投票（--models）：
-    每个模型独立跑完整张图，原始结果写到 ``<输出主干>.models/00_<模型>.jsonl``；
-    最终投票结果写到 ``--out-file`` 指定的文件，记录形状与单模型一致，另带 voting 块。
-    模型配置里的 ``voting_weight`` 是票数（缺省 1，必须 >= 1）；加权得分唯一最高的标签
-    被采纳，最高分并列即平票，该条 status=discarded、admission 转人工复核。
-    各模型并行执行（--model-workers，0 = 全部并行），每个模型内部仍按 --workers 并发。
-    LTP 句法证据总会在模型线程开跑前准备好（消息侧只读，worker 不再补算）；
-    --batch-inference 只决定一次前向的批大小：默认逐句准备，显式开启后按
-    config.LTP_BATCH_CHUNK 批量送入。多模型时整批只准备一次（LTP 与模型无关）。
-
-批量推理（--batch，默认 auto）：
-    模型配置声明了原生批量入口时（OpenAI 文件式 Batch / OpenRouter 内联 Batch，或显式
-    `batch` 配置），LLM agent 的请求按「波次」整批提交：第一波判 reality、第二波 semantic
-    （a/b 同批）、第三波 feature、第四波 schema（仅查表未命中项）、第五波 judge（仅判定表
-    未给结论项）。闸门与查表仍由原图决定，批处理层不复制阶段判断。
-    没有原生入口、或原生入口调用失败时回退同步执行（--workers 生效），并在汇总里记成
-    fallback；`--batch native` 则在不可用时直接报错。结果 sidecar 见 `--batch-cache`，
-    `--batch-resume` 会复用已收结果并继续收上次未终结的 batch（batch ID 在
-    `<sidecar>.jobs.json` 里，不会因为轮询超时而重复提交）。
-
-四张配置表（改写规则 / 语义特征类别 / schema / 判定）**按语料类型分两组**存放在
-config_files/localization/（方位词）与 config_files/direction/（趋向动词）下，文件名相同；
---corpus-type 决定读哪一组（默认方位词），启动时逐张打印实际路径与内容摘要，缺表/空表当场告警。
-同两个目录下还各有一份 reality 闸门的提示语（reality.txt）：闸门的判据随词类不同（方位词看的是
-「说的是一处位置还是虚化用法」，趋向动词看的是「说的是位移还是时体/结果」），所以它跟着配置表走，
-不放在 system_prompt/ 下，也由 --corpus-type 一并选中。
---corpus-type 不给时**不按语料文件名推断**（理由见该选项的 help）：语料名像另一类时会额外提醒一句。
+--models 保留模型独立执行与加权投票，缺票及平票转人工复核。--batch auto 优先使用原生 Batch，
+不可用时明确回退同步；native 不允许回退。批处理仅包含特征、图式和判定波次，查表优先级不变。
+完整命令、句对契约与 JSON5 示例格式见 docs/corpus-pipeline.md。
 """
 
 import argparse
@@ -127,6 +40,7 @@ import agent_log
 import agents as agent_factory
 import batch_inference as bi
 import config
+import corpus_pairs as cp
 import file_paths
 import spatial_agents as sa
 import spatial_graphs as sg
@@ -441,18 +355,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="类型",
         type=_corpus_type_arg,
         help="语料类型：方位词（别名 localization/location/loc）或 趋向动词（别名 direction/dir/direction_verb）。"
-        "决定读 config_files/<类型目录>/ 下的四张表与 reality 闸门的提示语（启动时逐张打印实际路径与内容摘要）。"
+        "决定读取该词性的特征、图式与判定配置，以及 system_prompt/examples 下的示例。"
         "默认方位词；**刻意不按语料文件名推断**——推断猜错时是静默读错一整组表，"
         "宁可要你显式说一句（语料名像另一类时会提醒一句，但不会替你改）。"
-        "--alter-rules 显式给路径时，改写那张表以它为准（类型只管另外三张）",
+        "正式标注前请先运行 sentence_replace.py 生成该类型的句对",
     )
-    parser.add_argument("--corpus", default=None, help="输入语料 jsonl 路径（默认按语料类型取 results/ 下对应那份）")
+    parser.add_argument("--corpus", default=None, help="句对 JSONL（pair/synonym 默认 results/location_pairs.jsonl 或 direction_pairs.jsonl）")
     parser.add_argument(
         "--alter-rules",
         default=None,
-        help="替换规则表路径（默认读本语料类型目录下的 alter_rules.json5，见 --corpus-type）："
-        "换一张表对照实验用，纯规则环节，--no-llm 下同样生效。"
-        "指定的文件不存在时按空表处理（等价于不改写），启动时会告警",
+        help="仅 alter_check 诊断图使用；正式 pair/synonym 标注不替换，须将此参数传给 sentence_replace.py",
     )
     parser.add_argument("--out-dir", default=None, help="输出目录（默认 results/<图的 prefix>）")
     parser.add_argument("--out-file", default=None, help="直接指定输出文件（默认按时间戳生成）")
@@ -484,7 +396,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--limit",
         type=int,
         default=100,
-        help="最多处理多少条**可用判定语料**（screening= true/no_llm，过滤后计数）；"
+        help="最多处理多少条两侧已通过检查的句对（过滤后计数）；"
         "可用数量不足时会报告。默认 100",
     )
     parser.add_argument("--offset", type=int, default=0, help="跳过前多少条可用判定语料（过滤后计数）")
@@ -512,13 +424,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--batch-inference",
         action="store_true",
-        help="LTP 句法证据按批准备（默认逐句准备）。只影响一次前向的批大小，"
-        "不影响消息与记录内容；多模型时整批只准备一次；--no-llm 时不执行",
+        help="仅旧诊断图的句法准备使用；正式 pair/synonym 标注无句法输入，此开关无效",
     )
     parser.add_argument(
         "--no-llm",
         action="store_true",
-        help="不调任何模型：只跑纯规则改写、查表与落盘，用于验证规则表与接线",
+        help="不调任何模型：只读取已有句对、查表与落盘；不重新替换或筛选",
     )
     parser.add_argument(
         "--feature-deep",
@@ -680,6 +591,8 @@ def _prefill(records: list[dict], agents, spec: sg.GraphSpec, *, batch: bool = T
     因为消息侧只读 st.syntax_text，worker 里不再补算 LTP。
     """
     sentences = [s for s in spec.plan(records, agents) if s]
+    if not sentences:
+        return  # 正式 pair/synonym 标注没有句法输入，不能触发句法预填充
     chunk_size = config.LTP_BATCH_CHUNK if batch else 1
     stat = st.prepare_syntax(sentences, chunk_size=chunk_size)
     mode = "批量" if batch else "逐句"
@@ -717,6 +630,8 @@ def _prefill_reality(records: list[dict], agents, spec: sg.GraphSpec, workers: i
         f"reality 预填充：本图需判 {stat['unique']} 个原句"
         f"（去重前 {stat['queries']} 个待选状态），实际发出 {stat['asked']} 次"
     )
+    if stat.get("reused"):
+        line += f"；另有 {stat['reused']} 个状态直接复用记录里的 screening 判定"
     if stat["failed"]:
         line += f"；其中 {stat['failed']} 次失败未入缓存，会在各自候选上重试"
     if stat["skipped"]:
@@ -763,7 +678,7 @@ def _build_overrides(args, spec: sg.GraphSpec) -> dict[str, dict]:
     与具体模型无关，多模型时每个模型各建一份同口径的 agent。
     """
     overrides: dict[str, dict] = {}
-    if args.alter_rules:
+    if args.alter_rules and "alter" in spec.needs:
         overrides["alter"] = {"rules": st.load_alter_rules(args.alter_rules), "rules_path": args.alter_rules}
     if args.feature_deep and "feature" in spec.needs:
         overrides.setdefault("feature", {})["deep"] = True
@@ -965,14 +880,14 @@ def _execute_run(
                 # 闸门的原句在这里一次判完（去重）。图已经建好——接线错在花钱之前就报出来，于是这份
                 # 去重账补写到 writer 上，与语料类型、配置表一并进汇总（见 ResultWriter.reality_prefill）
                 writer.reality_prefill = _prefill_reality(records, agents, spec, args.workers, verbose=verbose)
-            elif verbose:
+            elif verbose and "reality" in spec.needs:
                 print("reality 预填充：批处理模式下由第一波批量请求统一提交（按 user message 去重）")
 
         # 一条语料的每个目标词位置各能改出好几个待选句，每个待选句一个状态、一条记录，
         # 所以状态数一般多于语料条数
         states = spec.init_states(records, agents, str(out_path))
         if verbose:
-            print(f"展开待选句：{len(records)} 条语料 → {len(states)} 个状态（每个状态落一条记录）")
+            print(f"处理状态：{len(records)} 条输入 → {len(states)} 个状态（正式标注不再展开句对）")
         # 转化链的两个分母（D5）补写到 writer 上、进汇总（与 reality_prefill / agent_stats 同一套路）
         writer.input_records = len(records)
         writer.expanded_states = len(states)
@@ -1504,10 +1419,19 @@ def main(argv: list[str] | None = None) -> None:
     _warn_corpus_type_mismatch(corpus_path, corpus_type)
 
     spec = sg.get_graph(args.graph)
-    records = st.read_corpus(corpus_path, limit=args.limit, offset=args.offset, judge_only=True)
+    if spec.name in ("pair", "synonym"):
+        if not args.corpus:
+            corpus_path = _PROJECT_ROOT / "results" / cp.PAIR_CORPORA[corpus_type]
+        if args.alter_rules:
+            raise SystemExit("错误：标注阶段不再替换句子；请将 --alter-rules 传给 sentence_replace.py")
+        records = cp.read_prepared_pairs(corpus_path, limit=args.limit, offset=args.offset)
+        if any(record.get("corpus_type") != corpus_type for record in records):
+            raise ValueError("句对的 corpus_type 与 --corpus-type 不一致，不能使用另一词性的标注配置")
+    else:
+        records = st.read_corpus(corpus_path, limit=args.limit, offset=args.offset, judge_only=True)
     if args.limit is not None and len(records) < args.limit:
         print(
-            f"警告：可用判定语料只有 {len(records)} 条（true/no_llm），少于计数限制 {args.limit} 条；"
+            f"警告：可用判定语料只有 {len(records)} 条，少于计数限制 {args.limit} 条；"
             "已按实际数量运行"
             + (f"（已跳过 offset={args.offset} 条可用语料）" if args.offset else "")
         )

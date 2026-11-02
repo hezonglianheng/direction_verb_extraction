@@ -1,66 +1,17 @@
 # encoding: utf8
 
-"""把 spatial_agents.py 里的 agent 接成图：状态、节点适配器、各图 builder、图注册表。
+"""空间语义图的状态、节点适配器、序列化与注册表。
 
-本模块只做"谁接谁"：agent 做什么在 spatial_agents.py，跑批与落盘在 spatial_runner.py。
-三个模块的依赖方向是单向的：spatial_runner → spatial_graphs → spatial_agents → spatial_tools。
+正式标注图：
+    pair     read_pair → feature（a/b）→ schema（a/b）→ judge → save
+    synonym  read_pair → synonym → save
+两者只接受 sentence_replace.py 产出的合格句对；不再改写或请求语法/空间义判断。
+read_pair 将两侧原有检查写入兼容的 reality/semantic 输出块，来源标记 preparation。
+两侧分别使用自己的关注词、三元组与示例；旧输入必须先经过替换步骤。
 
-现有的四张图（GRAPHS）：
-
-    pair         六个 agent 全用：alter → reality → semantic → feature → schema → judge → save
-                 改写未命中、或 reality 判为「不是现实空间用法」则直接 save 收尾。产出前缀 spatial_pairs。
-    single       单句：read → reality → 语义 → 特征 → schema。用来看单个句子抽出来的东西是否合理。
-                 前缀 spatial_single。
-    alter_check  改写检查：alter → reality → semantic（两句各判一次语法与空间语义），语义那一步不做闸门路由
-                 （两侧都判、不通顺也照样落盘），目的就是看改写句与原句各自是否通顺。
-                 前缀 spatial_alter_check。
-    synonym      独立同义判断：alter → reality → semantic → synonym → save。
-                 前三步与 pair 图共用节点和闸门，直接由 synonym agent 比较两句。
-                 提示语留在 system_prompt/synonym.txt 供用户填写，前缀 spatial_synonym。
-
-四张图的第一道闸门都是 reality（见 spatial_agents.RealityAgent）：判这一句里的关注词是不是在说
-现实世界中的空间场景，判为 False 的记录就此收尾，后面几步的模型调用一概不发生。它排在各自的
-入口节点（alter / read）**之后**、后续 LLM agent 之前：那两个入口都是纯规则（不调模型、不花钱），
-先跑它们，停下来的记录里才带着句子与切片，事后能看到被滤掉的是哪一句。判不出来时一律放行
-（见 reality_gate）：闸门只拦明确判为 False 的，不拿「没问过模型」当「不是空间用法」。
-
-闸门判的**只是原句**（a 侧那个词，与改写句换上去的词无关），而一条语料展开出的每个候选状态
-都要过一遍——问的是逐字相同的一句原话。所以这一问在跑批前就按原句判完、去重（见
-reality_queries_alter / reality_queries_single 与 spatial_runner._prefill_reality）：
-节点仍在 alter 之后（拓扑与产物形状不动，改写未命中的记录照旧没有 reality 块），变的只是
-时间上一批原句先判完、节点按 message 读缓存（见 spatial_agents.RealityAgent.prefill）。
-实测一条语料能展开出 9~11 个候选，不去重就是几倍的调用。
-
-图内一律是"一对句子"（a 原句 / b 改写句），可一个原句能改出好几个待选句。待选句来自**句内每个
-目标词位置**上的每个替换词（见 spatial_tools.pick_focus_words 与 alter_sentence）：
-**有几个待选句就展开成几条记录**，每条记录仍是完整的一对句子——一条记录只改一个位置，句里其余
-目标词原样保留作参照，candidate 块用 focus_index 标明改的是哪个位置、用 index 标明是第几个待选句。
-展开放在跑批前一次算好（见 GraphSpec.init_states），所以图本身、serialize 与统计口径的形状都不用变。
-
-一对句子的两侧**各看各的关注词**：a 侧看**本记录改的那个位置**上的词（focus_word，由 alter_node
-从选中候选里取），b 侧看规则表换上去的那个词
-（focus_word_b，由 alter_node 用 spatial_tools.replacement_focus_word 算出）。所以 semantic / feature /
-schema 三个节点传下去的关注词是**按侧取**的（inputs 里写 {"a": ..., "b": ...}，见 _resolve），
-而不是两侧共用一个字段。这样 b 侧的 schema 才会收窄到替换词所属的词组，判定表里
-上12 × 里1 这种跨组的格子才对得上；两侧共用原词的话 b 侧会收窄回原词组，判定退化成同组自比。
-judge 与 synonym 都要同时看到两份关注词——它们的 user message 开头两份、各占 2 行，就是这两份
-（见 pair_head_block）。
-
-b 侧那份的 index 是照搬 a 侧的（改写只动了切片里那一个 token）：改出来的切片（slice_b）上它指的就是
-替换词，但模型拿到的是改写句字符串、会自己重新分词，替换点并词时同一下标会指到别的 token，
-所以 b 侧的措辞只说这个下标是原句上的位置（见 spatial_agents.FOCUS_INDEX_NOTE_ALTER）。
-
-新建一张图的步骤：
-
-    1. 在本模块写一个 TypedDict 状态，继承 BaseState，只加这张图自己的字段；
-    2. 写 build_xxx_graph(agents, writer)，用 agent_node 把需要的 agent 包成节点，
-       用 StateGraph 接起来，最后 compile()；
-    3. 写 init_states(records, agents, output_file)、plan(records, agents)、
-       gate_queries(records, agents) 与 serialize(state)，以及 tally/counter_names；
-    4. 在 GRAPHS 里登记一个 GraphSpec。跑批无需改动：spatial_runner.py --graph <名字>。
-
-    不需要的 agent 别写进 needs：needs 里没有的名字根本不会被构造，
-    feature 那种带 subagent 的 deep agent 构造一次很贵，能省就省。
+single 和 alter_check 保留旧的筛选/改写接线，作为显式诊断图，不用于正式句对标注。
+agent 实现见 spatial_agents.py，驱动与落盘见 spatial_runner.py。
+新增图需声明 state、needs、init_states、build、serialize、plan、gate_queries 和统计接口。
 """
 
 import operator
@@ -72,6 +23,7 @@ from typing import TYPE_CHECKING, Annotated, Any, Callable, NamedTuple, TypedDic
 from langgraph.graph import END, START, StateGraph
 
 import batch_inference as bi
+import corpus_pairs as cp
 import spatial_tools as st
 
 if TYPE_CHECKING:  # 只为类型标注，避免与 spatial_runner 相互 import
@@ -99,6 +51,10 @@ class BaseState(TypedDict, total=False):
     """结果落盘路径，随记录一起存档"""
     focus_word: dict | None
     """本次需要重点关注的词 {"index", "word", "kind", "source"}，见 spatial_tools.pick_focus_word
+
+    ``pick_focus_words`` 还会按位置挂上前序空间标注 ``grounding`` 与语料筛选判定
+    ``screening``（extractable/grammatical/spatial_coherent）；reality / semantic 两步直接读
+    ``screening``，不再各自调用模型。
 
     它是 record 的纯函数，各图都要用（single 图也拿它标注这一句是为哪个词抽的），
     所以由 init_state 统一写入；alter_node / single_entry_node 再按 record 复算一次写回，
@@ -488,6 +444,52 @@ def single_init_states(records: list[dict], agents, output_file: str) -> list[di
     return [init_state(record, output_file) for record in records]
 
 
+def prepared_init_states(records: list[dict], agents, output_file: str) -> list[dict]:
+    """标注阶段一条输入句对就是一个状态，绝不再次展开替换词。"""
+    return [
+        {"record": record, "output_file": str(output_file), "stage": "unknown",
+         "status_reason": "", "history": [], "focus_word": record.get("focus_word"),
+         "candidate_index": (record.get("candidate") or {}).get("candidate_index", 0)}
+        for record in records
+    ]
+
+
+def prepared_pair_node(state: dict) -> dict:
+    """读取已在替换阶段检查好的句对，筛选结论只作来源证据，不再请求 LLM。"""
+    record = state["record"]
+    if not cp.is_prepared_pair(record):
+        return {"stage": "bad_pair", "status_reason": "不是两侧均通过检查的句对；请先运行 sentence_replace.py",
+                "history": [_step("read_pair", stage="bad_pair")]}
+    pair, checks = record["pair"], record["pair_screening"]
+    semantic = {}
+    for side in ("a", "b"):
+        check = checks[side]
+        semantic[side] = {
+            "is_fluent": True, "grammar_ok": True, "spatial_ok": True,
+            "reason": check.get("reason", ""), "grammar_reason": check.get("grammar_reason", ""),
+            "spatial_reason": check.get("spatial_reason", ""), "source": "preparation",
+        }
+    return {
+        "stage": "semantic_ok", "status_reason": "",
+        "slice_a": pair["a"]["slice"], "sentence_a": pair["a"]["sentence"],
+        "slice_b": pair["b"]["slice"], "sentence_b": pair["b"]["sentence"],
+        "focus_word": record["focus_word"], "focus_word_b": record["focus_word_b"],
+        "candidate": record["candidate"], "alter": pair["b"].get("alter") or {},
+        "reality": {"is_spatial_scene": True, "source": "preparation",
+                    "reason": "原句和替换句已在语料构造阶段通过空间义检查"},
+        "semantic": semantic, "history": [_step("read_pair", stage="semantic_ok")],
+    }
+
+
+def prepared_plan(records: list[dict], agents) -> list[str]:
+    """正式标注不需要句法预填充或原句闸门查询。"""
+    return []
+
+
+def no_gate_queries(records: list[dict], agents) -> list:
+    return []
+
+
 def reality_queries_alter(records: list[dict], agents) -> list[tuple[str, dict | None]]:
     """pair / alter_check 两张图会让 reality 闸门判哪些原句：[(原句, 关注词), ...]
 
@@ -536,9 +538,9 @@ def reality_queries_single(records: list[dict], agents) -> list[tuple[str, dict 
 
 
 REALITY_OK = "spatial_ok"
-"""闸门放行的 stage：关注词确实在说现实世界里的空间"""
+"""闸门放行的 stage：关注词确实在表达本类语料认定的空间语义"""
 REALITY_NOT_SPATIAL = "not_spatial"
-"""闸门停下（记录 status 也是它）的 stage：关注词在这一句里不是现实空间用法"""
+"""闸门停下（记录 status 也是它）的 stage：关注词在这一句里不是空间用法"""
 REALITY_SKIPPED = "spatial_skipped"
 """闸门放行的 stage：没调 LLM（--no-llm），无从判断"""
 REALITY_UNKNOWN = "spatial_unknown"
@@ -562,10 +564,10 @@ def reality_gate(value: dict) -> tuple[str, str]:
     if value.get("is_spatial_scene") is True:
         return REALITY_OK, ""
     if value.get("is_spatial_scene") is False:
-        return REALITY_NOT_SPATIAL, f"关注词在句中没有表达现实世界中的空间场景：{value.get('reason')}"
+        return REALITY_NOT_SPATIAL, f"关注词在句中没有表达本类语料认定的空间语义：{value.get('reason')}"
     if value.get("source") == "no_llm":
         return REALITY_SKIPPED, "未调用 LLM（--no-llm），跳过空间场景闸门"
-    return REALITY_UNKNOWN, value.get("reason") or "没有判出是否表达现实空间场景"
+    return REALITY_UNKNOWN, value.get("reason") or "没有判出是否表达本类语料认定的空间语义"
 
 
 def reality_node(agent, *, sentence: str, state_type) -> Callable[[dict], dict]:
@@ -1345,6 +1347,7 @@ def serialize_pair(state: PairState) -> dict:
         "stage": state.get("stage", "unknown"),
         "status_reason": state.get("status_reason", ""),
         "schema_version": st.RESULT_SCHEMA_VERSION,
+        "pair_screening": record.get("pair_screening", {}),
         "sentence_id": st.sentence_id(record),
         "content_hash": st.content_hash(record.get("sentence") or []) if record.get("sentence") else None,
         "candidate_key": _candidate_key(state),
@@ -1369,12 +1372,14 @@ def serialize_pair(state: PairState) -> dict:
                 "slice": state.get("slice_a"),
                 "alter": None,
                 "role": "原句",
+                "grounding": (state.get("focus_word") or {}).get("grounding"),
             },
             "b": {
                 "sentence": state.get("sentence_b"),
                 "slice": state.get("slice_b"),
                 "alter": state.get("alter"),
                 "role": "改写句",
+                "grounding": (state.get("focus_word_b") or {}).get("grounding"),
             },
         },
         "semantic": state.get("semantic", {}),
@@ -1501,20 +1506,16 @@ def pair_tally(record: dict, counters: dict[str, Counter]) -> None:
 
 
 def build_pair_graph(agents, writer: "ResultWriter"):
-    """按组织逻辑接好六个 agent，返回可 invoke 的图"""
+    """句对已筛选：read_pair → feature → schema → judge → save。"""
     graph = StateGraph(PairState)
-    graph.add_node("alter", alter_node(agents.need("alter")))
-    graph.add_node("reality", reality_node(agents.need("reality"), sentence="sentence_a", state_type=PairState))
-    graph.add_node("semantic", pair_semantic_node(agents.need("semantic")))
+    graph.add_node("read_pair", prepared_pair_node)
     graph.add_node("feature", pair_feature_node(agents.need("feature")))
     graph.add_node("schema", pair_schema_node(agents.need("schema")))
     graph.add_node("judge", pair_judge_node(agents.need("judge")))
     graph.add_node("save", _save_node(serialize_pair, writer))
 
-    graph.add_edge(START, "alter")
-    graph.add_conditional_edges("alter", route_after_alter, {"reality": "reality", "save": "save"})
-    graph.add_conditional_edges("reality", route_after_reality, {"semantic": "semantic", "save": "save"})
-    graph.add_conditional_edges("semantic", route_after_semantic, {"feature": "feature", "save": "save"})
+    graph.add_edge(START, "read_pair")
+    graph.add_conditional_edges("read_pair", route_after_semantic, {"feature": "feature", "save": "save"})
     graph.add_edge("feature", "schema")
     graph.add_edge("schema", "judge")
     graph.add_edge("judge", "save")
@@ -1783,6 +1784,7 @@ def serialize_alter_check(state: AlterCheckState) -> dict:
     record = state["record"]
     return {
         "status": alter_check_final_status(state),
+        "pair_screening": record.get("pair_screening", {}),
         "stage": state.get("stage", "unknown"),
         "status_reason": state.get("status_reason", ""),
         "line_no": record.get("line_no"),
@@ -1949,19 +1951,14 @@ def synonym_tally(record: dict, counters: dict[str, Counter]) -> None:
 
 
 def build_synonym_graph(agents, writer: "ResultWriter"):
-    """alter → reality → semantic → synonym → save，前三步与 pair 图相同。"""
+    """已检查句对 → 独立同义判定，不重复替换或筛选。"""
     graph = StateGraph(SynonymState)
-    graph.add_node("alter", alter_node(agents.need("alter")))
-    graph.add_node("reality", reality_node(agents.need("reality"), sentence="sentence_a", state_type=SynonymState))
-    graph.add_node("semantic", pair_semantic_node(agents.need("semantic"), state_type=SynonymState))
+    graph.add_node("read_pair", prepared_pair_node)
     graph.add_node("synonym", pair_synonym_node(agents.need("synonym")))
     graph.add_node("save", _save_node(serialize_synonym, writer))
 
-    graph.add_edge(START, "alter")
-    graph.add_conditional_edges("alter", route_after_alter, {"reality": "reality", "save": "save"})
-    graph.add_conditional_edges("reality", route_after_reality, {"semantic": "semantic", "save": "save"})
-    # 复用 pair 的语义闸门；它的放行分支在本图直接接到 synonym。
-    graph.add_conditional_edges("semantic", route_after_semantic, {"feature": "synonym", "save": "save"})
+    graph.add_edge(START, "read_pair")
+    graph.add_conditional_edges("read_pair", route_after_semantic, {"feature": "synonym", "save": "save"})
     graph.add_edge("synonym", "save")
     graph.add_edge("save", END)
     return graph.compile()
@@ -2017,14 +2014,14 @@ GRAPHS: dict[str, GraphSpec] = {
     "pair": GraphSpec(
         name="pair",
         prefix="spatial_pairs",
-        doc="改写并判定：六个 agent 全用，一对句子走完闸门-语义-特征-schema-判定",
+        doc="已检查句对的标注：feature → schema → judge；先运行 sentence_replace.py",
         state=PairState,
-        needs=("alter", "reality", "semantic", "feature", "schema", "judge"),
-        init_states=alter_init_states,
+        needs=("feature", "schema", "judge"),
+        init_states=prepared_init_states,
         build=build_pair_graph,
         serialize=serialize_pair,
-        plan=pair_plan,
-        gate_queries=reality_queries_alter,
+        plan=prepared_plan,
+        gate_queries=no_gate_queries,
         counter_names=(
             "status_counts",
             "reality_counts",
@@ -2083,14 +2080,14 @@ GRAPHS: dict[str, GraphSpec] = {
     "synonym": GraphSpec(
         name="synonym",
         prefix="spatial_synonym",
-        doc="独立同义判断：alter → reality → semantic → synonym，前三步与 pair 图相同，提示语由用户填写",
+        doc="已检查句对的独立同义判断：read_pair → synonym；提示语由用户填写",
         state=SynonymState,
-        needs=("alter", "reality", "semantic", "synonym"),
-        init_states=alter_init_states,
+        needs=("synonym",),
+        init_states=prepared_init_states,
         build=build_synonym_graph,
         serialize=serialize_synonym,
-        plan=pair_plan,
-        gate_queries=reality_queries_alter,
+        plan=prepared_plan,
+        gate_queries=no_gate_queries,
         counter_names=(
             "status_counts",
             "reality_counts",

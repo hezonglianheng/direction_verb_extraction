@@ -14,11 +14,16 @@
     两类判据不同，所以正文分别放在
         system_prompt/screen_localization.txt   （方位词）
         system_prompt/screen_direction.txt      （趋向动词）
-    里，由用户填写。文件为空时本模块**不建模型、不发请求**，记录原样通过——这样默认行为
+    里，由用户填写。两份模板都用两个共享判据占位符拼装：
+        {{judgement_criteria}}  ← system_prompt/judgement_criteria.txt（语法 + 空间自洽）
+        {{spatial_criteria}}    ← config_files/<类型>/reality.txt（本类语料的空间判据片段）
+    all_in_one 注入的是同两个文件，因此筛选、agent 与一次性调用不会各写一套判据。文件为空时本模块**不建模型、不发请求**，记录原样通过——这样默认行为
     与加筛选之前完全一致，填好提示语后自动生效。
 
 输出的形式化：
-    每个目标词一条判定：``{"index", "word", "extractable": True/False, "reason", "source"}``；
+    每个目标词一条判定：``{"index", "word", "extractable": True/False,
+    "grammatical": True/False/None, "spatial_coherent": True/False/None,
+    "reason", "grammar_reason", "spatial_reason", "source"}``；
     一条记录汇总在 ``record["screening"]`` 里：
         status       true = LLM 判真（进入判定工作流）
                      false = LLM 判假（落盘，但不进入判定）
@@ -28,6 +33,13 @@
         extractable  true/false 时给布尔值；error/limit/no_llm 时为 None
         verdicts     逐词判定明细。
     所有记录都会落盘；判定工作流按 ``screening_status`` 只取 true/no_llm。
+
+与 agent 判定的关系：
+    ``extractable`` / ``grammatical`` / ``spatial_coherent`` 是**同一份实现**给 agent 链路用的三项
+    判定。``spatial_tools.pick_focus_words`` 会把本位置的 verdict 挂到关注词上（``screening``），
+    ``RealityAgent`` 据此给 ``is_spatial_scene``，``SemanticAgent`` 据此给 ``grammar_ok`` /
+    ``spatial_ok``，不再各自维护一套提示语与判据。旧语料没有 screening 时，两者才回退到
+    ``build_item_content`` + 本模块的提示语（与筛选逐字同一实现）。
 
 批量请求：
     一次 LLM 请求可以放入 ``config.SCREEN_BATCH_SIZE`` 条「句子 + 目标词」判定项，模型按
@@ -77,6 +89,24 @@ SCREENING_STATUSES = frozenset(
 JUDGEMENT_SCREENING_STATUSES = frozenset({SCREENING_TRUE, SCREENING_NO_LLM})
 """判定工作流只接受这两类语料"""
 
+
+def verdict_status(verdict: dict | None) -> str:
+    """逐位置严格准入：空间义、语法、空间自洽均明确为真才通过。"""
+    verdict = verdict or {}
+    source = verdict.get("source")
+    if source in (SCREENING_ERROR, SCREENING_LIMIT, SCREENING_NO_LLM):
+        return source
+    values = [verdict.get(key) for key in ("extractable", "grammatical", "spatial_coherent")]
+    if any(value is False for value in values):
+        return SCREENING_FALSE
+    if all(value is True for value in values):
+        return SCREENING_TRUE
+    return SCREENING_ERROR
+
+
+def verdict_passes(verdict: dict | None) -> bool:
+    return verdict_status(verdict) == SCREENING_TRUE
+
 _TARGET_PREFIXES: dict[str, tuple[str, ...] | None] = {
     # 与 word_sampler.CORPUS_SPECS 的口径一致：
     # 方位词取顶层规则自己的词表；趋向动词只取 direction_verb_ 前缀的规则词表，
@@ -102,12 +132,33 @@ _PROGRESS_LOCK = threading.Lock()
 
 
 class ExtractionVerdict(BaseModel):
-    """单条筛选结果：只允许 true/false，理由另附（批处理里的每个 item 仍是这个形状）"""
+    """单条判定结果：空间可提取性、语法、空间自洽三项分开判（批处理里的每个 item 仍是这个形状）
+
+    三项在**同一次调用**里给出，agent 链路直接读这份结果，不再各问一遍：
+        extractable      这个句子里的这个待提取词是否表达了本类语料认定空间信息、是否值得提取
+                         （即原筛选的 true/false，RealityAgent 用它当 is_spatial_scene）
+        grammatical      语法是否通顺、语义是否完整（SemanticAgent 用它当 grammar_ok）
+        spatial_coherent 句中的空间关系是否自洽（SemanticAgent 用它当 spatial_ok）
+    后两项允许为 None：旧提示语/旧模型没给时按“未判出”处理，不默认成 true。
+    """
 
     extractable: bool = Field(
         description="这个句子里的这个待提取词是否能够被提取：能提取为 true，不能为 false"
     )
+    grammatical: bool | None = Field(
+        default=None,
+        description="该句语法是否通顺、语义是否完整：成分残缺、搭配不当、语序错乱、虚词误用、"
+        "结构杂糅等为 false；这一项只看语法，与空间关系合不合理无关",
+    )
+    spatial_coherent: bool | None = Field(
+        default=None,
+        description="该句描述的空间关系、方向、位置、位移是否自洽：搭配矛盾、多个空间信息互相冲突"
+        "（如“桌子外的咖啡杯”“她回头看着身前的男人”）为 false；这一项只看空间自洽，"
+        "与句子是不是空间用法无关",
+    )
     reason: str = Field(description="判断依据，需结合句子中该词的用法与前序步骤提取到的相关成分")
+    grammar_reason: str = Field(default="", description="语法这一项的判断依据")
+    spatial_reason: str = Field(default="", description="空间自洽这一项的判断依据")
 
 
 class BatchExtractionItem(ExtractionVerdict):
@@ -173,6 +224,136 @@ def prompt_name(kind: str) -> str:
         return SCREEN_PROMPT_FILES[kind]
     except KeyError:
         raise ValueError(f"没有为词类型 {kind!r} 配置筛选提示语；可用：{'、'.join(SCREEN_PROMPT_FILES)}") from None
+
+
+_CONFIG_DIRS = {"方位词": "localization", "趋向动词": "direction"}
+"""词类型 -> config_files/ 下的目录名（只用于取 spatial 判据片段）"""
+
+
+def prompt_path(kind: str) -> Path:
+    """该类语料的筛选/判定提示语路径（agent 的 a 侧回退也读这一份）"""
+    return utils.prompt_path(prompt_name(kind))
+
+
+def spatial_criteria_path(kind: str) -> Path:
+    """该类语料的空间判据片段（config_files/<类型>/reality.txt）
+
+    它同时被 all_in_one 注入，所以 screen_<类型>.txt 与 all_in_one 的“是否表示空间语义”
+    永远读同一份正文；两份提示语只各写自己的任务说明。
+    """
+    directory = _CONFIG_DIRS.get(kind)
+    if directory is None:
+        raise ValueError(f"没有为词类型 {kind!r} 配置空间判据目录；可用：{'、'.join(_CONFIG_DIRS)}")
+    return Path(__file__).resolve().parent / "config_files" / directory / "reality.txt"
+
+
+def load_system_prompt(kind: str) -> str:
+    """读该类语料的共享提示语并渲染两个判据占位符；空文件返回空串
+
+    占位符：
+        ``{{judgement_criteria}}``  语法 + 空间自洽（system_prompt/judgement_criteria.txt）
+        ``{{spatial_criteria}}``    本类语料的空间判据片段（config_files/<类型>/reality.txt）
+    两个占位符是“同一份正文只写一次”的落点：screen_<类型>.txt 与 all_in_one.txt 都从这里取。
+    """
+    template = utils.read_prompt_path(prompt_path(kind))
+    if not template.strip():
+        return ""
+    return utils.render_prompt(
+        template,
+        {
+            "judgement_criteria": utils.read_prompt("judgement_criteria"),
+            "spatial_criteria": utils.read_prompt_path(spatial_criteria_path(kind)),
+        },
+        source=f"{prompt_name(kind)}.txt",
+    )
+
+
+def build_item_content(
+    kind: str,
+    sentence: str,
+    target: dict,
+    *,
+    tree: Any = None,
+    filter_methods: Iterable[str] = (),
+    grounding: Any = None,
+    index_note: str | None = None,
+) -> str:
+    """单条「句子 + 目标词」的完整判据文本（筛选与 agent 回退共用这一处）
+
+    ``index_note`` 用来改写「分词结果里的下标」那句：改写句是重新分词的，下标属于原句，
+    这时传一句说明，不让模型拿旧下标去数改写句的 token。
+    """
+    word = (target or {}).get("word", "")
+    index = (target or {}).get("index")
+    related = json.dumps(tree if tree is not None else [], ensure_ascii=False, sort_keys=True)
+    methods = "、".join(str(item) for item in filter_methods or ()) or "（无）"
+    index_text = f"（分词结果里的下标 {index}）" if index_note is None else f"（{index_note}）"
+    role_line = ""
+    if isinstance(grounding, dict):
+        # 只把与当前待提取词同下标的那一条整理结果交给模型，避免同句其他词的
+        # 角色信息干扰判定（多目标句子里这一点尤其重要）。
+        candidates = [
+            candidate
+            for candidate in grounding.get("candidates") or []
+            if isinstance(candidate, dict) and candidate.get("index") == index
+        ]
+        if not candidates and grounding.get("index") == index:
+            candidates = [grounding]
+        if candidates:
+            role_label = "前序步骤整理的空间角色"
+            if index_note is not None:
+                # b 侧（改写句）没有重新做三元组整理，a 侧标注只能当参考，不能当已确认事实。
+                role_label += "（属于原句；改写后未重新验证）"
+            role_line = (
+                f"{role_label}（JSON，目标物/参照物/动词；趋向动词的动词允许为空）："
+                + json.dumps(candidates, ensure_ascii=False, sort_keys=True)
+                + "\n"
+            )
+    return (
+        f"本次语料类型：{kind}。\n"
+        f"待提取的句子：{sentence}\n"
+        f"待提取的词：{word}{index_text}\n"
+        f"前序步骤命中的规则：{methods}\n"
+        f"前序步骤提取出的匹配树（JSON，含该词及其修饰/搭配成分）：{related}\n"
+        f"{role_line}"
+        "请分别判断：grammatical（语法是否通顺、语义是否完整）、"
+        "spatial_coherent（句中的空间关系是否自洽）、"
+        "extractable（这个句子里的这个待提取词是否能够被提取）；"
+        "只按结构化输出的字段作答，reason/grammar_reason/spatial_reason 说明各自依据。"
+    )
+
+
+def verdict_for_target(record: dict, index, word: str | None = None) -> dict | None:
+    """从记录里取**本目标位置**的 screening 判定（没有就返回 None）
+
+    只按 index（给了 word 时再核对词形）精确匹配，不回落：同一句里同一个词可能出现两次，
+    拿另一个位置的判定当自己的会把 agent 闸门带偏。
+    """
+    block = record.get("screening")
+    if not isinstance(block, dict):
+        return None
+    verdicts = block.get("verdicts")
+    if not isinstance(verdicts, list):
+        return None
+    for verdict in verdicts:
+        if not isinstance(verdict, dict):
+            continue
+        if verdict.get("index") != index:
+            continue
+        if word and verdict.get("word") and verdict.get("word") != word:
+            continue
+        return {
+            "index": verdict.get("index"),
+            "word": verdict.get("word"),
+            "extractable": verdict.get("extractable"),
+            "grammatical": verdict.get("grammatical"),
+            "spatial_coherent": verdict.get("spatial_coherent"),
+            "reason": verdict.get("reason") or "",
+            "grammar_reason": verdict.get("grammar_reason") or "",
+            "spatial_reason": verdict.get("spatial_reason") or "",
+            "source": verdict.get("source") or "screening",
+        }
+    return None
 
 
 def _sentence_text(record: dict) -> str:
@@ -347,7 +528,7 @@ class SentenceScreener:
 
         name = prompt_name(self.kind)
         self.prompt_path = utils.prompt_path(name)
-        self.system_prompt = utils.read_prompt_path(self.prompt_path)
+        self.system_prompt = load_system_prompt(self.kind)
         if not self.system_prompt.strip():
             self._disabled_reason = f"提示语尚未填写：{self.prompt_path}，LLM 筛选已跳过"
             return
@@ -413,35 +594,13 @@ class SentenceScreener:
         grounding: Any = None,
     ) -> str:
         """单条「句子 + 目标词」的完整判据文本（同时用作缓存键，与批组合无关）"""
-        word = target.get("word", "")
-        index = target.get("index")
-        related = json.dumps(tree, ensure_ascii=False, sort_keys=True)
-        methods = "、".join(str(item) for item in filter_methods or ()) or "（无）"
-        role_line = ""
-        if isinstance(grounding, dict):
-            # 只把与当前待提取词同下标的那一条整理结果交给模型，避免同句其他词的
-            # 角色信息干扰判定（多目标句子里这一点尤其重要）。
-            candidates = [
-                candidate
-                for candidate in grounding.get("candidates") or []
-                if isinstance(candidate, dict) and candidate.get("index") == index
-            ]
-            if candidates:
-                role_line = (
-                    "前序步骤整理的空间角色（JSON，目标物/参照物/动词；"
-                    "趋向动词的动词允许为空）："
-                    + json.dumps(candidates, ensure_ascii=False, sort_keys=True)
-                    + "\n"
-                )
-        return (
-            f"本次语料类型：{self.kind}。\n"
-            f"待提取的句子：{sentence}\n"
-            f"待提取的词：{word}（分词结果里的下标 {index}）\n"
-            f"前序步骤命中的规则：{methods}\n"
-            f"前序步骤提取出的匹配树（JSON，含该词及其修饰/搭配成分）：{related}\n"
-            f"{role_line}"
-            "请判断这个句子里的这个待提取词是否能够被提取；只按结构化输出的字段作答："
-            "extractable 为 true 或 false，reason 说明判断依据。"
+        return build_item_content(
+            self.kind,
+            sentence,
+            target,
+            tree=tree,
+            filter_methods=filter_methods,
+            grounding=grounding,
         )
 
     def _content_batch(self, tasks: list[tuple[int, str, dict, Any, list[str], Any]]) -> str:
@@ -457,8 +616,9 @@ class SentenceScreener:
             lines.append(self._item_content(sentence, target, tree, methods, grounding))
         lines.append("")
         lines.append(
-            "请把上述每条语料的判断结果放进 results：每个 item_id 恰好一条，"
-            "extractable 为 true 或 false，reason 说明该条自己的判断依据。"
+            "请把上述每条语料的判断结果放进 results：每个 item_id 恰好一条；"
+            "extractable、grammatical、spatial_coherent 都要给布尔值，"
+            "reason / grammar_reason / spatial_reason 分别说明依据。"
         )
         return "\n".join(lines)
 
@@ -485,7 +645,7 @@ class SentenceScreener:
         try:
             verdict: BatchExtractionVerdict = self._invoke(self._content_batch(tasks))
             items = list(verdict.results)
-        except Exception as exc:  # noqa: BLE001 —— 整批失败不带走语料，逐条 fail-open
+        except Exception as exc:  # noqa: BLE001 —— 整批失败不带走语料，逐条保留落盘、不进入判定
             with self._stats_lock:
                 self._stats["failed"] += len(tasks)
             return [
@@ -502,13 +662,20 @@ class SentenceScreener:
                 continue
             by_id[item_id] = {
                 "extractable": bool(item.extractable),
+                "grammatical": item.grammatical,
+                "spatial_coherent": item.spatial_coherent,
                 "reason": item.reason,
+                "grammar_reason": item.grammar_reason,
+                "spatial_reason": item.spatial_reason,
                 "source": "llm",
             }
+            if item.grammatical is None or item.spatial_coherent is None:
+                by_id[item_id]["source"] = "error"
+                by_id[item_id]["reason"] = "模型未完整给出语法和空间自洽判定；" + item.reason
 
         missing = [item_id for item_id in range(len(tasks)) if item_id not in by_id]
         if invalid or missing:
-            # 重复/越界/缺项都说明这份批量响应不可信：整批转 error、fail-open 保留，
+            # 重复/越界/缺项都说明这份批量响应不可信：整批转 error、保留落盘、不进入判定，
             # 不能拿“第一个重复 id”的结果去丢弃语料，也不能把可疑结果写进缓存。
             with self._stats_lock:
                 self._stats["invalid_items"] += invalid + len(missing)
@@ -517,7 +684,7 @@ class SentenceScreener:
                 detail.append(f"重复/越界 item_id {invalid} 条")
             if missing:
                 detail.append(f"缺少 item_id {missing}")
-            reason = "批量响应不完整（" + "；".join(detail) + "），整批按 fail-open 保留"
+            reason = "批量响应不完整（" + "；".join(detail) + "），整批保留落盘、不进入判定"
             return [{"extractable": None, "reason": reason, "source": "error"} for _ in tasks]
 
         return [by_id[item_id] for item_id in range(len(tasks))]
@@ -577,7 +744,7 @@ class SentenceScreener:
                     self._limit_warned = True
                     print(
                         f"[LLM 筛选] {self.family}：累计发送已达上限 "
-                        f"{self.budget.max_items} 条，后续语料不再送 LLM，按 fail-open 保留落盘"
+                        f"{self.budget.max_items} 条，后续语料不再送 LLM，保留落盘、不进入判定"
                     )
 
             batches = [allowed[start : start + self.batch_size] for start in range(0, len(allowed), self.batch_size)]
@@ -633,7 +800,7 @@ class SentenceScreener:
                     "extractable": None,
                     "reason": (
                         f"已达 LLM 筛选发送上限 {self.budget.max_items} 条，本条未送模型；"
-                        "按 fail-open 保留语料"
+                        "保留落盘、不进入判定"
                     ),
                     "source": "limit",
                 }
@@ -655,6 +822,30 @@ class SentenceScreener:
                 self._stats[key] += 1
 
     # -- 对外 --------------------------------------------------------------
+    def screen_items(self, items: list[dict]) -> list[dict]:
+        """筛选已明确定位的句子/词/三元组，替换阶段也复用同一批处理、缓存与预算。
+
+        不再按原始词表找目标：规则允许换入词表之外的词形，但仍需检查该替换词。
+        """
+        if not items:
+            return []
+        if not self.enabled:
+            return [
+                {"index": item["target"].get("index"), "word": item["target"].get("word"),
+                 "extractable": None, "grammatical": None, "spatial_coherent": None,
+                 "source": "no_llm", "reason": self.disabled_reason}
+                for item in items
+            ]
+        tasks = [
+            (i, item["sentence"], item["target"], item.get("tree") or [],
+             item.get("filter_methods") or [], item.get("grounding"))
+            for i, item in enumerate(items)
+        ]
+        return [
+            {"index": item["target"].get("index"), "word": item["target"].get("word"), **result}
+            for item, result in zip(items, self._resolve_tasks(tasks))
+        ]
+
     def screen_rows(self, rows: list[dict]) -> list[dict]:
         """对一批命中记录逐词筛选，返回**与输入等长**的记录（false 也保留）
 
@@ -709,9 +900,9 @@ class SentenceScreener:
             }
             by_row.setdefault(row_index, []).append(verdict)
             with self._stats_lock:
-                if verdict.get("extractable") is True:
+                if verdict_passes(verdict):
                     self._stats["extractable"] += 1
-                elif verdict.get("extractable") is False:
+                elif verdict_status(verdict) == SCREENING_FALSE:
                     self._stats["not_extractable"] += 1
 
         kept: list[dict] = []
@@ -721,11 +912,11 @@ class SentenceScreener:
                 # 没有目标词（或这一行没进任务）：保留，避免因取词失败丢语料
                 kept.append(row)
                 continue
-            true_indices = {v["index"] for v in verdicts if v.get("extractable") is True}
-            false_indices = {v["index"] for v in verdicts if v.get("extractable") is False}
-            # 判不出来（调用失败）按 fail-open 保留；裁剪 false 父节点时要把它当作要保留的
+            true_indices = {v["index"] for v in verdicts if verdict_passes(v)}
+            false_indices = {v["index"] for v in verdicts if verdict_status(v) == SCREENING_FALSE}
+            # 判不出来（调用失败）保留落盘、不进入判定；裁剪 false 父节点时要把它当作要保留的
             # 后代，不能因为父节点被删就把它一起带走。
-            unknown_indices = {v["index"] for v in verdicts if v.get("extractable") is None}
+            unknown_indices = {v["index"] for v in verdicts if verdict_status(v) not in (SCREENING_TRUE, SCREENING_FALSE)}
             sources = {v.get("source") for v in verdicts}
             if sources == {"llm"}:
                 source = "llm"
@@ -759,8 +950,10 @@ class SentenceScreener:
                     direction_grounding.prune_candidates(
                         row, false_indices, true_indices | unknown_indices
                     )
-                except Exception:  # noqa: BLE001 —— 整理块缺失/形状异常不影响筛选主流程
-                    pass
+                except Exception as exc:  # noqa: BLE001 —— 整理块缺失/形状异常不影响筛选主流程，
+                    # 但不能静默：树已按 false 裁过、grounding 没裁会留下两边不一致的证据。
+                    # 记到该条 screening 块里，事后可查，且不打断整批筛选。
+                    row["screening"]["prune_error"] = repr(exc)
             self._note_record_status(status)
             kept.append(row)
         return kept

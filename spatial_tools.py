@@ -12,9 +12,9 @@
    跑哪种类型由 spatial_runner.py 的 --corpus-type 指定（默认方位词），构造期注入 agent。
    哪一组文件缺了或内容为空都按空表跑，对应环节退化为 LLM 兜底或原样返回，并在结果记录的
    source 字段里如实标记来源；跑批入口启动时会逐张打印实际路径与内容摘要，绝不静默降级。
-   这两组目录下还各有一份 reality_agent 的提示语（reality.txt，见 CONFIG_PROMPT_FILES）：
-   它的判据按词类分，与四张表同一套分组口径，路径与读法见 config_prompt_path /
-   utils.read_prompt_path。
+   这两组目录下还各有一份空间判据片段（reality.txt，见 CONFIG_PROMPT_FILES），由
+   system_prompt/screen_<词类型>.txt 与 all_in_one 共同注入；reality/semantic agent 的主判据
+   与语料筛选共用这一份。路径与读法见 config_prompt_path / utils.read_prompt_path。
 2. 纯规则工具：切片改写 alter_sentence（一个原句按命中的规则组产出多个待选句）、词组定位
    find_word_groups、schema 查表 lookup_schema（先按关注词收窄、再按语义特征匹配）、
    判定查表 lookup_judgement、结果落盘 write_jsonl、成对记录拍平 write_pairs_csv —— 不调 LLM，
@@ -546,6 +546,7 @@ def read_corpus(
     offset: int = 0,
     *,
     judge_only: bool = False,
+    prepared_only: bool = False,
 ) -> list[dict]:
     """读 results/location_corpus.jsonl 一类语料
 
@@ -588,11 +589,22 @@ def read_corpus(
         for line_no, line in enumerate(f, start=1):
             if not line.strip():
                 continue
-            if not judge_only and line_no <= offset:
+            if not (judge_only or prepared_only) and line_no <= offset:
                 continue
             record = json.loads(line)
-            if judge_only:
-                if not sentence_screening.is_judgement_eligible(record):
+            if judge_only or prepared_only:
+                if prepared_only:
+                    import corpus_pairs
+
+                    if "pair_schema_version" not in record:
+                        raise ValueError(
+                            f"{path} 第 {line_no} 行不是替换阶段产出的句子对；"
+                            "请先运行 sentence_replace.py，再将其输出传给标注入口"
+                        )
+                    eligible = corpus_pairs.is_prepared_pair(record)
+                else:
+                    eligible = sentence_screening.is_judgement_eligible(record)
+                if not eligible:
                     continue
                 eligible_seen += 1
                 if eligible_seen <= offset:
@@ -932,7 +944,8 @@ def pick_focus_word(record: dict, vocab: dict[str, set[str]] | None = None) -> d
     合并会同时改错改写口径与抽样口径。
 
     Returns:
-        dict | None: {"index", "word", "kind", "source"}；记录没有 match_tree 时返回 None。
+        dict | None: {"index", "word", "kind", "source"}，另按位置挂
+            ``grounding``（前序空间标注）与 ``screening``（语料筛选判定）；没有 match_tree 时返回 None。
             kind 取 "方位词" / "趋向动词" / ""（判不出来就是空串，不猜）。
     """
     entries = pick_focus_words(record, vocab)
@@ -986,8 +999,8 @@ def _pick_focus_words(record: dict, vocab: dict[str, set[str]] | None = None) ->
         vocab (dict[str, set[str]] | None): 两份词表，默认取 load_focus_vocab()
 
     Returns:
-        list[dict]: [{"index", "word", "kind", "source"}, ...]，按改写顺序；
-            记录没有可用的 match_tree 时返回空表（不猜）。
+        list[dict]: [{"index", "word", "kind", "source"}, ...]，按改写顺序；每个位置另挂
+            ``grounding`` / ``screening``（有就挂）；记录没有可用的 match_tree 时返回空表（不猜）。
     """
     vocab = load_focus_vocab() if vocab is None else vocab
     filter_methods = record.get("filter_methods") or []
@@ -1110,10 +1123,32 @@ def select_grounding(record: dict, index, word: str | None = None) -> dict | Non
     }
 
 
+def select_screening(record: dict, index, word: str | None = None) -> dict | None:
+    """取这条记录里**本关注位置**的 LLM 筛选判定（没有就返回 None）
+
+    与 select_grounding 同一套精确匹配口径：只按 index（给了 word 时再核对词形），
+    不回落。agent 链路据此直接复用筛选结果，不再各问一次模型。
+    """
+    return sentence_screening.verdict_for_target(record, index, word)
+
+
 def _with_grounding(entry: dict, record: dict) -> dict:
-    """给一份关注词挂上本位置的前序空间标注（没有就不加这个键）"""
+    """给一份关注词挂上本位置的前序空间标注与筛选判定
+
+    - ``grounding``：目标物/参照物/动词三元组（没有就不加这个键）；
+    - ``screening``：本位置的 extractable/grammatical/spatial_coherent（有筛选结果时）。
+
+    不把整棵 match_tree / filter_methods 挂到关注词上：它们已经在本条记录里，重复携带会把
+    每个候选的结果都撑大；旧语料回退时用空树也能按同一份提示语判定（判据在系统提示语里）。
+    """
     grounding = select_grounding(record, entry.get("index"), entry.get("word"))
-    return {**entry, "grounding": grounding} if grounding is not None else entry
+    result = {**entry}
+    if grounding is not None:
+        result["grounding"] = grounding
+    screening = select_screening(record, entry.get("index"), entry.get("word"))
+    if screening is not None:
+        result["screening"] = screening
+    return result
 
 
 FOCUS_SOURCE_ALTER = "alter"
@@ -1510,9 +1545,7 @@ def render_schema_candidates(candidates: dict[str, dict]) -> str:
             condition = " ／ ".join(format_match(group) for group in groups)
         parts = [f"  {name}：{entry.get('description') or '（未写说明）'}"]
         parts.append(f"      命中条件：{condition}")
-        examples = [str(e) for e in (entry.get("examples") or []) if e]
-        if examples:
-            parts.append(f"      例句：{'；'.join(examples)}")
+        # 示例单独由 system_prompt/examples 按关注词选择，不夹带表内旧例句。
         lines.append("\n".join(parts))
     return "\n".join(lines)
 
