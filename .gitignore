@@ -21,3 +21,7 @@ tests/__pycache__/
 
 # 忽略.doc中的说明文档
 .docs/*
+!.docs/plans/
+.docs/plans/*
+!.docs/plans/2026-11-02-stage-layout.md
+!.docs/stage-migration.md

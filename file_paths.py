@@ -9,6 +9,30 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 
+def resolve_cache_path(
+    cache_path: str | Path | None,
+    out_path: str | Path,
+    *,
+    model_key: str | None = None,
+    multi_model: bool = False,
+) -> Path:
+    """Batch 缓存路径：预检与实际会话共用，不加载模型依赖。"""
+    if cache_path:
+        path = Path(cache_path)
+    else:
+        out_path = Path(out_path)
+        path = out_path.parent / (out_path.name + ".batch-cache.jsonl")
+    if multi_model and model_key:
+        path = path.with_name(f"{path.stem}.{model_key}{path.suffix}")
+    return path
+
+
+def sidecar_paths(cache_path: str | Path) -> tuple[Path, Path, Path]:
+    """Batch 会写出的缓存、jobs、meta 三件套。"""
+    path = Path(cache_path)
+    return (path, path.with_suffix(path.suffix + ".jobs.json"), path.with_suffix(path.suffix + ".meta.json"))
+
+
 def same_file_path(left: str | Path, right: str | Path) -> bool:
     """识别相对路径、符号链接和现存文件的硬链接别名。"""
     left, right = Path(left), Path(right)
