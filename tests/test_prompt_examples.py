@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import spatial_agents as sa
+from annotate import spatial_agents as sa
 
 
 GROUPS = [
@@ -17,10 +17,10 @@ GROUPS = [
 class ExampleTests(unittest.TestCase):
     def test_example_loader_exists(self):
         import importlib.util
-        self.assertIsNotNone(importlib.util.find_spec("prompt_examples"))
+        self.assertIsNotNone(importlib.util.find_spec("annotate.prompt_examples"))
 
     def test_exact_word_matches_all_groups_in_file_order(self):
-        import prompt_examples as pe
+        from annotate import prompt_examples as pe
         rendered = pe.render_examples(GROUPS, "上")
         self.assertIn("海报贴在墙上。", rendered)
         self.assertIn("表面附着", rendered)
@@ -31,7 +31,7 @@ class ExampleTests(unittest.TestCase):
         self.assertEqual(pe.render_examples(GROUPS, ""), "")
 
     def test_files_separate_stage_and_part_of_speech_and_reject_malformed_groups(self):
-        import prompt_examples as pe
+        from annotate import prompt_examples as pe
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for stage in ("feature", "schema"):
@@ -84,8 +84,8 @@ class AnnotationPromptTests(unittest.TestCase):
         self.assertIn("按关注词选出的", feature.system_prompt)
 
     def test_all_in_one_selects_four_independent_example_blocks(self):
-        import all_in_one as aio
-        import spatial_graphs as sg
+        from annotate import all_in_one as aio
+        from annotate import spatial_graphs as sg
         from test_corpus_stages import AnnotationGraphTests
         args = aio.parse_args(["--no-llm"])
         ctx = aio.build_context(args, "方位词", Path("unused.jsonl"))

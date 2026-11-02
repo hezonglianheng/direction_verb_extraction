@@ -1,7 +1,7 @@
 # encoding: utf8
 """提取/替换与标注之间的句对契约，不依赖模型。"""
 
-import sentence_screening as screening
+from extract import sentence_screening as screening
 
 PAIR_SCHEMA_VERSION = "1.0"
 PAIR_CORPORA = {"方位词": "location_pairs.jsonl", "趋向动词": "direction_pairs.jsonl"}
@@ -51,6 +51,6 @@ def is_prepared_pair(record: dict) -> bool:
 
 
 def read_prepared_pairs(path, limit=None, offset: int = 0) -> list[dict]:
-    import spatial_tools
+    from annotate import spatial_tools
 
     return spatial_tools.read_corpus(path, limit=limit, offset=offset, prepared_only=True)

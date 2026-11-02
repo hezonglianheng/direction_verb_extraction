@@ -55,9 +55,9 @@ import json5
 from langchain.tools import tool
 
 import config
-import sentence_screening
-import word_sampler
-from sentenceTable import SentenceTaskCache
+from extract import sentence_screening
+from extract import word_sampler
+from extract.sentenceTable import SentenceTaskCache
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_DIR = _PROJECT_ROOT / "config_files"
@@ -594,12 +594,12 @@ def read_corpus(
             record = json.loads(line)
             if judge_only or prepared_only:
                 if prepared_only:
-                    import corpus_pairs
+                    from replace import corpus_pairs
 
                     if "pair_schema_version" not in record:
                         raise ValueError(
                             f"{path} 第 {line_no} 行不是替换阶段产出的句子对；"
-                            "请先运行 sentence_replace.py，再将其输出传给标注入口"
+                            "请先运行 python replace，再将其输出传给标注入口"
                         )
                     eligible = corpus_pairs.is_prepared_pair(record)
                 else:

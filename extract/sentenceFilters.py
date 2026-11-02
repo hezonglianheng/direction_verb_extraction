@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from collections import defaultdict
 
 import config
-from sentenceTable import SentenceTaskCache
+from extract.sentenceTable import SentenceTaskCache
 
 cache = SentenceTaskCache(max_size=config.CACHE_MAX_SIZE)
 
@@ -854,7 +854,7 @@ def simplify_tree(tree: list[MatchNode], tokens: list[str] | None = None) -> lis
 # =========================
 
 if __name__ == "__main__":
-    # 自测：python sentenceFilters.py（需要 LTP 模型，秒级）
+    # 自测：python -m extract.sentenceFilters（需要 LTP 模型，秒级）
     # 注意：路径基于 __file__ 解析，与运行时 cwd 无关（旧写法用 Windows 反斜杠，在 Linux 下必然失败）
     config_dir = Path(config._PROJECT_ROOT) / "config_files"
     direction_config = config_dir / "direction_expressions.json5"

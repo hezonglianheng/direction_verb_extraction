@@ -7,10 +7,10 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-import sentence_screening as ss
-import spatial_agents as sa
-import spatial_tools as st
-import spatial_graphs as sg
+from extract import sentence_screening as ss
+from annotate import spatial_agents as sa
+from annotate import spatial_tools as st
+from annotate import spatial_graphs as sg
 
 
 def verdict(word="上", index=3, **changes):
@@ -68,7 +68,7 @@ class ScreeningTests(unittest.TestCase):
 
 class PairPreparationTests(unittest.TestCase):
     def make_preparer(self, resolve):
-        import sentence_replace as sr
+        from replace import sentence_replace as sr
         screener = ss.SentenceScreener(
             family="localization_expressions", config_path=str(st.FOCUS_VOCAB_SPECS["方位词"][0]),
             model_key="unused", workers=1,
@@ -78,10 +78,10 @@ class PairPreparationTests(unittest.TestCase):
 
     def test_pair_preparer_exists(self):
         import importlib.util
-        self.assertIsNotNone(importlib.util.find_spec("sentence_replace"), "替换应有独立入口")
+        self.assertIsNotNone(importlib.util.find_spec("replace.sentence_replace"), "替换应有独立入口")
 
     def test_replacement_checked_before_annotation_and_triple_is_independent(self):
-        import corpus_pairs as cp
+        from replace import corpus_pairs as cp
         source = original_row()
         saved = copy.deepcopy(source)
 
@@ -127,7 +127,7 @@ class PairPreparationTests(unittest.TestCase):
         self.assertEqual(pairs[0]["pair"]["b"]["slice"][-1], "上")
 
     def test_unchecked_and_failed_replacements_are_not_eligible(self):
-        import corpus_pairs as cp
+        from replace import corpus_pairs as cp
         for source in ("no_llm", "error", "limit"):
             with self.subTest(source=source):
                 def resolve(tasks):
@@ -137,7 +137,7 @@ class PairPreparationTests(unittest.TestCase):
                 self.assertFalse(any(cp.is_prepared_pair(p) for p in pairs))
 
     def test_pair_reader_rejects_old_input_and_counts_only_accepted_pairs(self):
-        import corpus_pairs as cp
+        from replace import corpus_pairs as cp
         pairs = self.make_preparer(lambda tasks: [verdict(t[2]["word"]) for t in tasks]).prepare_rows([original_row()])
         bad = copy.deepcopy(pairs[0])
         bad["pair_screening"]["b"]["grammatical"] = False
@@ -148,11 +148,11 @@ class PairPreparationTests(unittest.TestCase):
             self.assertEqual(len(selected), 1)
             self.assertEqual(selected[0]["focus_word_b"]["word"], "里")
             st.write_jsonl([original_row()], path)
-            with self.assertRaisesRegex(ValueError, "sentence_replace"):
+            with self.assertRaisesRegex(ValueError, "python replace"):
                 cp.read_prepared_pairs(path)
 
     def test_damaged_pair_metadata_cannot_enter_annotation(self):
-        import corpus_pairs as cp
+        from replace import corpus_pairs as cp
         pairs = self.make_preparer(lambda tasks: [verdict(t[2]["word"]) for t in tasks]).prepare_rows([original_row()])
         for mutate in (
             lambda p: p.pop("candidate"),
@@ -165,7 +165,7 @@ class PairPreparationTests(unittest.TestCase):
             self.assertFalse(cp.is_prepared_pair(damaged))
 
     def test_replacement_cli_preserves_inputs_and_existing_outputs(self):
-        import sentence_replace as replace
+        from replace import sentence_replace as replace
         with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
             source, output = Path(directory) / "original.jsonl", Path(directory) / "pairs.jsonl"
             rules = Path(directory) / "rules.json5"
@@ -185,7 +185,7 @@ class PairPreparationTests(unittest.TestCase):
             self.assertEqual(source.read_bytes(), saved)
 
     def test_null_source_line_keeps_candidate_key_across_preparation_and_annotation(self):
-        import corpus_pairs as cp
+        from replace import corpus_pairs as cp
         source = original_row()
         source["source_line_no"] = None
         preparer = self.make_preparer(lambda tasks: [verdict(t[2]["word"]) for t in tasks])
@@ -202,8 +202,8 @@ class PairPreparationTests(unittest.TestCase):
         self.assertIsNone(source["source_line_no"])
 
     def test_cli_fills_null_source_and_old_line_with_physical_input_line(self):
-        import sentence_replace as replace
-        import corpus_pairs as cp
+        from replace import sentence_replace as replace
+        from replace import corpus_pairs as cp
         source = original_row()
         source.update(source_line_no=None, line_no=None)
         preparer = self.make_preparer(lambda tasks: [verdict(t[2]["word"]) for t in tasks])
@@ -279,7 +279,7 @@ class AnnotationGraphTests(unittest.TestCase):
         self.assertEqual(updates["stage"], "bad_pair")
 
     def test_formal_runner_does_not_prepare_syntax(self):
-        import spatial_runner as runner
+        from annotate import spatial_runner as runner
         agents = sa.build_agents(sg.GRAPHS["pair"].needs, llm=False, corpus_type="方位词")
         with patch.object(st, "prepare_syntax", side_effect=AssertionError("不应预填句法")):
             runner._prefill(self.prepared(), agents, sg.GRAPHS["pair"])
@@ -296,13 +296,13 @@ class AnnotationGraphTests(unittest.TestCase):
 
 class AllInOneTests(unittest.TestCase):
     def context(self, *, llm=False):
-        import all_in_one as aio
+        from annotate import all_in_one as aio
         args = aio.parse_args(["--no-llm", "--all-candidates"])
         ctx = aio.build_context(args, "方位词", Path("unused.jsonl"))
         return aio, args, ctx._replace(llm=llm)
 
     def test_structured_output_only_contains_annotation(self):
-        import all_in_one as aio
+        from annotate import all_in_one as aio
         model = aio.build_verdict_model([])
         self.assertEqual(set(model.model_fields), {"features", "schema", "judgement"})
 
@@ -348,8 +348,8 @@ class AllInOneTests(unittest.TestCase):
         self.assertEqual(result["judgement"]["source"], "table")
 
     def test_annotation_clis_read_pairs_and_never_call_ltp(self):
-        import all_in_one as aio
-        import spatial_runner as runner
+        from annotate import all_in_one as aio
+        from annotate import spatial_runner as runner
         import agent_log
         with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
             root = Path(directory)

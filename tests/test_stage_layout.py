@@ -1,4 +1,3 @@
-import importlib
 import subprocess
 import sys
 import unittest
@@ -27,17 +26,37 @@ class StageLayoutTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn(marker, result.stdout)
 
-    def test_new_and_legacy_imports_share_state(self):
-        for old, new in (
-            ("sentence_split", "extract.sentence_split"),
-            ("sentence_screening", "extract.sentence_screening"),
-            ("sentence_replace", "replace.sentence_replace"),
-            ("spatial_runner", "annotate.spatial_runner"),
-            ("spatial_tools", "annotate.spatial_tools"),
-            ("all_in_one", "annotate.all_in_one"),
-        ):
-            with self.subTest(module=old):
-                self.assertIs(importlib.import_module(old), importlib.import_module(new))
+    def test_packages_load_without_any_legacy_module_names(self):
+        modules = [f"{stage}.{path.stem}" for stage in ("extract", "replace", "annotate")
+                   for path in sorted((ROOT / stage).glob("*.py"))
+                   if path.stem not in ("__init__", "__main__", "temp")]
+        old_names = {name.split(".")[1] for name in modules} | {"temp", "legacy_entry"}
+        script = f"""
+import importlib
+import importlib.abc
+import sys
+blocked = {old_names!r}
+class NoLegacyModules(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname in blocked:
+            raise ModuleNotFoundError('Legacy import forbidden: ' + fullname)
+sys.meta_path.insert(0, NoLegacyModules())
+for name in {modules!r}:
+    importlib.import_module(name)
+assert not blocked.intersection(sys.modules), blocked.intersection(sys.modules)
+print('PACKAGE IMPORTS OK')
+"""
+        result = subprocess.run([sys.executable, "-c", script], cwd=ROOT, capture_output=True,
+                                text=True, encoding="utf-8", errors="replace", timeout=240)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("PACKAGE IMPORTS OK", result.stdout)
+
+    def test_legacy_forwarding_files_are_removed(self):
+        names = {path.name for stage in ("extract", "replace", "annotate")
+                 for path in (ROOT / stage).glob("*.py") if not path.name.startswith("__")}
+        for name in names | {"legacy_entry.py"}:
+            with self.subTest(name=name):
+                self.assertFalse((ROOT / name).exists(), "旧入口应被删除：" + name)
 
     def test_resources_still_resolve_to_project_root(self):
         from annotate import spatial_tools, spatial_runner, all_in_one, prompt_examples

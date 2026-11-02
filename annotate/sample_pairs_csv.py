@@ -15,12 +15,12 @@
 同名采样结果会覆盖；输出不能指向输入文件。
 
 用法：
-    python sample_pairs_csv.py results/pairs.csv --counts 300 200 100
-    python sample_pairs_csv.py results/pairs.csv --total 1000 --ratios 5 3 2
-    python sample_pairs_csv.py results/pairs.csv --counts 100 0 0 -o results/yes.csv
-    python sample_pairs_csv.py results/pairs.csv --total 200 --ratios 1 1 0 --seed 42 --shuffle
-    python sample_pairs_csv.py results/pairs.csv --counts 100 100 50 --allow-shortage
-    python sample_pairs_csv.py results/pairs.csv --total 1000 --ratios 5 3 2 --dry-run
+    python -m annotate.sample_pairs_csv results/pairs.csv --counts 300 200 100
+    python -m annotate.sample_pairs_csv results/pairs.csv --total 1000 --ratios 5 3 2
+    python -m annotate.sample_pairs_csv results/pairs.csv --counts 100 0 0 -o results/yes.csv
+    python -m annotate.sample_pairs_csv results/pairs.csv --total 200 --ratios 1 1 0 --seed 42 --shuffle
+    python -m annotate.sample_pairs_csv results/pairs.csv --counts 100 100 50 --allow-shortage
+    python -m annotate.sample_pairs_csv results/pairs.csv --total 1000 --ratios 5 3 2 --dry-run
 """
 
 import argparse

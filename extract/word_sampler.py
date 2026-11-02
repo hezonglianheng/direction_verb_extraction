@@ -29,18 +29,18 @@
 一句只落一份记录，抽中的词全部写进 `sampled_words`；下游据此只展开这些词的位置。
 
 内存：本模块自己的数据结构只占几十 MB（两遍流式扫，不把语料读进内存）。但进程整体常驻约 0.8GB ——
-`from sentenceFilters import ...` 会连带 `sentenceTable` 里的 `from ltp import LTP` / `import torch`，
+`from extract.sentenceFilters import ...` 会连带 `sentenceTable` 里的 `from ltp import LTP` / `import torch`，
 在跑之前就吃掉了（实测裸解释器 11MB、import torch 后 639MB、import ltp 后 774MB）。这条依赖是为了
 复用 FilterGenerator 展开 `_vocab_file`（词表只有一处真源），不好省；只是别把这里的「O(1) 内存」
 当成整个进程的内存。启动也多花约 3.5 秒。
 
 用法：
-    .venv/bin/python word_sampler.py                                  # 两份语料各抽 1%
-    .venv/bin/python word_sampler.py --ratio 0.05 --seed 0            # 换比例，固定种子
-    .venv/bin/python word_sampler.py --corpus results/direction_corpus.jsonl
-    .venv/bin/python word_sampler.py --dry-run                        # 只统计逐词计数，不落盘
-    .venv/bin/python word_sampler.py --min-per-word 1                 # 长尾词至少抽一条
-    .venv/bin/python word_sampler.py --corpus results/direction_corpus.jsonl \
+    .venv/bin/python -m extract.word_sampler                                  # 两份语料各抽 1%
+    .venv/bin/python -m extract.word_sampler --ratio 0.05 --seed 0            # 换比例，固定种子
+    .venv/bin/python -m extract.word_sampler --corpus results/direction_corpus.jsonl
+    .venv/bin/python -m extract.word_sampler --dry-run                        # 只统计逐词计数，不落盘
+    .venv/bin/python -m extract.word_sampler --min-per-word 1                 # 长尾词至少抽一条
+    .venv/bin/python -m extract.word_sampler --corpus results/direction_corpus.jsonl \
         --vocab /path/to/words.json5                                  # 换一份目标词表（一次只跑一份语料）
 """
 
@@ -50,8 +50,8 @@ import random
 from pathlib import Path
 
 import file_paths
-from sentenceFilters import FilterGenerator, load_vocab_file
-from sentence_screening import is_judgement_eligible
+from extract.sentenceFilters import FilterGenerator, load_vocab_file
+from extract.sentence_screening import is_judgement_eligible
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 

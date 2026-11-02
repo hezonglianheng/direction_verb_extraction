@@ -2,7 +2,7 @@
 
 """空间语义标注跑批：读取合格句对 → feature → schema → judge → 落盘汇总。
 
-语料提取见 sentence_extract.py，机械替换及两侧语法/空间义检查见 sentence_replace.py。
+语料提取见 extract/sentence_extract.py，机械替换及两侧检查见 replace/sentence_replace.py。
 正式 pair/synonym 图只消费替换阶段的句对，不展开候选、不重新筛选、不准备句法证据。
 原句和替换句各用自己的关注词与三元组，特征/图式示例从 system_prompt/examples 按词选择。
 single/alter_check 保留为显式诊断图，不是正式句对标注入口。
@@ -12,17 +12,17 @@ single/alter_check 保留为显式诊断图，不是正式句对标注入口。
 收尾按 (line_no, candidate.index) 排序，可与 all_in_one.py 对账。模型执行日志见 log/。
 
 用法：
-    python spatial_runner.py --corpus results/location_pairs.jsonl --limit 5
-    python spatial_runner.py --corpus results/direction_pairs.jsonl --corpus-type 趋向动词 --limit 20
-    python spatial_runner.py --workers 4 --limit 200
-    python spatial_runner.py --no-llm --batch off --limit 5
-    python spatial_runner.py --models model-a model-b --workers 4
-    python spatial_runner.py --batch native --batch-resume --batch-cache results/run.batch-cache.jsonl
-    python spatial_runner.py --list-graphs
+    python annotate --corpus results/location_pairs.jsonl --limit 5
+    python annotate --corpus results/direction_pairs.jsonl --corpus-type 趋向动词 --limit 20
+    python annotate --workers 4 --limit 200
+    python annotate --no-llm --batch off --limit 5
+    python annotate --models model-a model-b --workers 4
+    python annotate --batch native --batch-resume --batch-cache results/run.batch-cache.jsonl
+    python annotate --list-graphs
 
 --models 保留模型独立执行与加权投票，缺票及平票转人工复核。--batch auto 优先使用原生 Batch，
 不可用时明确回退同步；native 不允许回退。批处理仅包含特征、图式和判定波次，查表优先级不变。
-完整命令、句对契约与 JSON5 示例格式见 docs/corpus-pipeline.md。
+完整命令与服务器迁移注意事项见 .docs/stage-migration.md。
 """
 
 import argparse
@@ -40,12 +40,12 @@ import agent_log
 import agents as agent_factory
 import batch_inference as bi
 import config
-import corpus_pairs as cp
+from replace import corpus_pairs as cp
 import file_paths
-import spatial_agents as sa
-import spatial_graphs as sg
-import spatial_tools as st
-import voting
+from annotate import spatial_agents as sa
+from annotate import spatial_graphs as sg
+from annotate import spatial_tools as st
+from annotate import voting
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CORPUS = _PROJECT_ROOT / "results" / st.CORPUS_TYPE_CORPORA[st.DEFAULT_CORPUS_TYPE]
@@ -358,13 +358,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "决定读取该词性的特征、图式与判定配置，以及 system_prompt/examples 下的示例。"
         "默认方位词；**刻意不按语料文件名推断**——推断猜错时是静默读错一整组表，"
         "宁可要你显式说一句（语料名像另一类时会提醒一句，但不会替你改）。"
-        "正式标注前请先运行 sentence_replace.py 生成该类型的句对",
+        "正式标注前请先运行 python replace 生成该类型的句对",
     )
     parser.add_argument("--corpus", default=None, help="句对 JSONL（pair/synonym 默认 results/location_pairs.jsonl 或 direction_pairs.jsonl）")
     parser.add_argument(
         "--alter-rules",
         default=None,
-        help="仅 alter_check 诊断图使用；正式 pair/synonym 标注不替换，须将此参数传给 sentence_replace.py",
+        help="仅 alter_check 诊断图使用；正式 pair/synonym 标注不替换，须将此参数传给 python replace",
     )
     parser.add_argument("--out-dir", default=None, help="输出目录（默认 results/<图的 prefix>）")
     parser.add_argument("--out-file", default=None, help="直接指定输出文件（默认按时间戳生成）")
@@ -1423,7 +1423,7 @@ def main(argv: list[str] | None = None) -> None:
         if not args.corpus:
             corpus_path = _PROJECT_ROOT / "results" / cp.PAIR_CORPORA[corpus_type]
         if args.alter_rules:
-            raise SystemExit("错误：标注阶段不再替换句子；请将 --alter-rules 传给 sentence_replace.py")
+            raise SystemExit("错误：标注阶段不再替换句子；请将 --alter-rules 传给 python replace")
         records = cp.read_prepared_pairs(corpus_path, limit=args.limit, offset=args.offset)
         if any(record.get("corpus_type") != corpus_type for record in records):
             raise ValueError("句对的 corpus_type 与 --corpus-type 不一致，不能使用另一词性的标注配置")

@@ -13,12 +13,12 @@ import threading
 import time
 
 import config
-import direction_grounding
-import extraction_log
-import localization_grounding
-import sentenceFilters
-import sentence_split
-import sentence_screening
+from extract import direction_grounding
+from extract import extraction_log
+from extract import localization_grounding
+from extract import sentenceFilters
+from extract import sentence_split
+from extract import sentence_screening
 import file_paths
 from file_paths import atomic_write_text
 from pipeline_utils import ROW_ID_FIELD, prefetch_iter, row_key, tag_rows

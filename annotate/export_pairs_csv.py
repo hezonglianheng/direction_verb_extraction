@@ -29,14 +29,14 @@ stage 值，用来区分有没有判断——semantic_ok 即有判断，其余�
 跑出来、后来又想要 csv 的那些结果。
 
 用法：
-    .venv/bin/python export_pairs_csv.py results/loc_test/spatial_pairs_20261003_001802.jsonl
-    .venv/bin/python export_pairs_csv.py <结果.jsonl> -o <输出.csv>
+    .venv/bin/python -m annotate.export_pairs_csv results/loc_test/spatial_pairs_20261003_001802.jsonl
+    .venv/bin/python -m annotate.export_pairs_csv <结果.jsonl> -o <输出.csv>
 """
 
 import argparse
 from pathlib import Path
 
-import spatial_tools as st
+from annotate import spatial_tools as st
 from file_paths import atomic_output_path, validate_output_paths
 
 

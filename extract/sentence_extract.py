@@ -7,11 +7,11 @@ import sys
 import time
 
 import config
-import extraction_log
-import sentenceFilters
-import sentence_screening
-from entry_in_linux import run_linux_entry
-from entry_in_win import run_windows_entry
+from extract import extraction_log
+from extract import sentenceFilters
+from extract import sentence_screening
+from extract.entry_in_linux import run_linux_entry
+from extract.entry_in_win import run_windows_entry
 
 
 DEFAULT_FILTER_CONFIG = ""

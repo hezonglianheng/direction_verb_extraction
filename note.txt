@@ -1,4 +1,4 @@
 LTP接受的transformers库需要小于版本5.
 
-指令形式（入口是 sentence_extract.py，不是 main.py）：
-python sentence_extract.py "F:\智源语料文件\wudao2_0_sample\wudao2_0\百家号文章.jsonl" --filter_config_path E:\SpaCE后续工作\趋向动词语料构建\config_files\direction_expressions.json5
+指令形式（在项目根目录运行，入口是 extract/）：
+python extract "F:\智源语料文件\wudao2_0_sample\wudao2_0\百家号文章.jsonl" --filter_config_path E:\SpaCE后续工作\趋向动词语料构建\config_files\direction_expressions.json5

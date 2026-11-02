@@ -1,14 +1,14 @@
 # encoding: utf8
 """已筛选句对的单次标注：空间特征 → 空间图式 → 同义判断。
 
-替换、语法与空间义检查都在 sentence_replace.py 完成，不属于 all-in-one。
+替换、语法与空间义检查都在 replace/sentence_replace.py 完成，不属于 all-in-one。
 与 spatial_runner.py --graph pair 读取同一份句对、复用同一序列化与查表实现。
 
 用法：
-    python all_in_one.py --corpus results/location_pairs.jsonl --limit 5
-    python all_in_one.py --corpus results/location_pairs.jsonl --print-prompt
-    python all_in_one.py --corpus results/direction_pairs.jsonl --corpus-type 趋向动词
-    python all_in_one.py --corpus results/location_pairs.jsonl --no-llm --batch off
+    python annotate --engine all-in-one --corpus results/location_pairs.jsonl --limit 5
+    python annotate --engine all-in-one --corpus results/location_pairs.jsonl --print-prompt
+    python annotate --engine all-in-one --corpus results/direction_pairs.jsonl --corpus-type 趋向动词
+    python annotate --engine all-in-one --corpus results/location_pairs.jsonl --no-llm --batch off
 
 每个句对一次逻辑调用，不提供句法工具或句法证据。传输层重试及可选的结构化输出
 补发沿用现有配置，真实请求数由回调计数。同步、原生 Batch、同步回退使用同一份消息。
@@ -29,14 +29,14 @@ from pydantic import Field, create_model
 import agents as agent_factory
 import batch_inference as bi
 import config
-import corpus_pairs as cp
+from replace import corpus_pairs as cp
 import file_paths
-import prompt_examples as pe
+from annotate import prompt_examples as pe
 import retry
-import spatial_agents as sa
-import spatial_graphs as sg
-import spatial_runner as sr
-import spatial_tools as st
+from annotate import spatial_agents as sa
+from annotate import spatial_graphs as sg
+from annotate import spatial_runner as sr
+from annotate import spatial_tools as st
 import utils
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -285,7 +285,7 @@ def expand_states(record: dict, ctx: _Context, args: argparse.Namespace) -> list
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--corpus", default=None, help="sentence_replace.py 产出的句对 JSONL")
+    parser.add_argument("--corpus", default=None, help="python replace 产出的句对 JSONL")
     parser.add_argument("--corpus-type", default=None, type=sr._corpus_type_arg)
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT, help="最多标注多少条合格句对，默认 1")
     parser.add_argument("--offset", type=int, default=0, help="跳过多少条合格句对")
@@ -313,7 +313,7 @@ def main(argv=None):
     if any(record.get("corpus_type") != kind for record in records):
         raise ValueError("句对的 corpus_type 与 --corpus-type 不一致")
     if not records:
-        print(f"没有可标注的合格句对：{corpus}；请先运行 sentence_replace.py")
+        print(f"没有可标注的合格句对：{corpus}；请先运行 python replace")
         return
     if args.limit is not None and len(records) < args.limit:
         print(f"提示：仅有 {len(records)} 条合格句对，少于 --limit {args.limit}；按实际数量运行")

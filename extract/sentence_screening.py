@@ -444,7 +444,7 @@ def _target_nodes(record: dict, vocab: set[str]) -> list[dict]:
     """这条记录里真正被规则提取出来的目标词节点（口径见 word_sampler.target_nodes）"""
     try:
         # 延迟 import：入口模块的轻量测试会把 sentenceFilters 换成桩，顶层 import 会连带失败
-        import word_sampler
+        from extract import word_sampler
 
         return word_sampler.target_nodes(record, vocab)
     except Exception:  # noqa: BLE001 —— 单条记录形状异常只降级，不带走整批
@@ -535,7 +535,7 @@ class SentenceScreener:
 
         try:
             # 延迟 import 的理由同 _target_nodes：提示语为空时本模块不该拖入 sentenceFilters/torch
-            import word_sampler
+            from extract import word_sampler
 
             self._vocab = word_sampler.derive_vocab(self.config_path, _TARGET_PREFIXES[self.kind])[0]
         except Exception as exc:  # noqa: BLE001 —— 提示语填了但词表推不出来：说清原因后跳过，不阻断语料构造
@@ -940,8 +940,8 @@ class SentenceScreener:
                     row.get("match_tree") or [], false_indices, true_indices | unknown_indices
                 )
                 try:
-                    import direction_grounding
-                    import localization_grounding
+                    from extract import direction_grounding
+                    from extract import localization_grounding
 
                     # 两类语料各有一个前序整理块；不存在的块会被模块内的形状检查直接跳过。
                     localization_grounding.prune_candidates(

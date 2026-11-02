@@ -23,8 +23,8 @@
 `focus_word.source == "sampled_word"` 的记录沿用旧 id 里的位置序号并告警。
 
 用法：
-    python migrate_result_ids.py results/old.jsonl
-    python migrate_result_ids.py old.jsonl -o new.jsonl --csv-out new.csv --corpus sampled.jsonl
+    python -m annotate.migrate_result_ids results/old.jsonl
+    python -m annotate.migrate_result_ids old.jsonl -o new.jsonl --csv-out new.csv --corpus sampled.jsonl
 """
 
 from __future__ import annotations
@@ -34,8 +34,8 @@ import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
-import spatial_graphs as sg
-import spatial_tools as st
+from annotate import spatial_graphs as sg
+from annotate import spatial_tools as st
 
 
 def _is_pair_record(record: dict) -> bool:

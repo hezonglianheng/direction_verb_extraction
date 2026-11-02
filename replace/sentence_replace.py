@@ -1,7 +1,7 @@
 # encoding: utf8
 """语料替换阶段：原句及三元组 → 机械替换 → 检查替换句 → 一行一个句对。
 
-示例：python sentence_replace.py --corpus results/location_corpus.jsonl
+示例：python replace --corpus results/location_corpus.jsonl
                     --corpus-type 方位词 --out-file results/location_pairs.jsonl
 旧语料缺少完整原句判定时先补筛；标注阶段不再负责替换或语法/空间义检查。
 """
@@ -13,11 +13,11 @@ from collections import Counter
 from pathlib import Path
 
 import config
-import corpus_pairs as cp
+from replace import corpus_pairs as cp
 import file_paths
-import sentence_screening as ss
-import spatial_agents as sa
-import spatial_tools as st
+from extract import sentence_screening as ss
+from annotate import spatial_agents as sa
+from annotate import spatial_tools as st
 
 
 def replacement_grounding(grounding: dict | None, index: int, replacement: str) -> dict | None:
@@ -169,7 +169,7 @@ def main(argv=None):
                 continue
             row = json.loads(line)
             if "pair_schema_version" in row:
-                raise ValueError("输入已是句对，请勿再次替换；将它交给 spatial_runner.py 或 all_in_one.py")
+                raise ValueError("输入已是句对，请勿再次替换；将它交给 python annotate 或其 --engine all-in-one 模式")
             source_line_no = st.record_line_no(row)
             row["source_line_no"] = source_line_no if source_line_no is not None else line_no
             row["line_no"] = line_no

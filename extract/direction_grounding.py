@@ -37,7 +37,7 @@
 from typing import Any
 
 import config
-import localization_grounding as lg
+from extract import localization_grounding as lg
 from pipeline_utils import prune_tree
 
 # --------------------------------------------------------------------------
@@ -490,7 +490,7 @@ def apply_grounding(
         (保留的记录或 None, 统计块)。所有候选都不合格时返回 None；
         ``record["direction_grounding"]`` 写入每个候选词的判定明细。
     """
-    import word_sampler
+    from extract import word_sampler
 
     stats = empty_stats()
     stats["records"] = 1

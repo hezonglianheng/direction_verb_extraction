@@ -45,7 +45,7 @@
 每个 agent 只依赖自己那张配置表，构造参数都带默认值（默认读默认语料类型「方位词」那一组的
 标准路径，见 spatial_tools.config_path），因此既能被图按需建，也能单独建来做对照实验：
 
-    from spatial_agents import SemanticAgent
+    from annotate.spatial_agents import SemanticAgent
     focus = {"index": 2, "word": "进", "kind": "趋向动词", "source": "vocab"}
     SemanticAgent().run("他走进屋里。", focus)              # 只看语义通顺性
     JudgeAgent().run(a, b, sa, sb, fa, fb, focus)          # 只做判定
@@ -64,8 +64,8 @@ system_prompt/screen_<词类型>.txt（见 sentence_screening）；新语料直�
 由筛选步骤注入；正式 pair/all-in-one 不再运行 reality/semantic，仅诊断图保留这些 agent。
 
 用法：
-    .venv/bin/python spatial_agents.py --list        # 打印七个 agent 的输入输出契约，不调模型
-    .venv/bin/python spatial_agents.py               # 纯规则冒烟测试（不调模型，不需要 GPU）
+    .venv/bin/python -m annotate.spatial_agents --list  # 打印七个 agent 的输入输出契约，不调模型
+    .venv/bin/python -m annotate.spatial_agents         # 纯规则冒烟测试（不调模型，不需要 GPU）
 """
 
 import argparse
@@ -84,9 +84,9 @@ from pydantic import BaseModel, Field, create_model
 
 import agents as agent_factory
 import batch_inference as bi
-import sentence_screening
-import spatial_tools as st
-import prompt_examples as pe
+from extract import sentence_screening
+from annotate import spatial_tools as st
+from annotate import prompt_examples as pe
 import utils
 
 DEFAULT_MODEL = "deepseek-flash"

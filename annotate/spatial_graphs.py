@@ -5,7 +5,7 @@
 正式标注图：
     pair     read_pair → feature（a/b）→ schema（a/b）→ judge → save
     synonym  read_pair → synonym → save
-两者只接受 sentence_replace.py 产出的合格句对；不再改写或请求语法/空间义判断。
+两者只接受 python replace 产出的合格句对；不再改写或请求语法/空间义判断。
 read_pair 将两侧原有检查写入兼容的 reality/semantic 输出块，来源标记 preparation。
 两侧分别使用自己的关注词、三元组与示例；旧输入必须先经过替换步骤。
 
@@ -23,11 +23,11 @@ from typing import TYPE_CHECKING, Annotated, Any, Callable, NamedTuple, TypedDic
 from langgraph.graph import END, START, StateGraph
 
 import batch_inference as bi
-import corpus_pairs as cp
-import spatial_tools as st
+from replace import corpus_pairs as cp
+from annotate import spatial_tools as st
 
 if TYPE_CHECKING:  # 只为类型标注，避免与 spatial_runner 相互 import
-    from spatial_runner import ResultWriter
+    from annotate.spatial_runner import ResultWriter
 
 
 # --------------------------------------------------------------------------
@@ -458,7 +458,7 @@ def prepared_pair_node(state: dict) -> dict:
     """读取已在替换阶段检查好的句对，筛选结论只作来源证据，不再请求 LLM。"""
     record = state["record"]
     if not cp.is_prepared_pair(record):
-        return {"stage": "bad_pair", "status_reason": "不是两侧均通过检查的句对；请先运行 sentence_replace.py",
+        return {"stage": "bad_pair", "status_reason": "不是两侧均通过检查的句对；请先运行 python replace",
                 "history": [_step("read_pair", stage="bad_pair")]}
     pair, checks = record["pair"], record["pair_screening"]
     semantic = {}
@@ -2014,7 +2014,7 @@ GRAPHS: dict[str, GraphSpec] = {
     "pair": GraphSpec(
         name="pair",
         prefix="spatial_pairs",
-        doc="已检查句对的标注：feature → schema → judge；先运行 sentence_replace.py",
+        doc="已检查句对的标注：feature → schema → judge；先运行 python replace",
         state=PairState,
         needs=("feature", "schema", "judge"),
         init_states=prepared_init_states,

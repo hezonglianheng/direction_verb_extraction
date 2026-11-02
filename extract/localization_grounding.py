@@ -867,7 +867,7 @@ def apply_grounding(
         (保留的记录或 None, 统计块)。返回 None 表示所有候选词都不合格，整条记录不进入下一步。
         ``record["localization_grounding"]`` 会写入每个候选词的判定明细，供复核。
     """
-    import word_sampler
+    from extract import word_sampler
 
     stats = empty_stats()
     stats["records"] = 1
@@ -983,7 +983,7 @@ def attach_analysis(
     ``_direction_analysis``。这里不导入 OpenHowNet，因此可以安全地在多进程 worker 中调用。
     """
     if kind == "趋向动词":
-        import direction_grounding
+        from extract import direction_grounding
 
         return direction_grounding.attach_analysis(record, sentence, cache, kind=kind)
     if kind != "方位词" or not isinstance(sentence, str) or not sentence:
@@ -1023,12 +1023,12 @@ def prepare_families(
         resolved = kind or classify_family(family)
         vocab = None
         if resolved == "方位词":
-            import word_sampler
+            from extract import word_sampler
 
             vocab = set(word_sampler.derive_vocab(str(path), None)[0])
             need_locative = True
         elif resolved == "趋向动词":
-            import word_sampler
+            from extract import word_sampler
 
             # 与 sentence_screening/word_sampler 同一口径：只取 direction_verb_ 前缀的
             # 词表，避免把 accompany_/cause_/manner_ 里的搭配动词当成目标词。
@@ -1043,7 +1043,7 @@ def prepare_families(
             gates["localization"] = PhysicalGate()
             hownet = gates["localization"].hownet
         if need_direction:
-            import direction_grounding
+            from extract import direction_grounding
 
             gates["direction"] = direction_grounding.DirectionGate(hownet=hownet)
     return metas, gates

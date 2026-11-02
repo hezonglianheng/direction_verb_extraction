@@ -9,7 +9,7 @@ from collections import OrderedDict
 from typing import Iterable
 
 import config
-from locative_split import get_suffix_vocab, split_tokens_by_suffix
+from extract.locative_split import get_suffix_vocab, split_tokens_by_suffix
 
 _ltp = None
 _ltp_init_lock = threading.Lock()
