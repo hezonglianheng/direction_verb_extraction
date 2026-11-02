@@ -1,0 +1,2394 @@
+# encoding: utf8
+
+"""空间语义改写-判定流水线（spatial_agents.py）用到的工具。
+
+内容分三类：
+
+1. 配置读取：config_files/ 下的四张表——改写规则（alter_rules.json5）、语义特征类别
+   （feature_classes.json5）、schema 表（schema_table.json5）、判定表（judge_table.csv，
+   唯一一张 CSV：首行首列是 schema 名、格子是结论符号，格式见 load_judge_table）。
+   四张表**按语料类型分两组**（见 CORPUS_TYPE_DIRS）：方位词在 config_files/localization/、
+   趋向动词在 config_files/direction/，两组里文件名相同，路径一律由 config_path 解析。
+   跑哪种类型由 spatial_runner.py 的 --corpus-type 指定（默认方位词），构造期注入 agent。
+   哪一组文件缺了或内容为空都按空表跑，对应环节退化为 LLM 兜底或原样返回，并在结果记录的
+   source 字段里如实标记来源；跑批入口启动时会逐张打印实际路径与内容摘要，绝不静默降级。
+   这两组目录下还各有一份空间判据片段（reality.txt，见 CONFIG_PROMPT_FILES），由
+   system_prompt/screen_<词类型>.txt 与 all_in_one 共同注入；reality/semantic agent 的主判据
+   与语料筛选共用这一份。路径与读法见 config_prompt_path / utils.read_prompt_path。
+2. 纯规则工具：切片改写 alter_sentence（一个原句按命中的规则组产出多个待选句）、词组定位
+   find_word_groups、schema 查表 lookup_schema（先按关注词收窄、再按语义特征匹配）、
+   判定查表 lookup_judgement、结果落盘 write_jsonl、成对记录拍平 write_pairs_csv —— 不调 LLM，
+   可脱离 agent 单独测试
+   （.venv/bin/python spatial_tools.py）。收窄那一步的口径见 _narrowed_groups：一个词条能用
+   words 声明它覆盖哪些关注词词形（外面/外边/外头 都归「外」这一类），schema 名仍用组名。
+3. 供 LLM agent 调用的 @tool：parse_sentence 提供分词/词性/依存句法证据，让模型基于
+   结构判断而不是仅凭语感。
+
+另有一处贯穿全流程的口径：**本次需要重点关注的词**（pick_focus_word / pick_focus_words）。
+一条语料是为哪个方位词/趋向动词抽出来的，改写与五个 LLM agent 都要知道，逐级向下传的只有
+三样——index、词本身、属方位词还是趋向动词。取词口径见这两个函数；词表真源是两张筛选配置，
+与抽样（word_sampler.py）共用同一个 derive_vocab。
+
+句内**每个**目标词位置都要参与改写（见 pick_focus_words）：一句「他从山上掉到山谷里」里
+「上」与「里」各出一个位置，改写时逐位置各出一批待选句，但**一条记录仍只改一个位置**——
+所以 pick_focus_word（= pick_focus_words 的首元素）仍是下游读的那个单值关注词。
+例外是抽样产物：带 `sampled_words` 的记录只展开**被抽中的词**的位置，免得同一句在
+两个词层各抽一次就重复生成同一批句对（D1）。
+
+一对句子里的两侧各有各的关注词：a 侧（原句）看的是记录里那个词，b 侧（改写句）看的是规则表
+换上去的那个词（见 replacement_focus_word，来源记 FOCUS_SOURCE_ALTER）。所以 b 侧的 schema
+收窄到的是替换词所属的词条，判定表里 上12 × 里1 这样的格子才对得上——两侧共用一个词的话，
+b 侧会收窄回原词那一组，判定表就永远只在自己那一组里打转。
+"""
+
+import csv
+import hashlib
+import json
+import threading
+import unicodedata
+from datetime import datetime
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, Iterable, Iterator
+
+import json5
+from langchain.tools import tool
+
+import config
+import sentence_screening
+import word_sampler
+from sentenceTable import SentenceTaskCache
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+CONFIG_DIR = _PROJECT_ROOT / "config_files"
+"""四张规则表的根目录；每类语料一张同名子目录（见 CORPUS_TYPE_DIRS）"""
+
+TABLE_FILES: dict[str, str] = {
+    # 逻辑表名 -> 文件名。各类型子目录里**同名**，于是「表」只有一处定义
+    "alter_rules": "alter_rules.json5",
+    "feature_classes": "feature_classes.json5",
+    "schema_table": "schema_table.json5",
+    "judge_table": "judge_table.csv",
+}
+"""本流水线读的四张表；值同时是各子目录里的文件名（单一真源）"""
+
+CORPUS_TYPE_DIRS: dict[str, str] = {
+    # 语料类型（中文名，与 FOCUS_VOCAB_SPECS、记录里的 kind 同一套字符串）-> 配置子目录名
+    # 别名只是命令行入口，见 CORPUS_TYPE_ALIASES；类型枚举的真源是这里与 FOCUS_VOCAB_SPECS
+    "方位词": "localization",
+    "趋向动词": "direction",
+}
+"""语料类型 -> config_files/ 下的配置子目录"""
+
+CORPUS_TYPE_ALIASES: dict[str, str] = {
+    # 别名（大小写不敏感）-> 中文类型名
+    "localization": "方位词",
+    "location": "方位词",
+    "loc": "方位词",
+    "direction": "趋向动词",
+    "dir": "趋向动词",
+    "direction_verb": "趋向动词",
+}
+"""命令行上可用的类型别名"""
+
+DEFAULT_CORPUS_TYPE = "方位词"
+"""缺省语料类型：与默认语料 results/location_corpus.jsonl 同一口径"""
+
+CORPUS_TYPE_CORPORA: dict[str, str] = {
+    # 类型 -> 该类型的默认语料文件名（results/ 下）；键与 word_sampler.CORPUS_SPECS 同名
+    "方位词": "location_corpus.jsonl",
+    "趋向动词": "direction_corpus.jsonl",
+}
+"""每类语料的默认输入文件（spatial_runner 不给 --corpus 时用）"""
+
+FOCUS_VOCAB_SPECS: dict[str, tuple[str | Path, tuple[str, ...] | None]] = {
+    # 类别 -> (筛选配置, 只取哪些键的词表；None 表示取各顶层规则自己的词表)
+    # 与 word_sampler.CORPUS_SPECS 同一口径，别在这里另立一套词表（词表只有一处真源）
+    "方位词": (CONFIG_DIR / "localization_expressions.json5", None),
+    "趋向动词": (CONFIG_DIR / "direction_expressions.json5", ("direction_verb_",)),
+}
+"""关注词的两份词表：判一个词属方位词还是趋向动词，就按它落在哪张表里定
+
+刻意不用 config_files/localization_vocab.json5：那是初筛用的超集（会做子串最小化，
+出来/上来/过去 会被吞成 出/上/过），且它在 sentenceFilters 自测里是回归基线，不是目标词表。
+"""
+
+# 三处都写着「有哪些语料类型」：CORPUS_TYPE_DIRS、CORPUS_TYPE_CORPORA、FOCUS_VOCAB_SPECS。
+# 对不上就是改漏了一处，在 import 时就报，别留给跑批跑到一半才暴露。
+assert set(CORPUS_TYPE_DIRS) == set(FOCUS_VOCAB_SPECS), (
+    "语料类型两处真源对不上：CORPUS_TYPE_DIRS 与 FOCUS_VOCAB_SPECS"
+)
+assert set(CORPUS_TYPE_CORPORA) == set(CORPUS_TYPE_DIRS), (
+    "语料类型两处真源对不上：CORPUS_TYPE_CORPORA 与 CORPUS_TYPE_DIRS"
+)
+assert set(CORPUS_TYPE_CORPORA.values()) <= set(word_sampler.CORPUS_SPECS), (
+    "CORPUS_TYPE_CORPORA 里的语料名不在 word_sampler.CORPUS_SPECS 里（文件名写错了？）"
+)
+
+
+def normalize_corpus_type(value: str | None) -> str:
+    """语料类型规范化：别名（大小写不敏感）-> 中文类型名；None/空串 -> DEFAULT_CORPUS_TYPE
+
+    认不出来时抛 ValueError，**绝不当成默认类型静默跑**——那会让人以为跑的是 X、
+    实际读的是方位词的四张表，与「绝不静默降级」相违。
+
+    Args:
+        value (str | None): 中文类型名或 CORPUS_TYPE_ALIASES 里的别名
+
+    Returns:
+        str: 中文类型名（CORPUS_TYPE_DIRS 的键之一）
+    """
+    if value is None or not str(value).strip():
+        return DEFAULT_CORPUS_TYPE
+    text = str(value).strip()
+    if text in CORPUS_TYPE_DIRS:
+        return text
+    alias = CORPUS_TYPE_ALIASES.get(text.lower())
+    if alias:
+        return alias
+    available = "、".join(
+        f"{kind}（{'/'.join(sorted(a for a, k in CORPUS_TYPE_ALIASES.items() if k == kind))}）"
+        for kind in CORPUS_TYPE_DIRS
+    )
+    raise ValueError(f"认不出语料类型 {value!r}；可用：{available}")
+
+
+def config_path(table: str, corpus_type: str | None = None) -> Path:
+    """四张规则表的路径：config_files/<语料类型目录>/<文件名>
+
+    Args:
+        table (str): TABLE_FILES 的键（alter_rules / feature_classes / schema_table / judge_table）
+        corpus_type (str | None): 语料类型（中文名或别名）；None/空 = DEFAULT_CORPUS_TYPE
+
+    Returns:
+        Path: 只拼路径、不检查存在性——缺表按空表跑，由跑批入口在启动时逐张打印并告警
+    """
+    if table not in TABLE_FILES:
+        raise ValueError(f"没有名为 {table!r} 的表；可用：{'、'.join(TABLE_FILES)}")
+    return CONFIG_DIR / CORPUS_TYPE_DIRS[normalize_corpus_type(corpus_type)] / TABLE_FILES[table]
+
+
+CONFIG_PROMPT_FILES: dict[str, str] = {
+    # 逻辑名 -> 文件名。与四张表一样按语料类型分两组（见 CORPUS_TYPE_DIRS）
+    "reality": "reality.txt",
+}
+"""与四张表同放在 config_files/<语料类型>/ 下的**提示语**（目前只有 reality_agent 这一份）
+
+为什么不进 system_prompt/（其余五份提示语都在那儿）：判据随词类不同——方位词要挡的是
+「会上/意义上/三天内」这类引申与时间用法，趋向动词要挡的是「笑起来/看出来/走出困境」
+这类时体、结果与比喻用法，两类词的判据不是一回事。与四张表同一个目录、同一套按类型分组的
+口径，改一类的标准碰不到另一类。读与报错见 utils.read_prompt_path。
+"""
+
+
+def config_prompt_path(name: str, corpus_type: str | None = None) -> Path:
+    """config_files/<语料类型目录>/ 下的提示语路径（口径与 config_path 一致：只拼路径、不查存在性）
+
+    Args:
+        name (str): CONFIG_PROMPT_FILES 的键
+        corpus_type (str | None): 语料类型（中文名或别名）；None/空 = DEFAULT_CORPUS_TYPE
+
+    Returns:
+        Path: 文件不在时的报错由 utils.read_prompt_path 负责（它会列出同目录下现有哪些 .txt）
+    """
+    if name not in CONFIG_PROMPT_FILES:
+        raise ValueError(f"没有名为 {name!r} 的配置目录提示语；可用：{'、'.join(CONFIG_PROMPT_FILES)}")
+    return CONFIG_DIR / CORPUS_TYPE_DIRS[normalize_corpus_type(corpus_type)] / CONFIG_PROMPT_FILES[name]
+
+
+ALTER_RULES_FILE = config_path("alter_rules")
+"""替换规则表：原词 -> 候选替换词（默认类型即方位词那张）
+
+注意它**不再是 load_alter_rules 的默认值**（那个函数的默认值在调用时按语料类型解析，见 config_path）。
+保留这个名字只为文档、命令行 help 与外部引用；路径真源是 config_path。
+语义与旧版不同：过去它指向一个不存在的根文件（等价于不改写），现在指向方位词的实表。
+"""
+FEATURE_CLASSES_FILE = config_path("feature_classes")
+"""语义特征类别表：特征类别的定义（默认类型即方位词那张，同上不再作 load_* 的默认值）"""
+SCHEMA_TABLE_FILE = config_path("schema_table")
+"""schema 表：语义特征组合 -> schema（默认类型即方位词那张）"""
+JUDGE_TABLE_FILE = config_path("judge_table")
+"""判定表：两个 schema -> 意义是否相同（默认类型即方位词那张）
+
+四张表里唯一的 CSV（judge_table.csv）：首行首列是 schema 名、格子写结论符号，格式与匹配
+规则见 load_judge_table。改成矩阵是为了能逐格声明「这一对手工裁定」还是「交 LLM」——
+旧版 JSON5 的 same: true/false 只有两档，想表达「交 LLM」只能不写，与「忘了写」分不开。
+"""
+_cache = SentenceTaskCache(max_size=config.CACHE_MAX_SIZE)
+"""句法分析结果缓存，与筛选阶段共用同一套 LTP 推理与缓存逻辑"""
+
+
+# --------------------------------------------------------------------------
+# 一、配置读取
+# --------------------------------------------------------------------------
+
+
+def load_json5(path: str | Path) -> Any:
+    """读 json5 配置文件（与 sentenceFilters.py 用同一种格式，支持注释与尾逗号）"""
+    with open(path, "r", encoding="utf-8") as f:
+        return json5.load(f)
+
+
+def _table_path(path: str | Path | None, table: str, corpus_type: str | None) -> Path:
+    """四张表的路径：显式给的 path 优先，否则按语料类型解析（见 config_path）
+
+    默认值刻意不写成 `path=常量`：那样在 import 时就把路径绑死成方位词那张，忘了传类型的
+    趋向动词调用会静默读错表——正是「按类型分组」要消灭的东西。
+    """
+    return Path(path) if path is not None else config_path(table, corpus_type)
+
+
+def load_alter_rules(path: str | Path | None = None, *, corpus_type: str | None = None) -> dict:
+    """读替换规则表，文件不存在时返回空表（等价于“不改写”）
+
+    表形如 {"groups": [{"words": ["上", "中", "里"], "replacements": ["中", "里"]}, ...]}：
+    groups 是一串组，每组是一个对象，两个字段各管一件事——
+
+    - words：命中这一组的关注词（关注词是其中之一，本组的规则才生效）；
+    - replacements：要换成的词，逐个替换原句 index 处的 token，**排除关注词本身**。
+
+    一个词可以出现在多组里，各组产出的替换词并集去重（先出现的组优先）。
+    表填得不对由 validate_alter_rules 在构造 agent 时当场报（见 AlterAgent）。
+
+    Args:
+        path (str | Path | None): 显式表路径；None 时按 corpus_type 解析
+        corpus_type (str | None): 语料类型（中文名或别名）；None = DEFAULT_CORPUS_TYPE
+    """
+    path = _table_path(path, "alter_rules", corpus_type)
+    if not path.exists():
+        return {"groups": []}
+    return load_json5(path) or {"groups": []}
+
+
+def load_feature_classes(path: str | Path | None = None, *, corpus_type: str | None = None) -> list[dict]:
+    """读语义特征类别表，返回其中已填写 key 的类别列表。
+
+    返回空列表表示该类语料的特征类别尚未定义，此时 feature_agent 退化为让模型自由抽取特征。
+    """
+    path = _table_path(path, "feature_classes", corpus_type)
+    if not path.exists():
+        return []
+    classes = (load_json5(path) or {}).get("classes", [])
+    return [c for c in classes if isinstance(c, dict) and c.get("key")]
+
+
+def load_schema_table(path: str | Path | None = None, *, corpus_type: str | None = None) -> dict:
+    """读 schema 表，文件不存在时返回空表（查表必然未命中，走 LLM 兜底）
+
+    表按**词条**分组，一个词条下挂若干编号的图式，schema 名就是「组名 + 编号」：
+        {"schemas": {"<组名>": {"words": ["<词形>", ...],
+                                "<编号>": {"description": "...", "match": [...]}}}}
+    组名是这一类的代表词形；words（可省，与编号同级）列出这一类还覆盖哪些词形，两者合起来
+    决定收窄（见 _narrowed_groups）：关注词落在 {组名} ∪ words 里就归这一组。没写 words 的
+    词条只认与组名逐字相等的关注词。同形词（「上」既是方位词也是趋向动词）在各自的类型目录里
+    各收各的词条，靠 match 与 description 区分用法——这是把表按语料类型分组的另一个理由。
+    """
+    path = _table_path(path, "schema_table", corpus_type)
+    if not path.exists():
+        return {"schemas": {}}
+    return load_json5(path) or {"schemas": {}}
+
+
+JUDGE_CELL_SAME = "√"
+"""判定表格子：两句意义相同——直接出结论，不调 LLM"""
+JUDGE_CELL_DIFFERENT = "×"
+"""判定表格子：两句意义不同——直接出结论，不调 LLM"""
+JUDGE_CELL_LLM = "○"
+"""判定表格子：交大模型做进一步判断——走 LLM 兜底"""
+JUDGE_NO_SCHEMA = "未判出"
+"""判定表的行/列标签：schema 名为 None（没判出 schema）那一路
+
+那一侧没有 schema，判定表也无从按 schema 断言，故它的对角格自动填 ○（见 load_judge_table）；
+它与别的 schema 的组合照常由作者逐格裁定。
+"""
+
+JUDGE_CELLS: tuple[str, ...] = (JUDGE_CELL_SAME, JUDGE_CELL_DIFFERENT, JUDGE_CELL_LLM)
+"""格子上合法的三种符号。第四类「留空」是非法：说明这张表没填完（见 lookup_judgement）"""
+
+JUDGE_ILLEGAL_SHOWN = 8
+"""非法格的汇总最多列出几个：一张表填了一半时非法格可能上百条，全列出来把启动打印淹掉"""
+
+JUDGE_CELL_ALIASES: dict[str, str] = {
+    # 输入法/Excel 打出来的异体与顺手敲的 ASCII 替身 -> 规范符号。
+    # normalize() 是 NFKC，折不动这几组（〇 U+3007、✓ U+2713、✕ U+2715 都不在兼容区里），
+    # 只能显式列；漏掉一个，Excel 里打的 ○ 就会静默变成「非法留空」。
+    "✓": JUDGE_CELL_SAME,
+    "✔": JUDGE_CELL_SAME,
+    "v": JUDGE_CELL_SAME,
+    "V": JUDGE_CELL_SAME,
+    "✕": JUDGE_CELL_DIFFERENT,
+    "✖": JUDGE_CELL_DIFFERENT,
+    "x": JUDGE_CELL_DIFFERENT,
+    "X": JUDGE_CELL_DIFFERENT,
+    "〇": JUDGE_CELL_LLM,
+    "◯": JUDGE_CELL_LLM,
+    "o": JUDGE_CELL_LLM,
+    "O": JUDGE_CELL_LLM,
+}
+"""格子上认的异体符号（键已规范化），值一律是 JUDGE_CELLS 里的规范符号"""
+
+
+def _judge_cell_symbol(raw: str) -> str | None:
+    """格子的原始文本 -> 规范符号；留空或认不出的符号返回 None（非法）
+
+    两种 None 由调用方按原文区分：「留空」是这一侧没写（对称的另一侧写了就行），
+    「写了却认不出」是要报出来的配置错（见 _judge_table_from_rows）。
+    """
+    text = normalize(raw)
+    if text in JUDGE_CELLS:
+        return text
+    return JUDGE_CELL_ALIASES.get(text)
+
+
+def _judge_label(name: str | None) -> str:
+    """schema 名 -> 表里的标签：None 那一路用 JUDGE_NO_SCHEMA，其余与读表同一口径（normalize）
+
+    两边都用 normalize 是为了对齐「全角/半角、夹了空格」这类手写差异；表里的标签在
+    _judge_table_from_rows 里也是这么规整的，于是 (schema 名, 标签) 的比较是同一把尺子。
+    """
+    return normalize(JUDGE_NO_SCHEMA if name is None else str(name))
+
+
+def _judge_table_from_rows(raw_rows: Iterable[list[str]]) -> dict:
+    """CSV 的原始行 -> 判定表字典（格式与字段含义见 load_judge_table）"""
+    # 行号按原始文件算、不按过滤后的位置算：以 # 开头的行虽然跳过，它占掉的表格行不会消失，
+    # 而这张表是拿 Excel 打开填的，problems 里的行号要能直接对上所见的行。
+    rows = [
+        (line_no, list(row))
+        for line_no, row in enumerate(raw_rows, start=1)
+        if row and not normalize(row[0]).startswith("#")
+    ]
+    problems: list[str] = []
+    if not rows:
+        return {"cells": {}, "labels": [], "filled": 0, "problems": problems}
+
+    _, header = rows[0]
+    body = rows[1:]
+
+    # 标签：空标签直接丢掉（Excel 存盘常留尾部空列），重复的只认第一次出现的位置。
+    # 两张对齐表里 "" 表示「这一行/列不收数据」，后面按标签取格时一并跳过。
+    columns: list[str] = [""]
+    for index, cell in enumerate(header[1:], start=1):
+        label = normalize(cell)
+        if not label:
+            columns.append("")
+        elif label in columns:
+            columns.append("")
+            problems.append(f"表头第 {index + 1} 列的标签 {label!r} 重复，只按第一次出现的位置取数据")
+        else:
+            columns.append(label)
+
+    row_labels: list[str] = []
+    for line_no, row in body:
+        label = normalize(row[0]) if row else ""
+        if not label:
+            row_labels.append("")
+        elif label in row_labels:
+            row_labels.append("")
+            problems.append(f"第 {line_no} 行首列的标签 {label!r} 重复，只按第一次出现的位置取数据")
+        else:
+            row_labels.append(label)
+
+    labels: list[str] = []
+    for label in columns + row_labels:
+        if label and label not in labels:
+            labels.append(label)
+
+    # 先按「逻辑对」把格子的原文收齐：对称的两格是同一个逻辑对，行主序先出现的优先。
+    # 一格里留空、对称那格写了，是「只写一侧」的正常写法（表是对称的），不算非法；
+    # 两侧都没写、或哪一侧写了却认不出（符号打错），都算非法——这正是按对判、而不是
+    # 按格判的理由。原文和符号一起留着，「留空」与「写了但认不出」才分得开。
+    per_pair: dict[tuple[str, str], list[tuple[str, str | None]]] = {}
+    for index, (line_no, row) in enumerate(body):
+        row_label = row_labels[index]
+        for col_index, cell in enumerate(row):
+            if col_index == 0:
+                continue
+            column = columns[col_index] if col_index < len(columns) else ""
+            text = normalize(cell)
+            if not row_label or not column:
+                if text:
+                    problems.append(
+                        f"第 {line_no} 行第 {col_index + 1} 列的格子 {cell!r} 有一侧没有标签，取不到"
+                    )
+                continue
+            if row_label == column:
+                # 对角线由格式定，不归作者写（见 load_judge_table 的说明）
+                auto = _judge_diagonal(row_label)
+                if text and _judge_cell_symbol(cell) != auto:
+                    problems.append(
+                        f"对角格 {row_label!r}×{row_label!r} 被写成 {cell!r}，"
+                        f"对角线一律按格式自动定为 {auto}，这一格不算数"
+                    )
+                continue
+            pair = (row_label, column) if row_label <= column else (column, row_label)
+            per_pair.setdefault(pair, []).append((text, _judge_cell_symbol(cell)))
+
+    cells: dict[tuple[str, str], str] = {}
+    illegal: list[str] = []
+    # filled 在分类之前算好：分类要按「整表有没有人填过」分档，边循环边累加会受迭代顺序影响
+    # （先遇到空对就还是 0，后遇到写过的对才变 1，同一张表换个行序结论就不同）。
+    filled = sum(1 for cells_of_pair in per_pair.values() if any(text for text, _ in cells_of_pair))
+    for (label_a, label_b), written_cells in per_pair.items():
+        # 写了却认不出的符号不能当成「这一侧没写」：另一侧有值时会静默按那一侧出结论，
+        # 作者的这一格就被吞了。按非法处理，至少启动时看得见。
+        garbled = [text for text, symbol in written_cells if text and symbol is None]
+        written = [symbol for _, symbol in written_cells if symbol]
+        if garbled or not written:
+            # 空模板（filled 为 0）里两侧都没写的对是未命中、不是非法——与 lookup_judgement
+            # 同一口径（查表那边也是 filled 为 0 一律 miss），否则启动会先打一条
+            # 「N 格留空（非法）」的警告、紧接着又打「表里没有已填内容」的提示，自相矛盾。
+            if filled:
+                illegal.append(f"{label_a}×{label_b}")
+            continue
+        symbol = written[0]
+        if any(other != symbol for other in written[1:]):
+            problems.append(
+                f"格子 {label_a}×{label_b} 与它对称的那格对不上（{'、'.join(written)}），"
+                f"按行主序先出现的 {symbol} 为准"
+            )
+        cells[(label_a, label_b)] = symbol
+        cells[(label_b, label_a)] = symbol
+
+    # 表头或首列列了名字、却没有那一格（某行短了一截、只写了行没写列）同样是「留空」：
+    # 查表时本就按非法处理（见 lookup_judgement），诊断里就不能整类缺席——否则这批对只在
+    # 运行期以 judge_lookups["illegal"] 露面，作者却看不到该补哪一行。
+    # 作者一格都没填的空模板不在此列（filled 为 0）：那时全表算未命中，不是非法。
+    if filled:
+        for left in range(len(labels)):
+            for right in range(left + 1, len(labels)):
+                pair = (labels[left], labels[right])
+                if pair[0] > pair[1]:
+                    pair = (pair[1], pair[0])
+                if pair not in per_pair:
+                    illegal.append(f"{pair[0]}×{pair[1]}")
+
+    if illegal:
+        # 插在最前：这一条是「该补哪些格」的汇总，而 config_report 只截前 5 条——
+        # 排在末尾时，越是格子缺得多（越需要这句）越容易正好被截掉。
+        # 「还有 N 格」从实际列出的条数算，不另写一个 8：两处各写一遍时，改了截断长度
+        # 而漏改这一处，就会出现「列了 9 格、还说还有 1 格」的对不上账。
+        shown = illegal[:JUDGE_ILLEGAL_SHOWN]
+        rest = len(illegal) - len(shown)
+        problems.insert(
+            0,
+            f"{len(illegal)} 格留空或符号认不出（非法）：{'、'.join(shown)}"
+            + (f"，还有 {rest} 格" if rest else "")
+            + "；这些格查表时如实降级交 LLM",
+        )
+
+    for label in labels:
+        cells[(label, label)] = _judge_diagonal(label)
+
+    return {"cells": cells, "labels": labels, "filled": filled, "problems": problems}
+
+
+def _judge_diagonal(label: str) -> str:
+    """对角格自动填什么：同一个 schema 按定义同义；「未判出」两侧都没 schema，表无权断言"""
+    return JUDGE_CELL_LLM if label == normalize(JUDGE_NO_SCHEMA) else JUDGE_CELL_SAME
+
+
+def load_judge_table(path: str | Path | None = None, *, corpus_type: str | None = None) -> dict:
+    """读判定表（CSV 矩阵），文件不存在时返回空表（查表必然未命中，走 LLM 兜底）
+
+    表长这样（首行首列是 schema 名，格子是结论符号）：
+
+        ,里1,里2,外1,未判出
+        里1,,×,○,○
+        外1,,,√,○
+        未判出,,,,
+
+    格子只能是三种符号之一，第四类「留空」是**非法**（这张表没填完）：
+
+        √  两句意义相同 -> 直接出结论，不调 LLM（lookup_judgement 记 source="table"）
+        ×  两句意义不同 -> 直接出结论，不调 LLM（同上）
+        ○  交大模型做进一步判断 -> 走 LLM 兜底（source="defer"）
+        留空（或认不出的符号）-> 非法：启动打警告，落到处如实降级交 LLM（source="illegal"）
+
+    约定：
+      1. 匹配是对称的：(里1, 外1) 与 (外1, 里1) 是同一个逻辑对，写一侧即可；两侧都写且
+         不一致算冲突（记 problem，按行主序先出现的为准）。**留空**指这一对没有可用的结论，
+         三种情形都算非法、都记进 problems（启动时打警告）：两侧都没写、哪一侧写了却认不出
+         （符号打错）、表头或首列列了名字却没有那一格（某行短了一截、只写了行没写列）。
+      2. 表里没列出的 schema 名（如运行期 llm_free 自由命名的 里3）算未命中 -> 交 LLM，
+         不报警。这是「只列想手工裁定的那些」的口子，也是这张表不必穷举的理由。
+      3. schema 名为 None（没判出 schema）那一路的标签写 未判出 常量（JUDGE_NO_SCHEMA）。
+      4. 对角线自动填，作者不必写、写了也不算数：真实 schema 结对角格 √，未判出 的对角格 ○。
+         自动填的格子不计入 filled，于是「只写了表头」仍算空表（走既有的空表提示与兜底）。
+      5. 以 # 开头的行整行跳过，供作者写理由——格子只放符号，没有旧版 JSON5 的 note 字段。
+         problems 里的行号仍按文件实际行算，跳过注释行也不会错位。
+      6. 文件用 utf-8-sig 读（Excel 存盘会带 BOM），csv.reader 配 newline="" 以正确处理 CRLF。
+
+    格式说明只能写在这里：CSV 放不下注释，而这张表是要用 Excel 打开填的。
+    `problems` 里是给人看的诊断（非法格、冲突、重复标签），跑批入口启动时打印。
+
+    Returns:
+        dict: {"cells": {(标签 a, 标签 b): 符号}——只有符号认得出的对才进来, "labels": [标签, ...],
+               "filled": 作者写过的对数（镜像两格算一格、自动对角线不算；符号认不出的也算写过，
+                         否则整表只剩认不出的符号时会被当成空模板，落点从 illegal 滑成 miss）,
+               "problems": [诊断字符串, ...]}
+    """
+    path = _table_path(path, "judge_table", corpus_type)
+    if not path.exists():
+        return {"cells": {}, "labels": [], "filled": 0, "problems": []}
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        return _judge_table_from_rows(csv.reader(f))
+
+
+# --------------------------------------------------------------------------
+# 二、语料读取与切片处理
+# --------------------------------------------------------------------------
+
+
+def read_corpus(
+    path: str | Path,
+    limit: int | None = None,
+    offset: int = 0,
+    *,
+    judge_only: bool = False,
+    prepared_only: bool = False,
+) -> list[dict]:
+    """读 results/location_corpus.jsonl 一类语料
+
+    每行形如：
+        {"sentence": ["在", "桌子", "上", "。"], "source_file": "...",
+         "filter_methods": ["locality_phrase"], "match_tree": [{"index": 2, "word": "上", "children": []}]}
+
+    Args:
+        path (str | Path): 语料文件路径
+        limit (int, optional): 最多读多少行，None 表示不限；<=0 明确返回空列表
+        offset (int): 跳过多少行；judge_only=True 时按**过滤后的可用语料**计数
+        judge_only (bool): True 时只返回 screening_status 为 true/no_llm 的记录；
+            旧语料（没有 screening 字段）按 no_llm 处理。默认 False 保持旧调用行为。
+
+    行号分层保留（D2），三样各是各的口径，不要互相覆盖：
+        source_line_no   源语料（抽样前那份）里的行号，由 word_sampler 写入，落到产物里不再变
+        input_line_no    本次输入文件里的物理行号（从 1 开始）
+        line_no          与 input_line_no 同值，是历史字段名：排序键按它算；
+                         记录 id 的第二段现在优先用 source_line_no（见 record_line_no），
+                         取不到才退回它。保留原名才能让旧产物与对账脚本继续工作
+
+    另写 source_document_no：来源文档在**本次输入**里第几篇（1 起，按首次出现顺序）。
+    它就是 id 的首段（见 record_document_no），所以 --offset 从语料中间起跑时，前面没遇到的
+    文档不占号，编号会从头重排——id 本来就是文件内口径，跨文件溯源看 sentence_id。
+
+    旧写法无条件把 line_no 覆盖成当前行号，于是抽样阶段写的源行号被吃掉：文件重排、
+    重新抽样或合并之后就再也说不清这条记录原先是哪一句。现在源行号先让位给
+    source_line_no，再写本次的行号——两个都有值时互不干扰。
+
+    Returns:
+        list[dict]: 每条记录原样返回，另加上述三个行号字段
+    """
+    if limit is not None and limit <= 0:
+        # 计数限制为非正数时明确表示“取 0 条”，不能先读入一条再因 len>=limit 退出。
+        return []
+    records: list[dict] = []
+    document_numbers: dict[str, int] = {}
+    eligible_seen = 0
+    with open(path, "r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            if not line.strip():
+                continue
+            if not (judge_only or prepared_only) and line_no <= offset:
+                continue
+            record = json.loads(line)
+            if judge_only or prepared_only:
+                if prepared_only:
+                    import corpus_pairs
+
+                    if "pair_schema_version" not in record:
+                        raise ValueError(
+                            f"{path} 第 {line_no} 行不是替换阶段产出的句子对；"
+                            "请先运行 sentence_replace.py，再将其输出传给标注入口"
+                        )
+                    eligible = corpus_pairs.is_prepared_pair(record)
+                else:
+                    eligible = sentence_screening.is_judgement_eligible(record)
+                if not eligible:
+                    continue
+                eligible_seen += 1
+                if eligible_seen <= offset:
+                    continue
+            # 记录里已带行号（抽样产物写的是源行号）就先把它留成 source_line_no，
+            # 别用本次的物理行号顶掉它
+            source_line_no = record.get("source_line_no")
+            if source_line_no is None:
+                source_line_no = record.get("line_no")
+            record["source_line_no"] = source_line_no
+            record["input_line_no"] = line_no
+            record["line_no"] = line_no
+            # 来源文档编号按本次输入里的首次出现顺序给；上游残留的旧编号一律重算，
+            # 否则两份语料拼在一起时会出现同一编号指两篇文档
+            document = source_document_id(record)
+            if document is None:
+                record.pop("source_document_no", None)
+            else:
+                if document not in document_numbers:
+                    document_numbers[document] = len(document_numbers) + 1
+                record["source_document_no"] = document_numbers[document]
+            records.append(record)
+            if limit is not None and len(records) >= limit:
+                break
+    return records
+
+
+SOURCE_DOCUMENT_KEYS = ("source_file", "source_document_id", "source_document")
+"""记录里「这条语料出自哪篇原始文章」的候选字段，按优先级取第一个非空值
+
+筛选阶段主要写 source_file（见 entry_in_win/entry_in_linux 的记录构造），它是文件的完整
+路径；同一篇文章被拆成多个输入文件时，靠它区分来源。"""
+
+
+def source_document_id(record: dict) -> str | None:
+    """这条语料出自哪一篇原始文章（source_file 等字段的第一个非空值）
+
+    稳定 ID 要有它：同一句文本可能来自多篇不同文章，**内容相同不等于来源相同**，
+    去重（看内容哈希）与溯源（看来源）是两件事，不能并成一个字段。
+    """
+    for key in SOURCE_DOCUMENT_KEYS:
+        value = (record or {}).get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def content_hash(text: str | Iterable[str]) -> str:
+    """句子文本的指纹（查重用）：先按 normalize 规整，再取 sha1 的前 12 位
+
+    参数是分词切片或拼好的句子都行（join_slice 后再 normalize）。它**只回答「这两句文本
+    是不是一样」**，不含来源信息：同一句出现在两篇文章里哈希相同，那正是它的用途
+    ——查重。要与来源区分时另看 source_document_id。
+    """
+    body = join_slice(text) if not isinstance(text, str) else text
+    return hashlib.sha1(normalize(body).encode("utf-8")).hexdigest()[:12]
+
+
+def record_document_no(record: dict) -> int | None:
+    """记录 id 首段要用的来源文档编号：本次输入里第几篇来源文档（1 起）
+
+    read_corpus 按首次出现顺序写进顶层；落盘后的结果记录把它收在 `source` 块里
+    （见 spatial_graphs.serialize_pair）。两种形状都认，先看 `source` 块再看顶层。
+
+    只接受正整数（排除 bool）、整值浮点数与纯数字字符串；取不到或不是正整数都返回
+    None——0 与 "?" 不是「第几篇文档」，不能拼进 id。
+    """
+    source = record.get("source") if isinstance(record, dict) else None
+    containers = [source, record] if isinstance(source, dict) else [record]
+    for container in containers:
+        if not isinstance(container, dict):
+            continue
+        value = container.get("source_document_no")
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int) and value >= 1:
+            return value
+        if isinstance(value, float) and value.is_integer() and value >= 1:
+            return int(value)
+        if isinstance(value, str) and value.strip().isdigit():
+            number = int(value.strip())
+            if number >= 1:
+                return number
+    return None
+
+
+def record_line_no(record: dict) -> int | None:
+    """记录 id 第二段要用的行号：源行号优先，其次输入行号，最后历史字段 line_no
+
+    两种记录形状都认：跑批中的语料记录把行号放在顶层（见 read_corpus），
+    落盘后的结果记录把它们收在 `source` 块里（见 spatial_graphs.serialize_pair）。
+    每个键先看 `source` 块、再看顶层，三个键之间严格按上面的优先序。
+
+    只接受整数（排除 bool）、整值浮点数与纯数字字符串；取不到或不是数字都返回 None，
+    绝不把 "None" / "1.0" 这类字面量拼进 id。
+    """
+    source = record.get("source") if isinstance(record, dict) else None
+    containers = [source, record] if isinstance(source, dict) else [record]
+    for key in ("source_line_no", "input_line_no", "line_no"):
+        for container in containers:
+            if not isinstance(container, dict):
+                continue
+            value = container.get(key)
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, int):
+                return value
+            if isinstance(value, float) and value.is_integer():
+                return int(value)
+            if isinstance(value, str) and value.strip().isdigit():
+                return int(value.strip())
+    return None
+
+
+def sentence_id(record: dict) -> str | None:
+    """与文件顺序无关的句子稳定 ID：`来源文档#源行号#文本指纹`
+
+    三段各管一件事，缺一段就换成占位符而不是编造：
+        来源文档   source_document_id（区分同文多源；缺失记 "unknown-doc"）
+        源行号     source_line_no，其次 input_line_no（缺失记 "?"）
+        文本指纹   content_hash(sentence)（内容变了 ID 就变，重排不影响）
+
+    为什么不用纯行号：文件重排、重新抽样或换一份输入后，同一个行号指的是另一句，
+    两份产物的 ID 会撞在一起却说的不是同一件事（D2）。为什么不用纯内容哈希：
+    同一句在多篇文章里各出现一次时它们是不同的样本，合并后会被误判成重复。
+
+    Returns:
+        str | None: 稳定 ID；记录里连句子都没有（坏记录）时返回 None，不编造。
+    """
+    sentence = (record or {}).get("sentence")
+    if not sentence:
+        return None
+    line_no = (record or {}).get("source_line_no")
+    if line_no is None:
+        line_no = (record or {}).get("input_line_no")
+    return "#".join(
+        (
+            source_document_id(record) or "unknown-doc",
+            str(line_no) if isinstance(line_no, int) else "?",
+            content_hash(sentence),
+        )
+    )
+
+
+def candidate_key(sentence_id_: str | None, focus_index, replacement) -> str | None:
+    """候选唯一键 (sentence_id, focus 位置, replacement)（D1）
+
+    「抽样单元」「候选单元」「最终有效句对」是三个不同的口径，只有候选单元需要唯一键：
+    一句抽中两个词、两个词又各有好几个替换词，(句子, 位置, 替换词) 才唯一确定一条候选。
+    sentence_id 已经含来源与文本指纹，所以跨文件也不会撞。
+
+    focus_index 是原句分词里的 token 下标（0 基），不是「第几个关注词」：同一句两处同一个
+    词（上@3 与 上@5）各是一个位置，光看词分不开。
+
+    Returns:
+        str | None: 唯一键；缺 sentence_id 或替换词时返回 None（不拼出不完整的键）。
+    """
+    if not sentence_id_ or not isinstance(replacement, str) or not replacement:
+        return None
+    return f"{sentence_id_}|{focus_index if focus_index is not None else '?'}|{replacement}"
+
+
+def join_slice(sentence_slice: Iterable[str]) -> str:
+    """把分词切片拼回句子字符串
+
+    语料里的标点是独立 token（有的还带尾空格，如 ": "），所以直接无缝拼接，
+    不做任何再切分或补空格。
+    """
+    return "".join(sentence_slice)
+
+
+def normalize(text: str) -> str:
+    """规范化句子文本，用于查表、去重和比较
+
+    统一全角/半角、去掉所有空白，这样 "软件上 说" 与 "软件上说" 会落到同一个键上。
+    """
+    return "".join(unicodedata.normalize("NFKC", text).split())
+
+
+def collect_span(node: dict) -> list[int]:
+    """收集匹配树节点覆盖的所有 token 下标（含各级 children）
+
+    match_tree 的一个节点形如 {"index": 4, "word": "上", "children": [{"index": 2, "word": "软件"}]}：
+    index/word 是方位词本身，children 是它的定语等修饰成分。改写只动方位词那个 token，
+    修饰成分原位保留（“硬件上” -> “硬件中”），所以这里把整个 span 记下来供结果留档。
+    """
+    indices = []
+    if isinstance(node.get("index"), int):
+        indices.append(node["index"])
+    for child in node.get("children") or []:
+        indices.extend(collect_span(child))
+    return sorted(set(indices))
+
+
+def pick_word_info(record: dict) -> dict | None:
+    """从语料记录里取出待改写的词语信息
+
+    取 match_tree 的第一个节点（该句被哪条筛选规则命中，此处就是哪个词）。
+    没有 match_tree（或它不是节点列表）或节点缺 index 时返回 None，调用方据此判为改写成不了对。
+    """
+    tree = record.get("match_tree") or []
+    if not isinstance(tree, list) or not tree:
+        return None
+    node = tree[0]
+    if not isinstance(node, dict) or not isinstance(node.get("index"), int):
+        return None
+    return node
+
+
+# --------------------------------------------------------------------------
+# 三、关注词：这条语料是为哪个方位词/趋向动词抽出来的
+# --------------------------------------------------------------------------
+
+
+def _method_family(method: str) -> str:
+    """筛选规则名 -> 它盯的是哪一族词（判不出来的给空串）
+
+    direction_verb_as_center 与 *_one_complement / *_two_complement 盯的都是趋向动词
+    （互补规则的目标词在子节点里，见 word_sampler 模块 docstring），locality_* 盯方位词。
+    """
+    if method.startswith("direction_verb") or method.endswith("_complement"):
+        return "趋向动词"
+    if method.startswith("locality"):
+        return "方位词"
+    return ""
+
+
+@lru_cache(maxsize=1)
+def _focus_vocab_cached() -> tuple[tuple[str, frozenset[str]], ...]:
+    """两份词表的缓存：返回元组，调用方拿不到可变对象、改不坏缓存
+
+    derive_vocab 要解析筛选配置（实测 44ms/次），而 pick_focus_word 每条记录都要调，
+    每条都推一遍词表是纯浪费。
+    """
+    return tuple(
+        (kind, frozenset(word_sampler.derive_vocab(path, prefixes)[0]))
+        for kind, (path, prefixes) in FOCUS_VOCAB_SPECS.items()
+    )
+
+
+def load_focus_vocab() -> dict[str, set[str]]:
+    """关注词的两份词表 {"方位词": {...}, "趋向动词": {...}}（浅拷贝，改不到缓存里那份）
+
+    跑批启动时打印一次，顺带把配置问题（筛选配置改名、取词表的前缀对不上）当场暴露出来。
+    """
+    return {kind: set(words) for kind, words in _focus_vocab_cached()}
+
+
+def _record_family(filter_methods: Iterable[str]) -> str:
+    """这条语料是哪条规则抽出来的 -> 它盯的那一族词（判不出、或两族都沾时给空串）
+
+    用于两处：破「上/下」两表都收时的平局，以及把 level 2 的候选限制在本族的词表里。
+    两族同时出现（如一条规则的 filter_methods 里既有 locality_* 又有 *_complement）时给空串，
+    不按列表顺序猜——顺序变了结论就变，那不是判据。
+    """
+    families = {_method_family(str(method)) for method in filter_methods or []}
+    families.discard("")
+    return families.pop() if len(families) == 1 else ""
+
+
+def focus_kind(
+    word: str, filter_methods: Iterable[str] = (), vocab: dict[str, set[str]] | None = None
+) -> str:
+    """这个词属方位词还是趋向动词；判不出来给空串
+
+    以词表归属为准。只有两张表都收时才用筛选规则族破平局——实测两表交集只有「上」「下」，
+    而两份语料的两族规则互斥（方位词语料 locality_*，趋向动词语料 direction_verb* / *_complement）。
+
+    词不在任何一张表里（如回落 match_tree[0] 时取到的搭配动词 走/带）一律给空串：
+    绝不能因为它所在的记录带 _complement 就标成「趋向动词」，那是假信息。
+    """
+    vocab = load_focus_vocab() if vocab is None else vocab
+    kinds = [kind for kind, words in vocab.items() if word in words]
+    if len(kinds) == 1:
+        return kinds[0]
+    if not kinds:
+        return ""
+    return _record_family(filter_methods)
+
+
+def _focus_entry(node: dict, source: str, filter_methods: Iterable[str], vocab: dict[str, set[str]]) -> dict:
+    """把节点收成向下传的那三样：index、词本身、类别（刻意不带 children 与规则组信息）"""
+    word = node.get("word")
+    return {
+        "index": node.get("index"),
+        "word": word,
+        "kind": focus_kind(word, filter_methods, vocab),
+        "source": source,
+    }
+
+
+def pick_focus_word(record: dict, vocab: dict[str, set[str]] | None = None) -> dict | None:
+    """这条语料「本次需要重点关注的词」——改写与五个 LLM agent 共用的一处口径
+
+    这就是 pick_focus_words 的首元素：本函数只回答"先改哪个"，"句里还有哪些位置要改"
+    见 pick_focus_words（改写逐位置展开，一条记录仍只改一个位置）。
+
+    三级回落，取到的是哪一级记在返回值的 source 里：
+
+    1. "sampled_word"：语料经 word_sampler.py 抽样而带上的字段（现写法是 `sampled_words`，
+       一句一份记录、抽中的词全在里面；旧的 `sampled_word` 仍认），有就直接用。
+       **只展开这些词命中的位置**（D1），句内其余目标词不再参与——见 pick_focus_words。
+       抽样只落了词、没落位置，同一个词在句子里出现 ≥2 次时无从区分，这里取 index 最小的那个
+       （实测 direction 3.3%、location 7.2% 的抽样记录如此）。实测这批记录的 index 与
+       sentence[index] 100% 对齐，alter_sentence 的「index 处的词与 word 不一致」守卫不会误伤。
+       抽样用的是**那份语料自己的词表**（word_sampler.CORPUS_SPECS），所以换一份 --vocab 抽出来的
+       语料，这里的 sampled_word 可能一个都不在当前两张表里，此时会静默回落 level 2、source 记成
+       "vocab"——汇总里的 focus_sources 就是这条的判据：抽样语料若一条 "sampled_word" 都没有，
+       说明抽样词表与本配置对不上。
+       这一级没有 ② 那道补语位偏好——要不要加得先看抽样语料上有没有这个形状：实测两份抽样语料里
+       sampled_word 命中 ≥2 处的记录共 54（direction）/ 1274（location）条，其中取到排在搭配动词
+       之前的 0 条，所以暂时不必加，加了也是空转。
+    2. "vocab"：按词表在 match_tree 里递归找（口径见 word_sampler.target_nodes）。命中多个时
+       **取 index 最小的目标词节点，不回落 match_tree[0]**——match_tree[0] 常常是搭配动词
+       （走/带/凑），拿它顶掉一个真正的目标词与「本次关注的词」直接冲突。取 index 最小之前有
+       两道收窄（顺序即下面两条，缺一不可）：
+
+       ① **候选先按本记录的规则族收窄**：两族取并集会把「被 _complement 规则当补语收进来的
+       方位词」选成关注词。实测收窄前后：direction 原始语料 156601 条里 959 条（0.61%）
+       从错的方位词改回真目标词，location 原始语料 1530335 条一条都没动（本来就全对）；
+       两份语料都 0 条落到「本族零命中」那条退路上。收窄后与 word_sampler 的抽样口径
+       （按语料分表）也一致。只有本族一个词都没命中时才退回并集（纯防御，实测触发 0 次）。
+
+       ② **本族候选里再优先「排在父节点之后」的那个**（口径见 word_sampler.pre_head_indices）。
+       ①挡不住两种残留：同一个词在动词前后各出现一次（上/下 两张表都收，族收窄筛不掉它）、
+       以及动词前那个是另一个本族词。实测 ② 在 direction 语料上改动 91 条（0.058%，含 13 条
+       同词、78 条同族异词，如 撒上 取到 上@39 而不是排在「撒」前的 上@37、滚去 取到 去@12
+       而不是 向下 的 下@10），location 语料 0 条改动——方位词的候选多是规则树的根（无父节点），
+       这条偏好对它们不适用，所以只在本族生效，以后 locality 规则把别的结构收进子节点也不会被它误伤。
+       本族候选全都排在父节点之前时退回原样（direction 语料实测 167 条，如「往下去走」的树把
+       下@59 去@60 都挂在 走@61 之前——偏好无可偏好，只好按 index 最小取；location 语料 0 条）。
+    3. "match_tree"：一个目标词节点都没找到（纯防御，实测两份语料触发 0 次）时，回落
+       pick_word_info 的 match_tree[0]。此时词多半不在词表里，kind 会是空串。
+
+    刻意不把 pick_word_info 合并进来：两者语义在 *_complement 规则下本就不同——一个取
+    「被规则命中的待改写词」，一个取「词表命中的目标词」（见 word_sampler 模块 docstring），
+    合并会同时改错改写口径与抽样口径。
+
+    Returns:
+        dict | None: {"index", "word", "kind", "source"}，另按位置挂
+            ``grounding``（前序空间标注）与 ``screening``（语料筛选判定）；没有 match_tree 时返回 None。
+            kind 取 "方位词" / "趋向动词" / ""（判不出来就是空串，不猜）。
+    """
+    entries = pick_focus_words(record, vocab)
+    return entries[0] if entries else None
+
+
+def pick_focus_words(record: dict, vocab: dict[str, set[str]] | None = None) -> list[dict]:
+    """这条语料里**全部**要参与改写的词，按"先改哪个"的优先序排列
+
+    公开入口：在 `_pick_focus_words` 的结果上给每个位置挂一份前序空间标注
+    （`grounding`，见 select_grounding）。挂在这里而不是各个 agent 里，是因为所有图
+    （single / pair / alter_check / synonym）与 all_in_one 都从这一个函数取关注词；
+    同一条消息的拼法因此只有一处，缓存键也自然把标注算进去。
+    """
+    return [_with_grounding(entry, record) for entry in _pick_focus_words(record, vocab)]
+
+
+def _pick_focus_words(record: dict, vocab: dict[str, set[str]] | None = None) -> list[dict]:
+    """pick_focus_words 的正身（不挂前序空间标注）
+
+    与 pick_focus_word 是同一个口径的两种读法：本函数返回全部位置（一条语料里每个目标词
+    各是一个位置，改写时逐位置各出一批候选），pick_focus_word 就是本函数的首元素
+    ——`pick_focus_words(r)[0] == pick_focus_word(r)` 对任何记录都成立，所以老调用点的
+    行为一字不变（含 --candidate-index 0）。
+
+    取词的三个来源（写进每一份返回值的 source 里）与逐级收窄的取舍见 pick_focus_word 的
+    docstring；这里只说与"选一个"不同的两处：
+
+    ① **两道收窄一个过滤、一个排序**，别把它们看成同一类：
+       - 族收窄（_record_family）是**硬过滤**：`上面` 被 _complement 规则当补语收进趋向动词
+         记录的 children 时，它不是这条记录的目标词（见 word_sampler.target_nodes 的第 1 条
+         约束），因此不展开——展开等于替一个"从未按它筛出"的词造样本。本族一个都没命中时
+         退回并集（纯防御，实测触发 0 次），与取一个时一致。
+       - 补语位偏好是**排序**：只在趋向动词族生效，把"排在父节点之后"的位置挪到前面。
+         排序而不是过滤，是为了让动词前面那个位置也照样被替换（取一个时它会被丢掉，这正是
+         本函数要修的东西）；排序后首元素仍是"index 最小的补语位节点"，与取一个时逐字一致。
+    ② **抽样口径：记录是为哪些词抽出来的，就只展开那些词的位置**（D1）
+
+       `sampled_words`（word_sampler 现写法，一句一份记录、抽中的词全在里面）或旧字段
+       `sampled_word`（一份记录一个词）存在时，**只**展开这些词命中的位置，不再把句内其余
+       目标词追加进来。旧行为是「抽中的词排最前 + 其余本族位置照旧展开」，于是
+       - 一句含「上」和「下」且两层都被抽中 → 两份记录各自展开这两个位置，相同句对重复生成；
+       - 只在「上」层抽中时也会处理其中的「下」→ 下游实际展开的词层分布不再等于采样配额。
+
+       统一成抽样口径之后：每个允许的位置按约定只展开一次，重复输入不增加唯一候选数，
+       采样配额（sampled_words 里那几个词）与实际展开的词层分布可以逐词对账。
+       没有抽样字段（原始语料直接跑）时行为一字不变，仍是「句内全部本族位置」。
+
+    Args:
+        record (dict): 语料记录，需含 match_tree
+        vocab (dict[str, set[str]] | None): 两份词表，默认取 load_focus_vocab()
+
+    Returns:
+        list[dict]: [{"index", "word", "kind", "source"}, ...]，按改写顺序；每个位置另挂
+            ``grounding`` / ``screening``（有就挂）；记录没有可用的 match_tree 时返回空表（不猜）。
+    """
+    vocab = load_focus_vocab() if vocab is None else vocab
+    filter_methods = record.get("filter_methods") or []
+    nodes = word_sampler.target_nodes(record, set().union(*vocab.values()) if vocab else set())
+
+    sampled_words = _sampled_words(record)
+    if sampled_words is not None:
+        # 抽样口径：只认被抽中的那些词的位置（同一个词的多个位置都展开，那是"该词的全部位置"）
+        entries = [
+            _focus_entry(node, "sampled_word", filter_methods, vocab)
+            for node in nodes
+            if node["word"] in sampled_words
+        ]
+        if entries:
+            return entries
+        # 一个位置都没对上（抽样用的词表与本配置的两份词表不一致）时**不静默回退**：
+        # 回退到 match_tree[0] 等于替一个根本没抽过的词造样本，回退到全部位置更是把
+        # "抽样口径"整个丢掉。如实返回空表——下游把它当"这条记录取不到关注词"，
+        # 汇总里的 focus_sources 会把它暴露出来（见 pick_focus_word 的 level 1）。
+        return []
+
+    rest = list(nodes)
+
+    family = _record_family(filter_methods)
+    if family and family in vocab:
+        preferred = [node for node in rest if node["word"] in vocab[family]]
+        rest = preferred or rest
+    if len(rest) > 1 and family == "趋向动词":
+        # 方向补语跟在搭配动词之后：本族候选里把排在父节点之后的挪到前面（口径见 pre_head_indices）。
+        # 只在本族生效——方位词的候选多是规则树的根，这条偏好对它们没有意义。
+        # 稳定分区：段内仍按 index 升序，故首元素仍是"index 最小的补语位节点"。
+        before = word_sampler.pre_head_indices(record)
+        after_nodes = [node for node in rest if node["index"] not in before]
+        if after_nodes:
+            rest = after_nodes + [node for node in rest if node["index"] in before]
+
+    entries = [_focus_entry(node, "vocab", filter_methods, vocab) for node in rest]
+    if entries:
+        return entries
+
+    node = pick_word_info(record)
+    if node is None:
+        return []
+    return [_focus_entry(node, "match_tree", filter_methods, vocab)]
+
+
+def _sampled_words(record: dict) -> set[str] | None:
+    """这条记录是被哪些词抽出来的；没有抽样字段时返回 None（= 原始语料，按词表展开全部位置）
+
+    `sampled_words` 是 word_sampler 现在的写法（一句一份记录，抽中的词全在里面）；
+    `sampled_word` 是旧写法（一份记录一个词），老抽样产物仍然只带它，两条路都要认。
+    """
+    words = record.get("sampled_words")
+    if isinstance(words, (list, tuple)):
+        # 空列表当成「没有抽样信息」而不是「一个词都不许展开」：前者退回按词表展开全部位置
+        # （原始语料的口径），后者会让这条记录落到 match_tree[0] 那条退路上，那不是抽样的意思
+        return {str(word) for word in words if isinstance(word, str) and word} or None
+    word = record.get("sampled_word")
+    if isinstance(word, str) and word:
+        return {word}
+    return None
+
+
+GROUNDING_BLOCK_KEY = "localization_grounding"
+"""旧名保留：方位词语料的前序空间角色整理块（见 localization_grounding.apply_grounding）"""
+
+GROUNDING_BLOCK_KEYS = ("direction_grounding", "localization_grounding")
+"""两类语料的前序三元组整理块；select_grounding 依次查找
+
+块内 candidates 的每一项形如
+``{"index", "word", "keep", "reference": {"index","word","sdp"},
+   "target": {"index","word","role"}, "verb": {"index","word"} | None, ...}``。
+它就是「目标物／参照物／动词」三元组的唯一来源；没有这个块时一律省略，不在下游推断。
+"""
+
+
+def select_grounding(record: dict, index, word: str | None = None) -> dict | None:
+    """取这条记录里**本关注位置**的前序空间标注（目标物／参照物／动词）
+
+    只用 ``index``（给了 word 时再核对词形）精确匹配：同一句里同一个词可能出现两次
+    （上@3 与 上@5），按词形选会把另一个位置的标注带过来。找不到精确项时返回 None，
+    **不回落**到第一个候选——把别人的三元组当成自己的，比没有提示更坏。
+
+    不要求 keep=True：keep=False 的候选同样是「前序步骤已经整理出的标注」，
+    照原样带上并标明 keep 状态，由模型自己判断它是否可信；下游不把它当成已确认事实。
+
+    Returns:
+        dict | None: ``{"index", "word", "keep", "target", "reference", "verb",
+        "verb_optional", "ambiguous"}``；target/reference/verb 保留原 dict（含下标、角色、sdp）。
+        ``ambiguous`` 为 True 表示同一位置有多条标注，调用方应如实说明。
+    """
+    matched: list[dict] = []
+    for block_key in GROUNDING_BLOCK_KEYS:
+        block = record.get(block_key)
+        if not isinstance(block, dict):
+            continue
+        candidates = block.get("candidates")
+        if not isinstance(candidates, list):
+            continue
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            if candidate.get("index") != index:
+                continue
+            if word and candidate.get("word") and candidate.get("word") != word:
+                continue
+            matched.append(candidate)
+    if not matched:
+        return None
+    return {
+        "index": matched[0].get("index"),
+        "word": matched[0].get("word"),
+        "keep": matched[0].get("keep"),
+        "target": matched[0].get("target") or None,
+        "reference": matched[0].get("reference") or None,
+        "verb": matched[0].get("verb") or None,
+        # 趋向动词允许独立作谓语；这里把「合法无动词」与「未识别」分开交给下游措辞。
+        "verb_optional": bool(matched[0].get("verb_optional")),
+        "ambiguous": len(matched) > 1,
+    }
+
+
+def select_screening(record: dict, index, word: str | None = None) -> dict | None:
+    """取这条记录里**本关注位置**的 LLM 筛选判定（没有就返回 None）
+
+    与 select_grounding 同一套精确匹配口径：只按 index（给了 word 时再核对词形），
+    不回落。agent 链路据此直接复用筛选结果，不再各问一次模型。
+    """
+    return sentence_screening.verdict_for_target(record, index, word)
+
+
+def _with_grounding(entry: dict, record: dict) -> dict:
+    """给一份关注词挂上本位置的前序空间标注与筛选判定
+
+    - ``grounding``：目标物/参照物/动词三元组（没有就不加这个键）；
+    - ``screening``：本位置的 extractable/grammatical/spatial_coherent（有筛选结果时）。
+
+    不把整棵 match_tree / filter_methods 挂到关注词上：它们已经在本条记录里，重复携带会把
+    每个候选的结果都撑大；旧语料回退时用空树也能按同一份提示语判定（判据在系统提示语里）。
+    """
+    grounding = select_grounding(record, entry.get("index"), entry.get("word"))
+    result = {**entry}
+    if grounding is not None:
+        result["grounding"] = grounding
+    screening = select_screening(record, entry.get("index"), entry.get("word"))
+    if screening is not None:
+        result["screening"] = screening
+    return result
+
+
+FOCUS_SOURCE_ALTER = "alter"
+"""关注词的来源之一：改写句那侧的关注词，由规则表换上去的那个词重算（见 replacement_focus_word）
+
+与 pick_focus_word 的三个来源（sampled_word / vocab / match_tree）并列，但它不在语料记录里，
+是改写之后才有的——判定「这份关注词该按哪一侧的措辞说」就认这个值
+（见 spatial_agents.focus_role）。
+"""
+
+
+def replacement_focus_word(
+    focus_word: dict | None, replacement: str, filter_methods: Iterable[str] = ()
+) -> dict:
+    """改写句那一侧的关注词：把关注词换成替换后的词语，其余口径照旧算
+
+    一对句子的两侧各看各的词：a 侧看语料记录里的原词，b 侧看规则表换上去的那个词。这样 b 侧的
+    schema 才会收窄到替换词所属的词条（见 _narrowed_groups），判定表里按两组名字写的格子
+    （如 上12 × 里1）才对得上；两侧共用一个词的话，b 侧会收窄回原词那一组，判定退化成同组自比。
+
+    index 照搬 a 侧：改写只把切片里 index 处的那个 token 换成规则表里给的替换词（见 alter_sentence），
+    改出来的候选切片长度与其余 token 都没动过，**改写句存在状态里的那份切片**（slice_b）在该下标
+    处确实是替换词（实测 5310/5310）。但这个下标说的是原句的分词，不是改写句的：模型手上只有改写句
+    字符串，它会自己去 parse_sentence，而重新分词在替换点附近可能并词（下+移 并成「下移」，
+    实测 4.9%，见 spatial_agents.FOCUS_INDEX_NOTE_ALTER），那时同一下标指的就是别的 token。
+    所以 b 侧的措辞只说「下标是原句上的位置」，并让模型按词本身在改写句里定位。
+
+    kind 按**替换词**重算（词表归属 + 规则族破平局，见 focus_kind）：替换词换到另一族、或压根
+    不在本语料类型的词表里时如实给出（空串就是不猜），不沿用原词的类别——沿用会把「这个词不是
+    方位词/趋向动词」这条配置隐患盖住，而它正是跑批汇总里 replacement_kinds 要暴露的东西。
+
+    Args:
+        focus_word (dict | None): a 侧那份关注词（pick_focus_word 的返回值）；只为取 index
+        replacement (str): 替换词，即改写句在 index 处实际用的那个词
+        filter_methods (Iterable[str]): 该语料记录的筛选规则名，只用于「上」「下」两表都收时破平局
+
+    Returns:
+        dict: {"index", "word", "kind", "source"}，形状与 pick_focus_word 的返回值一致，
+            source 固定是 FOCUS_SOURCE_ALTER
+    """
+    result = {
+        "index": (focus_word or {}).get("index"),
+        "word": replacement,
+        "kind": focus_kind(replacement, filter_methods),
+        "source": FOCUS_SOURCE_ALTER,
+    }
+    # 前序空间标注属于**原句**：改写句那一侧照带一份，措辞会说明它未经改写后重新验证
+    # （见 spatial_agents.grounding_block）。不带的话 b 侧的 semantic/feature/schema
+    # 消息就少了这条提示，与「各个输入都带」的要求不一致。
+    if isinstance(focus_word, dict) and focus_word.get("grounding"):
+        result["grounding"] = focus_word["grounding"]
+    return result
+
+
+# --------------------------------------------------------------------------
+# 四、纯规则改写（alter_agent 的实现，不调 LLM）
+# --------------------------------------------------------------------------
+
+
+ALTER_WORDS_KEY = "words"
+"""组里声明「哪些关注词命中这一组」的键（与 ALTER_REPLACEMENTS_KEY 同级，两个都必写）"""
+ALTER_REPLACEMENTS_KEY = "replacements"
+"""组里声明「要换成哪些词」的键；生成候选时排除关注词本身（见 alter_sentence）"""
+
+
+def find_word_groups(word: str, rules: dict | None = None) -> list[dict]:
+    """查出规则表里所有**收这个词**的组（“待替换的词命中哪些组”）
+
+    规则表的 groups 是一串组，每组 {"words": [...], "replacements": [...]}：关注词落在 words 里
+    就命中这一组，按该组的 replacements 替换（见 alter_sentence）。返回每组的出处与两个字段，
+    形如 [{"source": "groups[0]", "words": ["上", "中", "里"], "replacements": ["中", "里"]}]。
+    同一个词出现在多组里时全部返回，调用方把各组的替换词并起来用。
+    """
+    rules = load_alter_rules() if rules is None else rules
+    found: list[dict] = []
+    for index, group in enumerate(rules.get("groups") or []):
+        if not isinstance(group, dict):
+            continue
+        words = [w for w in group.get(ALTER_WORDS_KEY) or [] if isinstance(w, str)]
+        if word in words:
+            found.append(
+                {
+                    "source": f"groups[{index}]",
+                    ALTER_WORDS_KEY: words,
+                    ALTER_REPLACEMENTS_KEY: [
+                        w for w in group.get(ALTER_REPLACEMENTS_KEY) or [] if isinstance(w, str)
+                    ],
+                }
+            )
+    return found
+
+
+def alter_sentence(
+    sentence_slice: list[str],
+    word_info: dict[str, Any],
+    rules: dict | None = None,
+) -> tuple[list[list[str]], dict]:
+    """按规则替换切片中 index 处的词语，返回全部待选切片与改写记录。
+
+    纯规则实现，不调用 LLM。替换词来源按优先级：
+        1. word_info["replacement"]（调用方直接指定，便于按需组织不同改写）：只出一个待选句
+        2. 规则表里收该词的所有组（见 find_word_groups）的 replacements，**排除该词本身**：
+           每个词各出一个待选句
+    因为一组往往能换好几个词，所以返回的是**候选切片的列表的列表**：
+    一个候选切片对应一个待选句，空列表表示没命中任何替换词。
+
+    detail["candidates"] 与返回的切片按下标一一对应，写明每个候选的替换词与它出自哪个组
+    （source 是 groups[i]，group 是该组的 words 命中集，供留档核对）。
+
+    图里传进来的 word_info 是**关注词**（见 pick_focus_word）：含 index / word / kind，
+    **不含 children**。因此 detail["span"] 通常只有它自己那一个下标——旧口径传的是 match_tree
+    节点，span 还会带上定语等修饰成分（见 collect_span）。改写本身只动 index 处的那个 token，
+    两种口径改出来的句子没有差别，变的只是留档的 span。
+
+    Args:
+        sentence_slice (list[str]): 待改写的分词切片
+        word_info (dict[str, Any]): 关注词，至少含 "index" 与 "word"（可另带 "replacement"）
+        rules (dict, optional): 替换规则表，默认读 config_path("alter_rules") 解析出的那张
+            （默认类型方位词，即 config_files/localization/alter_rules.json5）
+
+    Returns:
+        tuple[list[list[str]], dict]: (待选切片列表, 改写记录)
+    """
+    rules = load_alter_rules() if rules is None else rules
+    detail: dict[str, Any] = {
+        "index": word_info.get("index"),
+        "word": word_info.get("word"),
+        "span": [],
+        "applied": False,
+        "reason": "",
+        "candidates": [],
+    }
+
+    index = word_info.get("index")
+    if not isinstance(index, int) or not 0 <= index < len(sentence_slice):
+        detail["reason"] = "index 缺失或越界，无法定位待替换的词"
+        return [], detail
+
+    original = sentence_slice[index]
+    # word 与切片不一致说明上游的 index 与切片没对齐，此时改写会动错词，宁可停下
+    if word_info.get("word") not in (None, original):
+        detail["reason"] = (
+            f"index 处的词与 word 不一致（切片为 {original!r}，word 为 {word_info.get('word')!r}）"
+        )
+        return [], detail
+    detail["word"] = original
+    detail["span"] = collect_span(word_info)
+
+    candidates: list[dict] = []
+    specified = word_info.get("replacement")
+    if specified:
+        candidates.append({"replacement": specified, "source": "word_info.replacement", "group": []})
+    else:
+        seen: set[str] = set()
+        for found in find_word_groups(original, rules):
+            for word in found["replacements"]:
+                # 关注词本身不算替换词；同一个替换词出现在多组里时只取先出现的那组
+                if word == original or word in seen:
+                    continue
+                seen.add(word)
+                candidates.append(
+                    {"replacement": word, "source": found["source"], "group": found["words"]}
+                )
+
+    if not candidates:
+        # 不点名具体路径：默认那张表不存在，调用方也可能用 --alter-rules 换了别的表
+        detail["reason"] = (
+            f"替换规则表里没有收录 {original!r} 或它没有可用替换词的组，"
+            f"请在本次使用的规则表里补上该组"
+        )
+        return [], detail
+
+    new_slices: list[list[str]] = []
+    for candidate in candidates:
+        new_slice = list(sentence_slice)
+        new_slice[index] = candidate["replacement"]
+        new_slices.append(new_slice)
+
+    detail.update(applied=True, candidates=candidates)
+    return new_slices, detail
+
+
+# --------------------------------------------------------------------------
+# 五、查表：语义特征 -> schema，schema 对 -> 判定
+# --------------------------------------------------------------------------
+
+WORDS_KEY = "words"
+"""词条下声明「这一类还覆盖哪些关注词词形」的保留键（与编号同级）
+
+存在的理由：表的一级键只能写一个词形（「外」），而语料里的关注词还有 外面/外边/外头
+（词表见 load_focus_vocab，实测 location 语料 41 个词形里 26 个是双音节）。没有它，
+关注词是 外面 的句子在表里取不到「外」那一组，只能落到 LLM 自由命名出「外面1」，
+与「外1」成了两类，判定表就得为每个词形各写一遍。
+
+编号一律是数字（见 validate_schema_table），所以这个键不会与编号撞名。
+"""
+
+
+def _numbered_entries(entries: dict) -> dict:
+    """一个词条下真正是图式的那部分：摘掉 words 键
+
+    words 与编号同级，是本组的元信息、不是一条图式。凡是「遍历某组的编号条目」的地方
+    （收窄、数条数、校验）都必须走这里，否则它会被当成一条编号条目——数条数会把它数进去，
+    校验会报出「编号 'words' 要写数字」这种指错方向的错。
+    """
+    return {key: value for key, value in (entries or {}).items() if str(key) != WORDS_KEY}
+
+
+def _group_words(group_word: str, entries: dict) -> list[str]:
+    """一个词条覆盖的全部关注词词形：组名本身 + words 里列的（组名排在最前）
+
+    组名总在其中，两条理由：schema 名就是「组名 + 编号」，一个不覆盖自己名字的组自相矛盾；
+    取并集还保证「给一组补 words」是**纯增量**——原本能命中这组的关注词不会因为漏写了组名
+    而静默掉进自由命名（那是配置层面的回归，不报错，只改名）。
+    """
+    listed = [form for form in (entries or {}).get(WORDS_KEY) or [] if isinstance(form, str)]
+    return [group_word, *(form for form in listed if form != group_word)]
+
+
+def schema_forms(table: dict | None = None) -> list[str]:
+    """表里被声明过、因而**可能**当上关注词的全部词形（按表里的书写顺序，去重）
+
+    「这个词形到底存在吗」只能靠语料类型的词表核对（见 load_focus_vocab）：words 里写了错字
+    （「外靣」）不会报错，只是那个词形永远当不成关注词、那一条静默失效。跑批入口用它对一次账。
+    """
+    table = load_schema_table() if table is None else table
+    forms: list[str] = []
+    for group_word, entries in (table.get("schemas") or {}).items():
+        forms.extend(form for form in _group_words(group_word, entries) if form not in forms)
+    return forms
+
+
+def _narrowed_groups(table: dict | None = None, focus_word: dict | None = None) -> dict[str, dict]:
+    """按关注词收窄后的词条：{组名: 该组的编号条目}，保持表里的书写顺序
+
+    收窄口径：
+
+    - 关注词落在某组的 {组名} ∪ words 里，就取该组（见 _group_words）。没写 words 的组只有
+      组名一个词形，于是逐字相等——与旧版一致：不看词形、不做前缀匹配，不会把「上」的图式
+      算给「上面」，反之亦然。
+    - 关注词缺失或词形为空时给出表中**全部**词条：这一层要排除的是「与关注词无关的格式」，
+      没有关注词就没有可排除的判据；此时宁可不排除（详情里把 focus_word 记成 None），
+      也不凭空认定某一族。
+
+    这是收窄的**唯一**实现：候选名单（schema_candidates）与命名前缀（schema_group_key）都基于
+    它，两者才不会各算各的——前缀与名单一旦分家，别名那一路的自由命名会被自己的校验全否掉。
+    """
+    table = load_schema_table() if table is None else table
+    schemas = table.get("schemas") or {}
+    word = (focus_word or {}).get("word") or ""
+    groups = (
+        schemas
+        if not word
+        else {w: entries for w, entries in schemas.items() if word in _group_words(w, entries)}
+    )
+    return {w: _numbered_entries(entries) for w, entries in groups.items()}
+
+
+def _schema_count(table: dict) -> int:
+    """表里一共有多少条图式（收窄前后各数一次，用来记录被关注词排除了几条）
+
+    只数编号条目：words 是同级的元信息，不是一条图式（漏掉的后果是 excluded 虚高）。
+    """
+    return sum(len(_numbered_entries(entries)) for entries in (table.get("schemas") or {}).values())
+
+
+def schema_candidates(table: dict | None = None, focus_word: dict | None = None) -> dict[str, dict]:
+    """按关注词收窄后的候选图式：{schema 名: 条目}，保持表里的书写顺序
+
+    schema 名是「组名 + 编号」（如「上12」「下1」）。组名是这一类的代表词形：词条写了 words 时，
+    关注词是它列出的任一词形（外面/外邊/外头）都归进同一个名字空间（外1），判定表因此只需
+    按类写一遍，不必为每个词形各写一条。
+
+    收窄口径（哪些组算命中）见 _narrowed_groups。
+    """
+    return {
+        f"{group_word}{number}": entry or {}
+        for group_word, entries in _narrowed_groups(table, focus_word).items()
+        for number, entry in entries.items()
+    }
+
+
+def schema_group_key(table: dict | None = None, focus_word: dict | None = None) -> str | None:
+    """关注词归属的**组名**——这一类的图式共用的名字前缀；没有归属时给 None
+
+    自由命名（关注词有归属但那一类还没收图式）那条路要用它：关注词是「里面」而归入「里」这一类
+    时，名字必须是「里 + 编号」，命名成「里面1」与判定表里按类写的那套对不上，这一次抽取就白抽了。
+
+    关注词缺失时**直接**给 None，不能写成 next(iter(_narrowed_groups(...)), None)——没有关注词时
+    那一层刻意返回全部词条，取第一个会把每一句都钉到表里第一类上。
+    """
+    if not ((focus_word or {}).get("word") or ""):
+        return None
+    return next(iter(_narrowed_groups(table, focus_word)), None)
+
+
+def _as_list(value: Any) -> list:
+    """把特征取值统一成列表，便于多值特征（一个类别取多个标签）参与匹配"""
+    if value is None:
+        return []
+    return list(value) if isinstance(value, (list, tuple, set)) else [value]
+
+
+FEATURE_VALUE_ALIASES: dict[str, tuple[str, ...]] = {
+    # 一个取值代表一组取值的「合称」：语义上它蕴含括号里每一个单值同时成立。只在**句子**那一侧
+    # 展开（见 _expand_feature_value），于是 schema 表里只写了某个单方向的图式也会被它命中，
+    # 不必在表里给每条含方向值的 match 都补一遍这个合称。
+    #
+    # [+四周] 表示目标物环绕参照物、四个水平方向同时成立（feature_classes.json5 的水平方向
+    # 一类里列了这个取值）。因此前1（[+前方]）、后1（[+后方]）、旁1（四个方向任一）、旁2
+    # （[+左方]/[+右方]）这些只覆盖部分方向的图式，对「环绕」句同样算命中——这是语言学上的
+    # 蕴含（四周 ⊃ 前/后/左/右），不是把 [+四周] 当成第五个并列方向。
+    "[+四周]": ("[+前方]", "[+后方]", "[+左方]", "[+右方]"),
+}
+"""取值别名：合称 -> 它蕴含的单值。改这张表等于改下游匹配口径，与配置里列的取值配套。"""
+
+
+def _expand_feature_value(value: Any) -> set[str]:
+    """把一个特征取值展开成它等价的取值集合（至少含它自己）
+
+    只对**句子**一侧的取值调用（见 _match_features）：表里 match 一侧不展开——表写什么就是
+    什么，免得「表里写了一组合称、又被自己展开」绕圈。别名见 FEATURE_VALUE_ALIASES。
+    """
+    text = str(value)
+    return {text, *FEATURE_VALUE_ALIASES.get(text, ())}
+
+
+def _match_features(match: dict, features: dict) -> bool:
+    """判断**一组** match 条件是否被 features 满足：match 里的每个键都要在 features 里命中取值
+
+    两侧都统一成集合作交集判断：上游一个特征可能传来多个备选值（feature_agent 每类返回的
+    就是列表），有交集即算这个键命中。因此一个键写多个值是「该键取其中任一」，多键时就是
+    各自取任一的组合；要精确控制组合就写多组条件（见 _schema_alternatives）。
+
+    句子一侧的取值先按 FEATURE_VALUE_ALIASES 展开（句子侧才展开，表侧不展开）：一个合称
+    （如 [+四周]）会被展开成它蕴含的各单值，于是表里只列了其中某个单值的条件也命中。
+    """
+    for key, expected in (match or {}).items():
+        if key not in features:
+            return False
+        actual_values = {expanded for v in _as_list(features[key]) for expanded in _expand_feature_value(v)}
+        expected_values = {str(v) for v in _as_list(expected)}
+        if not actual_values & expected_values:
+            return False
+    return True
+
+
+def _schema_alternatives(entry: dict) -> tuple[list[dict], bool]:
+    """把一个条目的 match 拆成 (备选条件组列表, 是不是兜底条目)
+
+    match 允许三种写法：一组条件的对象（{"area": [...]}）、多组条件的列表
+    （[{"area": [...]}, {"area": [...], "distance": [...]}]）、省略或为空。
+    列表里组与组之间是「或」——一个图式往往对应许多组特征值，如「外」的距离特征可以是
+    [+紧连] 也可以是 [+近]，就写多组条件，不必为每一组单开一个编号。
+
+    省略、为空、或列出的组全是空对象（{}）时返回 ([], True)：这是兜底条目，
+    只有同词的其他图式都没命中时才采用（想让 LLM 去挑最接近的就别写兜底条目）。
+    """
+    match = (entry or {}).get("match")
+    if isinstance(match, dict):
+        groups = [match]
+    elif isinstance(match, (list, tuple)):
+        groups = [g for g in match if isinstance(g, dict)]
+    else:
+        groups = []
+    groups = [g for g in groups if g]
+    return groups, not groups
+
+
+def format_match(match: Any) -> str:
+    """把一组 match 条件渲染成一行说明（落盘 reason 与提示语共用这一处措辞）"""
+    if isinstance(match, dict):
+        if not match:
+            return "（兜底条件：同词的其他图式都没命中时才是它）"
+        return " 且 ".join(
+            f"{key}={'、'.join(str(v) for v in _as_list(value))}" for key, value in match.items()
+        )
+    return str(match)
+
+
+def render_schema_candidates(candidates: dict[str, dict]) -> str:
+    """把候选图式渲染成 LLM 提示语里的一段：名字、说明、命中条件、例句
+
+    名字、条件、例句都给全，模型才有依据在「一组都没命中」时挑一个最接近的——
+    这正是「不命中就让它挑」的前提，条件给不全它就只能在名字上猜。
+    """
+    lines = []
+    for name, entry in candidates.items():
+        entry = entry or {}
+        groups, is_fallback = _schema_alternatives(entry)
+        if is_fallback:
+            condition = format_match({})
+        else:
+            condition = " ／ ".join(format_match(group) for group in groups)
+        parts = [f"  {name}：{entry.get('description') or '（未写说明）'}"]
+        parts.append(f"      命中条件：{condition}")
+        # 示例单独由 system_prompt/examples 按关注词选择，不夹带表内旧例句。
+        lines.append("\n".join(parts))
+    return "\n".join(lines)
+
+
+def is_schema_name(name: str, word: str = "") -> bool:
+    """名字是不是「前缀 + 编号」的格式（LLM 自由命名那条路上用来兜住名字的格式）
+
+    word 这里是**前缀**：一般是关注词，关注词归属某个词条（如「里面」归「里」）时传组名，
+    否则同一个名字空间会被词形切碎（里1 与 里面1 分成两类）。传空串时只要求非空：
+    没有可核对的前半段，此时不硬套格式。
+    """
+    if not isinstance(name, str) or not name:
+        return False
+    if not word:
+        return True
+    return name.startswith(word) and name[len(word) :].isdigit()
+
+
+def _validate_rule_words(where: str, field: str, listed: Any) -> None:
+    """校验一个组的某个词表字段（words / replacements）
+
+    空列表与「写了等于没写」同属配置问题，一并当场报出来（口径同 _validate_group_words）：
+    words 空则没人命中这一组，replacements 空则命中也没词可换，这一组都是白写。
+    """
+    if not isinstance(listed, (list, tuple)):
+        raise ValueError(f"{where} 的 {field} 要写成词列表，实际是 {listed!r}")
+    if not listed:
+        raise ValueError(f"{where} 的 {field} 是空列表，这一组永远用不上，请填词或删掉这一组")
+    seen: set[str] = set()
+    for word in listed:
+        if not isinstance(word, str) or not word or any(ch.isspace() for ch in word):
+            raise ValueError(
+                f"{where} 的 {field} 里每一项都要是非空且不含空白的字符串，实际有 {word!r}"
+            )
+        if word in seen:
+            raise ValueError(f"{where} 的 {field} 里有重复词 {word!r}")
+
+
+def validate_alter_rules(table: dict, *, source: str | None = None) -> None:
+    """校验替换规则表填得能用；写错当场抛 ValueError
+
+    与 validate_schema_table 同一口径：表填错属于配置问题，应该在构造 agent（启动）时就报，
+    而不是等跑到某条记录才吞掉、把错误混进结果里。
+
+    校验项：
+    1. 顶层是对象，形如 {"groups": [...]}；groups 缺失/None/空都合法（等价空表，走既有降级）。
+    2. 每个组是对象，且**恰好**有 words 与 replacements 两个键（见 ALTER_WORDS_KEY /
+       ALTER_REPLACEMENTS_KEY）——多写一个键没人读，少写一个这一组必有一头落空，都当场报。
+    3. 两个字段都是非空词列表，每项非空、不含空白、组内不重复（见 _validate_rule_words）。
+    4. 组写成词表数组（旧版扁平写法）时单独给一条带迁移提示的错：旧写法早就不认了，
+       只有说清「要改成什么」才不至于让人对着报错猜。
+
+    words 与 replacements 一样是「写错了不报错、只是静默失效」的那类配置
+    （词形写错就永远当不成关注词 / 永远换不出去），所以全部在这里挡住。
+
+    Args:
+        table (dict): 待校验的替换规则表
+        source (str | None): 这张表的路径，只用于报错信息
+    """
+    if not isinstance(table, dict):
+        raise ValueError('替换规则表必须是一个对象，形如 {"groups": [...]}')
+    groups = table.get("groups") or []
+    if not isinstance(groups, (list, tuple)):
+        raise ValueError('替换规则表的 groups 要写成列表，形如 {"groups": [{"words": [...], "replacements": [...]}]}')
+    for index, group in enumerate(groups):
+        where = f"groups[{index}]"
+        if isinstance(group, (list, tuple)):
+            raise ValueError(
+                f"{where} 是旧版扁平词组 {list(group)!r}；新版每组要写成对象，"
+                f'形如 {{"words": ["上", "中", "里"], "replacements": ["中", "里"]}}'
+            )
+        if not isinstance(group, dict):
+            raise ValueError(
+                f'{where} 要写成对象，形如 {{"words": ["上", "中", "里"], "replacements": ["中", "里"]}}'
+            )
+        extra = [key for key in group if key not in (ALTER_WORDS_KEY, ALTER_REPLACEMENTS_KEY)]
+        if extra:
+            raise ValueError(
+                f"{where} 只能有 {ALTER_WORDS_KEY} 与 {ALTER_REPLACEMENTS_KEY} 两个键，"
+                f"多了 {'、'.join(map(repr, extra))}（没人读）"
+            )
+        for field in (ALTER_WORDS_KEY, ALTER_REPLACEMENTS_KEY):
+            if field not in group:
+                raise ValueError(
+                    f"{where} 少了 {field} 键：{ALTER_WORDS_KEY} 定哪些关注词命中、"
+                    f"{ALTER_REPLACEMENTS_KEY} 定换成什么"
+                )
+            _validate_rule_words(where, field, group[field])
+
+
+def validate_schema_table(
+    table: dict,
+    feature_keys: Iterable[str] | None = None,
+    *,
+    source: str | None = None,
+    feature_source: str | None = None,
+) -> None:
+    """校验 schema 表填得能用；写错当场抛 ValueError
+
+    与特征类别表的校验同一口径：表填错属于配置问题，应该在构造 agent（启动）时就报，
+    而不是等跑到某条记录才吞掉、把错误混进结果里。
+
+    校验项：
+    1. 一级键是组名（非空字符串，且不含数字——schema 名是「组名 + 编号」，
+       词里带数字会与别人的编号撞名）；二级键是编号（数字或它的字符串形式，同组内不重复）。
+    2. 词条下可选的 words 是「这一类还覆盖哪些词形」的字符串列表（见 WORDS_KEY）：
+       非空、无重复、每项都是非空且不含空白的字符串。
+    3. **一个词形只能归一个词条**（按 {组名} ∪ words 反查，见 _group_words）：
+       两组都收同一个词形时，收窄结果取决于表里的书写顺序，那不是判据。
+       这一条对没写 words 的表是空操作（字典键本就不重复），不会影响既有配置。
+    4. match 必须是「一组条件的对象」或「多组条件的列表」，取值是字符串或字符串列表。
+    5. 给了 feature_keys（本次跑批的特征类别表里已填的类别）时，match 里的特征键必须
+       都在其中：写错一个键不会报错，只会让这条图式永远匹配不上（整条静默失效），
+       所以在这里挡住。
+
+    words 与 match 一样是「写错了不报错、只是静默失效」的那类配置（词形写错就永远当不成
+    关注词），所以与 match 同一口径，全部在这里挡住。
+
+    Args:
+        table (dict): 待校验的 schema 表
+        feature_keys (Iterable[str] | None): 已填的特征类别 key；None 或空 = 不校验键
+        source (str | None): 这张表的路径，只用于报错信息
+        feature_source (str | None): 特征类别表的路径，只用于报错信息
+    """
+    if not isinstance(table, dict):
+        raise ValueError('schema 表必须是一个对象，形如 {"schemas": {...}}')
+    schemas = table.get("schemas") or {}
+    if not isinstance(schemas, dict):
+        raise ValueError('schema 表的 schemas 必须是对象：{"<关注词>": {"<编号>": {...}}}')
+    known = {str(key) for key in (feature_keys or [])}
+    owners: dict[str, list[str]] = {}
+
+    for word, entries in schemas.items():
+        if not isinstance(word, str) or not word:
+            raise ValueError(f"schema 表的组名 {word!r} 必须是非空字符串（它是 schema 名的前一半）")
+        if any(ch.isdigit() for ch in word):
+            raise ValueError(
+                f"组名 {word!r} 里不能有数字：schema 名是「组名 + 编号」，"
+                f"「{word}1」会与编号撞名、也和别的词分不开"
+            )
+        if not isinstance(entries, dict):
+            raise ValueError(f"组名 {word!r} 下要写成 {{编号: 条目}} 的对象（words 与编号同级）")
+        for form in _validate_group_words(word, entries):
+            owners.setdefault(form, []).append(word)
+        numbers: set[str] = set()
+        for number, entry in _numbered_entries(entries).items():
+            num = str(number)
+            if not num.isdigit():
+                raise ValueError(f"图式 {word}{num} 的编号 {number!r} 要写数字（如 1、12）")
+            if num in numbers:
+                # json5 里 1 与 "1" 是两个不同的键，却指向同一个 schema 名
+                raise ValueError(f"组名 {word!r} 下有重复编号 {num}（一个写成了数字、另一个写成了字符串？）")
+            numbers.add(num)
+            name = f"{word}{num}"
+            if not isinstance(entry, dict):
+                raise ValueError(f"图式 {name} 的条目要写成对象（description / match / examples）")
+            if WORDS_KEY in entry:
+                raise ValueError(
+                    f"图式 {name} 里不该有 {WORDS_KEY}：它要写在组下、与编号同级，"
+                    f"写在图式里没人读，等于没写"
+                )
+            _validate_schema_match(name, entry.get("match"), known, feature_source=feature_source)
+            examples = entry.get("examples")
+            if examples is not None and not isinstance(examples, (list, tuple)):
+                raise ValueError(f"图式 {name} 的 examples 要写成列表（一个例句一项）")
+
+    for form, groups in owners.items():
+        if len(groups) > 1:
+            raise ValueError(
+                f"关注词词形 {form!r} 被多个词条同时收（{'、'.join(groups)}）："
+                f"收窄时该取哪一组取决于表里的书写顺序，那不是判据；"
+                f"请让它只出现在其中一组的 {WORDS_KEY} 里（组名本身恒属于该组）"
+            )
+
+
+def _validate_group_words(word: str, entries: dict) -> list[str]:
+    """校验一个词条的 words（可省略），返回该组覆盖的全部词形（含组名本身）
+
+    写成空列表与不写等价（两者都只覆盖组名），是徒增一处要维护的配置，所以也报出来——
+    本仓库对「写了等于没写」的配置一律当场说清，不留给它静默躺着。
+    """
+    if WORDS_KEY not in entries:
+        return _group_words(word, entries)
+    listed = entries[WORDS_KEY]
+    if not isinstance(listed, (list, tuple)):
+        raise ValueError(
+            f"组名 {word!r} 的 {WORDS_KEY} 要写成词形的列表（与编号同级），实际是 {listed!r}"
+        )
+    if not listed:
+        raise ValueError(
+            f"组名 {word!r} 的 {WORDS_KEY} 是空列表，与不写它等价（只覆盖组名自己），请删掉或填词"
+        )
+    seen: set[str] = set()
+    for form in listed:
+        if not isinstance(form, str) or not form or any(ch.isspace() for ch in form):
+            raise ValueError(
+                f"组名 {word!r} 的 {WORDS_KEY} 里每一项都要是非空且不含空白的字符串，实际有 {form!r}"
+            )
+        if form in seen:
+            raise ValueError(f"组名 {word!r} 的 {WORDS_KEY} 里有重复词形 {form!r}")
+        seen.add(form)
+    return _group_words(word, entries)
+
+
+def _validate_schema_match(name: str, match: Any, known: set[str], *, feature_source: str | None = None) -> None:
+    """校验一个条目的 match（拆组刻意不共用 _schema_alternatives：那个函数会把写坏的项静默丢掉）"""
+    if match is None:
+        return
+    if isinstance(match, dict):
+        groups: list = [match]
+    elif isinstance(match, (list, tuple)):
+        groups = list(match)
+    else:
+        raise ValueError(f"图式 {name} 的 match 要写成「一组条件的对象」或「多组条件的列表」，实际是 {match!r}")
+    for group in groups:
+        if not isinstance(group, dict):
+            raise ValueError(f"图式 {name} 的 match 里每一项都要是一组条件（对象），实际是 {group!r}")
+        for key, value in group.items():
+            if known and str(key) not in known:
+                raise ValueError(
+                    f"图式 {name} 的 match 用了特征键 {key!r}，但它不在特征类别表"
+                    f"（{feature_source or 'feature_classes.json5'}）的类别里"
+                    f"（已有：{'、'.join(sorted(known))}）：这个键永远匹配不上，整条图式会静默失效"
+                )
+            if isinstance(value, str):
+                continue
+            if isinstance(value, (list, tuple)) and all(isinstance(v, str) for v in value):
+                continue
+            raise ValueError(f"图式 {name} 的 match.{key} 取值要写字符串或字符串列表，实际是 {value!r}")
+
+
+def lookup_schema(
+    features: dict, table: dict | None = None, focus_word: dict | None = None
+) -> tuple[str | None, dict]:
+    """按关注词 + 语义特征查 schema 表。
+
+    schema 名是「组名 + 编号」（如「上12」「下1」），表按词条分组：
+        {"schemas": {"<组名>": {"words": ["<词形>", ...],
+                                "<编号>": {"description": "...", "match": [...]}}}}
+
+    两级收窄，顺序固定：
+
+    1. **先按关注词排除**别的词条的图式（见 _narrowed_groups）：「上12」与「下1」是两种不同的
+       空间结构，别的词条的图式结构上就不可能是答案。词条写了 words 时，关注词是它列出的任一
+       词形（外面/外边/外头）都算命中该词条，名字仍用组名（外1）——同一个名字空间，判定表
+       因此只需按类写。关注词缺失时不排除。
+    2. **再按特征匹配**：条目的 match 是**一组备选条件**，组内是「与」（列出的键都要命中，
+       没列出的键不参与判断），组间是「或」。取收窄后第一条命中的图式（按表中书写顺序，
+       所以特殊用法写在前面、宽泛的写在后面）。
+    3. match 省略或为空的条目是兜底，只有同组其他图式都没命中时才采用。
+
+    Args:
+        features (dict): 该句的语义特征
+        table (dict, optional): schema 表，默认读 config_path("schema_table") 解析出的那张
+            （默认类型方位词，即 config_files/localization/schema_table.json5）
+        focus_word (dict, optional): 上游传下来的关注词 {"index", "word", "kind", "source"}
+
+    Returns:
+        tuple[str | None, dict]: (schema 名或 None, 命中详情)。详情里始终带着
+            candidates（本词的候选名单，未命中时正交给 LLM 从中挑）与 excluded
+            （被关注词排除了几条，排查「收窄是不是收错了」的第一现场——经 words 归并进来的
+            关注词这里会是 0：图式不是被排除，是经别名够到的）。
+    """
+    table = load_schema_table() if table is None else table
+    candidates = schema_candidates(table, focus_word)
+    detail: dict[str, Any] = {
+        "focus_word": (focus_word or {}).get("word") or None,
+        "candidates": list(candidates),
+        "excluded": _schema_count(table) - len(candidates),
+    }
+
+    fallback: str | None = None
+    for name, entry in candidates.items():
+        groups, is_fallback = _schema_alternatives(entry)
+        if is_fallback:
+            fallback = fallback or name
+            continue
+        for group in groups:
+            if _match_features(group, features):
+                return name, {**detail, "source": "table", "matched": name, "match": group}
+    if fallback:
+        return fallback, {**detail, "source": "fallback", "matched": fallback, "match": {}}
+    return None, {**detail, "source": "miss", "matched": None, "match": None}
+
+
+def lookup_judgement(schema_a: str | None, schema_b: str | None, table: dict | None = None) -> tuple[bool | None, dict]:
+    """按两个 schema 查判定表（CSV 矩阵，格式见 load_judge_table），判断两句意义是否相同。
+
+    查到的格子决定下一步：√/× 直接出结论，○ 交 LLM，留空（非法）也如实交 LLM。
+    schema 名为 None（没判出 schema）那一路按标签 未判出 查。表里没列出的 schema 名算未命中；
+    整张表还没填（filled 为 0）也一律算未命中——空模板不该让每条记录都背一句「这格非法留空」。
+
+    容错刻意写在这里而不是 load_judge_table 里：表是可以注入的（构造 JudgeAgent 时给 table=），
+    注入的裸表 {"cells": ...} 或 {} 不经过读表那一步，直接落到这里。
+
+    table 不给就按**默认语料类型**（方位词）读一张：这只是给临时脚本行个方便，跑批路径上一律
+    由 agent 传自己那张（JudgeAgent 构造时按 corpus_type 读好存进 self.table），
+    所以这里没有 corpus_type 参数——别在这里省 table，那样另一类语料会静默拿到方位词表的结论。
+
+    Returns:
+        tuple[bool | None, dict]: (判定结果或 None, 查表详情)。None 表示没有直接结论。
+        详情里的 source 把查表结果分成四类，后三类都要 LLM 兜底：
+            "table"   格子是 √/×，same 即结论
+            "defer"   格子是 ○，交 LLM 做进一步判断
+            "miss"    schema 名不在表里，或整张表还没填（空模板）
+            "illegal" 格子留空/符号认不出（非法），降级交 LLM
+    """
+    table = load_judge_table() if table is None else table
+    cells = table.get("cells") or {}
+    labels = table.get("labels") or []
+    label_a, label_b = _judge_label(schema_a), _judge_label(schema_b)
+    detail = {"a": schema_a, "b": schema_b, "label_a": label_a, "label_b": label_b, "cell": None}
+
+    symbol = cells.get((label_a, label_b))
+    if symbol is None:
+        # 表是对称的，读表时两把键都会注册（load_judge_table），但注入的表未必：
+        # 只写了 (里1, 外1) 一格时，(外1, 里1) 也该查到它，不该滑成未命中。
+        symbol = cells.get((label_b, label_a))
+    if symbol == JUDGE_CELL_SAME:
+        return True, {**detail, "source": "table", "cell": symbol}
+    if symbol == JUDGE_CELL_DIFFERENT:
+        return False, {**detail, "source": "table", "cell": symbol}
+    if symbol == JUDGE_CELL_LLM:
+        return None, {**detail, "source": "defer", "cell": symbol}
+    # 没有这一格：两侧标签都在表里、表也填过 -> 这一格是作者漏填的非法空格；否则只是未命中
+    if (table.get("filled") or 0) and label_a in labels and label_b in labels:
+        return None, {**detail, "source": "illegal"}
+    return None, {**detail, "source": "miss"}
+
+
+# --------------------------------------------------------------------------
+# 六、结果落盘
+# --------------------------------------------------------------------------
+
+
+RESULT_SCHEMA_VERSION = "1.2"
+"""结果 jsonl 的 schema 版本号，写进每条记录与运行汇总
+
+正式产物一律带版本号：读取侧据此判断这份文件能不能直接解析，旧格式走一次性迁移并有异常
+清单，**不在正式读取链路里长期靠猜字段**（D3）。改记录形状就升版本号。
+1.1：顶层 id 由 `sentence_id-位置-替换` 改为 `源行号-第几个目标词位置-第几个替换句`。
+1.2：id 最前面加来源文档编号，变成
+`来源文档编号-源行号-第几个目标词位置-第几个替换句`；source 块新增 source_document_no。
+（迁移脚本见 migrate_result_ids.py）。"""
+
+RESULT_REQUIRED_FIELDS: tuple[str, ...] = (
+    "id",
+    "status",
+    "stage",
+    "line_no",
+    "sentence_id",
+    "candidate_key",
+    "admission",
+    "schema_version",
+)
+"""一条正式结果记录必有的顶层字段（schema 检查用）
+
+只查**键在不在**、不查取值非空：id / line_no 在坏记录上本来就是 null（见
+spatial_graphs._record_id），把它们判成缺失会让 schema 检查把已知的合法形状报成错误。"""
+
+
+def validate_result_record(record: dict) -> list[str]:
+    """检查一条结果记录是否符合当前 schema，返回问题列表（空列表 = 通过）
+
+    与「流程跑完了」是两件事：这里只管记录的形状够不够格当正式产物（D3），语义对不对由
+    人工金标准与准入字段负责（见 spatial_graphs.pair_admission）。缺字段、字段类型不对、
+    schema_version 不是当前版本都在这里报出来，供收尾打印与离线体检用。
+    """
+    problems: list[str] = []
+    if not isinstance(record, dict):
+        return [f"记录不是对象，实际是 {type(record).__name__}"]
+    for field in RESULT_REQUIRED_FIELDS:
+        if field not in record:
+            problems.append(f"缺少顶层字段 {field!r}")
+    version = record.get("schema_version")
+    if version != RESULT_SCHEMA_VERSION:
+        problems.append(f"schema_version 是 {version!r}，当前版本 {RESULT_SCHEMA_VERSION!r}（需迁移后再用）")
+    return problems
+
+
+def build_output_path(out_dir: str | Path, prefix: str = "spatial_pairs") -> Path:
+    """生成带时间戳的输出文件路径，并确保目录存在
+
+    文件名精确到秒（E1）：同秒、同前缀两次运行会撞到同一个路径，而调用方是以 "w" 打开的，
+    撞上就是后一次把前一次截断。所以这里**挑一个尚不存在的名字**：已存在就往后顺延序号
+    （_2、_3 …），再配合 file_paths.open_exclusive 的独占创建，双重兜住这条路径。
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base = out_dir / f"{prefix}_{stamp}"
+    candidate = base.with_suffix(".jsonl")
+    sequence = 1
+    while candidate.exists():
+        sequence += 1
+        candidate = base.with_name(f"{base.name}_{sequence}.jsonl")
+    return candidate
+
+
+def pairs_csv_path(jsonl_path: str | Path) -> Path:
+    """与结果 jsonl 配套的成对信息 csv 路径，**保证与 jsonl 本身不是同一个文件**
+
+    `with_suffix(".csv")` 在 `--out-file result.csv` 这类路径上换出来还是它自己，于是收尾
+    导 csv 会把刚写好的 jsonl 覆盖掉（E1）。撞上就改用 `.pairs.csv`，宁可文件名长一点，
+    也不能让一份产物吃掉另一份。
+    """
+    path = Path(jsonl_path)
+    csv_path = path.with_suffix(".csv")
+    if csv_path == path:
+        csv_path = path.with_suffix(".pairs.csv")
+    return csv_path
+
+
+def write_jsonl(records: Iterable[dict], path: str | Path) -> int:
+    """把结果记录逐行写成 jsonl，返回写入的条数"""
+    count = 0
+    with open(path, "w", encoding="utf-8") as f:
+        for record in records:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            count += 1
+    return count
+
+
+def append_jsonl(record: dict, path: str | Path) -> None:
+    """追加一条结果记录（流式落盘，供长跑时中途查看进度）"""
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def iter_jsonl(path: str | Path) -> Iterator[dict]:
+    """流式逐条读取结果 jsonl（不把整份文件读进内存，空行跳过）
+
+    与 read_jsonl 共用同一套解析口径。导出、过滤等只消费一遍的场景应走这里；
+    需要排序或随机访问时再用 read_jsonl。
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                yield json.loads(line)
+
+
+def read_jsonl(path: str | Path) -> list[dict]:
+    """读一份结果 jsonl，逐行解析（空行跳过）
+
+    与 write_jsonl / append_jsonl 并列，是仓库里唯一的 jsonl 读法：收尾排序（见
+    spatial_runner.ResultWriter._sort_records）与对账脚本（compare_runs.py）都走它。
+    只消费一遍的调用方优先用 iter_jsonl，避免额外一份列表内存。
+    """
+    return list(iter_jsonl(path))
+
+
+PAIR_CSV_COLUMNS: tuple[tuple[str, str], ...] = (
+    # 记录标识「来源文档编号-源行号-第几个目标词位置-该位置第几个替换句」
+    # （见 spatial_graphs._record_id）：第三段把句内全部目标词位置都算上，空位置也占号；
+    # 没有替换句的记录是「文档号-行号-0-0」。id 之前产出的旧记录没有这个字段，这一格留空
+    ("id", "id"),
+    ("原句", "pair.a.sentence"),
+    ("替换句", "pair.b.sentence"),
+    ("关键词a", "focus_word.word"),
+    ("关键词下标a", "focus_word.index"),
+    ("关键词b", "focus_word_b.word"),
+    ("a的图式", "schema.a.name"),
+    ("b的图式", "schema.b.name"),
+    ("是否同义", "judgement.same_meaning"),
+    ("判断理由", "judgement.reason"),
+    ("判断来源", "judgement.source"),
+    ("查表结果", "judgement.lookup"),
+    ("阶段", "stage"),
+    # 「阶段」只说走到哪一步停下，看不出这条记录**成不成立**——判定失败、闸门没判出来
+    # 都停在同一个阶段。落最终 status 与失败原因，人工池才能按「留空」的真实由头分层
+    # （改写未命中 / 非空间 / 不通顺 / 未调 LLM / 调用失败），而不是把几种原因混成一类（D5）。
+    ("最终状态", "status"),
+    ("失败原因", "status_reason"),
+    # 稳定溯源与候选唯一键（D2/D1）：按它们回连结构化原记录、查同一候选有没有重复产出
+    ("句子ID", "sentence_id"),
+    ("候选唯一键", "candidate_key"),
+    ("是否准入", "admission.is_admitted"),
+    ("模型名称", "model_name"),
+)
+"""成对记录拍平 csv 的列序：表头 -> 记录里的点分路径（形状见 spatial_graphs.serialize_pair）
+
+真源就在这里：跑批收尾（spatial_runner.ResultWriter.finish）与独立的导出脚本
+（export_pairs_csv.py）都用这一份，改列只改这里。只有 pair 图画得成这张表——单句图与
+改写检查图的记录里没有 pair/judgement 两块（见 spatial_graphs.GraphSpec.csv_columns）。
+首列 id 是记录标识（来源文档编号-源行号-第几个目标词位置-第几个替换句，口径见
+spatial_graphs._record_id），在记录里就是顶层一个字段、点分路径只有一段；旧记录缺它时这一格留空。
+编号只在同一次跑批的输入内唯一（文档编号随 --offset 重排），跨文件的身份仍看「句子ID」。
+末列「模型名称」来自顶层 model_name，记录本次 --model 的配置名；--no-llm 模式或旧记录缺该字段时留空。
+"""
+
+
+def _dig(record: dict, path: str, default: Any = "") -> Any:
+    """沿点分路径取值；路径上任一段缺失、为 None 或不是字典，就返回 default"""
+    cur = record
+    for key in path.split("."):
+        if not isinstance(cur, dict) or key not in cur or cur[key] is None:
+            return default
+        cur = cur[key]
+    return cur
+
+
+def _csv_cell(record: dict, path: str) -> str:
+    """把一个字段拍成 csv 单元格：布尔转「是/否」，其余原样转字符串，空值留空"""
+    value = _dig(record, path)
+    if isinstance(value, bool):
+        return "是" if value else "否"
+    return "" if value is None else str(value)
+
+
+def write_pairs_csv(
+    records: Iterable[dict], path: str | Path, columns: tuple[tuple[str, str], ...] = PAIR_CSV_COLUMNS
+) -> tuple[int, int]:
+    """把成对记录拍平成 csv，返回（总行数，其中有同义判断的行数）
+
+    只有走到 semantic_ok 的记录才有图式与同义判断（judgement 非空），其余记录
+    （not_spatial、semantic_failed_* 等）这两块是空的，对应格子留空；「阶段」列保留原始
+    stage 值，用来区分有没有判断——semantic_ok 即有判断，其余为空判断。
+
+    输出用 utf-8-sig（带 BOM）写：面向 Excel/记事本，与仓库读 csv 的口径一致
+    （见 load_judge_table 的注释与 utils.read_text 的说明）。
+    """
+    judged = 0
+    total = 0
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([header for header, _ in columns])
+        for record in records:
+            writer.writerow([_csv_cell(record, field) for _, field in columns])
+            total += 1
+            if _dig(record, "judgement.same_meaning", None) is not None:
+                judged += 1
+    return total, judged
+
+
+# --------------------------------------------------------------------------
+# 七、供 LLM agent 调用的工具
+# --------------------------------------------------------------------------
+
+
+def render_syntax(cws: list[str], pos: list[str], dep: dict) -> str:
+    """把一份已算好的 LTP 结果渲染成文本形式的句法证据（纯函数，不碰模型）
+
+    每个 token 前面都打了它从 0 开始的下标（`3:进/v`）：一是让「第 N 个词」这种说法能直接核对，
+    二是分词行按空格分隔，token 本身可能含空白（实测 location 语料的 token 里约 1.2% 带尾空格，
+    如 `": "`），照着空格数会整体数错一位。
+    """
+    dep_lines = []
+    for idx, (head, label) in enumerate(zip(dep["head"], dep["label"])):
+        # LTP 的 head 是从 1 开始的下标，0 表示指向根节点（核心谓词）
+        if head == 0:
+            dep_lines.append(f"  {idx}:{cws[idx]} —{label}—> ROOT")
+        else:
+            dep_lines.append(f"  {idx}:{cws[idx]} —{label}—> {head - 1}:{cws[head - 1]}")
+
+    return "\n".join(
+        [
+            f"分词/词性: {' '.join(f'{i}:{w}/{p}' for i, (w, p) in enumerate(zip(cws, pos)))}",
+            "依存句法:",
+            *dep_lines,
+        ]
+    )
+
+
+def parse_sentence_text(sentence: str) -> str:
+    """对单句做 LTP 分析并渲染句法证据（**会触发单句推理**，仅供显式调用/兼容旧代码）
+
+    LLM 标注链路不再调用本函数：消息里的句法证据一律从 prepare_syntax 建好的运行级证据表
+    读取（见 syntax_text），保证每个唯一句子只推理一次、worker 内不再补算。
+    """
+    cws = _cache.get_task_value(sentence, config.CWS)
+    pos = _cache.get_task_value(sentence, config.POS)
+    dep = _cache.get_task_value(sentence, config.DEP)
+    return render_syntax(cws, pos, dep)
+
+
+_SYNTAX_EVIDENCE: dict[str, dict] = {}
+"""运行级句法证据表：{句子: {"text": str | None, "error": str | None}}
+
+由 prepare_syntax 在跑批前填好，之后所有 agent 只读。它是「一次调用、处处使用」的落点：
+- 多模型投票时几个模型共用同一份（LTP 是模型无关的）；
+- 缓存条目被淘汰也不影响已渲染的文本；
+- 未准备的句子返回 None 并降级，绝不在 worker 里补算。
+"""
+_SYNTAX_LOCK = threading.Lock()
+_SYNTAX_WARNED = False
+"""未准备句子的告警只打一次，避免逐条刷屏"""
+
+
+def prepare_syntax(sentences: Iterable[str], chunk_size: int | None = None) -> dict:
+    """跑批前一次性准备整批句子的句法证据（每个唯一句子只做一次 LTP 推理）
+
+    分片预填充、**每片推理完立刻渲染并入证据表**：整批一次填进 LRU 后，超出容量时早期句子
+    会被淘汰，等到拼消息再渲染就又要单句推理。分片后每片的大小不超过缓存容量，渲染发生在
+    下一片预填充之前，因此不受淘汰影响。
+
+    Args:
+        sentences (Iterable[str]): 本图会让模型看到的全部句子（图自己的 plan 给出）
+        chunk_size (int, optional): 每片多少句；默认 config.LTP_BATCH_CHUNK
+
+    Returns:
+        dict: {"sentences", "inferred", "cached", "failed"}
+            inferred  实际送入 LTP 的句子数（其余是上次已准备/已缓存的）
+            cached    证据表里原本就有、这次跳过推理的句子数
+            failed    推理或渲染失败、只能降级的句子数（失败原因也记进证据表）
+    """
+    unique = [s for s in dict.fromkeys(sentences) if isinstance(s, str) and s]
+    missing = []
+    for sentence in unique:
+        with _SYNTAX_LOCK:
+            if sentence not in _SYNTAX_EVIDENCE:
+                missing.append(sentence)
+    stat = {"sentences": len(unique), "inferred": 0, "cached": len(unique) - len(missing), "failed": 0}
+    size = max(1, int(chunk_size or config.LTP_BATCH_CHUNK))
+    for start in range(0, len(missing), size):
+        chunk = missing[start : start + size]
+        stat["inferred"] += prefill_ltp(chunk, chunk_size=len(chunk))
+        for sentence in chunk:
+            text, error = _render_cached_syntax(sentence)
+            with _SYNTAX_LOCK:
+                _SYNTAX_EVIDENCE[sentence] = {"text": text, "error": error}
+            if error:
+                stat["failed"] += 1
+    return stat
+
+
+def _render_cached_syntax(sentence: str) -> tuple[str | None, str | None]:
+    """从 LTP 缓存**只读**渲染句法证据；缺任何一项都返回 (None, 原因)，不触发推理"""
+    cws = _cache.get_cached(sentence, config.CWS)
+    pos = _cache.get_cached(sentence, config.POS)
+    dep = _cache.get_cached(sentence, config.DEP)
+    missing = [name for name, value in ((config.CWS, cws), (config.POS, pos), (config.DEP, dep)) if value is None]
+    if missing:
+        return None, f"预填充后缓存里缺少 {'/'.join(missing)}（句子可能超出缓存容量）"
+    try:
+        return render_syntax(cws, pos, dep), None
+    except Exception as exc:  # noqa: BLE001 —— 渲染失败只降级，不让它决定这条记录跑不跑
+        return None, f"句法证据渲染失败：{exc!r}"
+
+
+def syntax_text(sentence: str) -> str | None:
+    """读取已准备的句法证据（纯内存查找；未准备时返回 None，绝不触发 LTP 推理）"""
+    with _SYNTAX_LOCK:
+        entry = _SYNTAX_EVIDENCE.get(sentence)
+    if entry is None:
+        global _SYNTAX_WARNED
+        if not _SYNTAX_WARNED:
+            _SYNTAX_WARNED = True
+            print(
+                "警告：有句子没有经过 prepare_syntax 准备，消息里将省略句法证据；"
+                "LLM 标注链路不再在线补算 LTP"
+            )
+        return None
+    return entry.get("text")
+
+
+def syntax_error(sentence: str) -> str | None:
+    """该句句法证据的准备失败原因（未准备或成功时为 None）"""
+    with _SYNTAX_LOCK:
+        entry = _SYNTAX_EVIDENCE.get(sentence) or {}
+    return entry.get("error")
+
+
+def syntax_ready(sentence: str) -> bool:
+    """该句的句法证据是否已准备（有文本）"""
+    with _SYNTAX_LOCK:
+        entry = _SYNTAX_EVIDENCE.get(sentence) or {}
+    return bool(entry.get("text"))
+
+
+def reset_syntax_evidence() -> None:
+    """清空运行级证据表（离线测试与对照实验用）"""
+    global _SYNTAX_WARNED
+    with _SYNTAX_LOCK:
+        _SYNTAX_EVIDENCE.clear()
+    _SYNTAX_WARNED = False
+
+
+def prefill_ltp(sentences: Iterable[str], chunk_size: int | None = None) -> int:
+    """批量预填充 LTP 原始任务缓存（只填 LRU，不渲染）
+
+    一般应直接用 prepare_syntax：它在本函数之上把渲染结果存进运行级证据表。
+    保留本函数供筛选阶段等只需要原始 LTP 结果的调用方使用。
+    """
+    return _cache.prefill(sentences, chunk_size=chunk_size)
+
+
+def cache_ready(sentence: str) -> bool:
+    """该句的 LTP 基础任务是否都还在缓存里（预填充后的自检用）"""
+    return _cache.has_base_tasks(sentence)
+
+
+@tool
+def parse_sentence(sentence: str) -> str:
+    """读取该句**已准备**的句法证据（分词/词性 + 依存句法）。
+
+    本工具只读跑批前准备的证据，不会现场跑 LTP。每个 token 前面是它从 0 开始的下标
+    （`3:进/v`），与「第几个词」这种说法可以逐位对上。
+
+    Args:
+        sentence (str): 待查看的单个句子（必须与消息里给出的句子逐字相同）
+
+    Returns:
+        str: 分词（词/词性）、依存句法（词 —关系—> 中心词）；未准备时返回一句说明
+    """
+    text = syntax_text(sentence)
+    if text:
+        return text
+    reason = syntax_error(sentence)
+    return "该句的句法证据未在跑批前准备，无法在线补算" + (f"（{reason}）" if reason else "") + "；请仅凭句子作答。"
+
+
+@tool
+def lookup_schema_tool(features_json: str, focus_word: str = "") -> str:
+    """按语义特征查 schema 表（纯查表，不含 LLM 判断）。
+
+    Args:
+        features_json (str): 该句的语义特征，JSON 对象字符串，如 {"area": ["[-容器内]"], "distance": ["[+近]"]}
+        focus_word (str): 本次需要关注的方位词/趋向动词；给了就只在收它的那个词条里找，
+            词条写了 words 时，写任一列出的词形（外面/外边）都算收进同一个词条（见 lookup_schema）
+
+    Returns:
+        str: 命中时返回 schema 名，未命中返回 "未命中"
+    """
+    try:
+        features = json.loads(features_json)
+    except json.JSONDecodeError as e:
+        return f"features_json 不是合法 JSON：{e}"
+    name, detail = lookup_schema(features, focus_word={"word": focus_word} if focus_word else None)
+    return name if name else f"未命中（{detail.get('source')}）"
+
+
+if __name__ == "__main__":
+    # 纯规则部分的冒烟测试：不调 LLM，也不需要 GPU
+    demo_slice = ["在", "硬件", "上", "说", ",", "它", "将", "涉及", "到", "参数", "设置", "。"]
+    demo_info = {"index": 2, "word": "上", "children": [{"index": 1, "word": "硬件"}]}
+    demo_rules = {
+        "groups": [
+            {"words": ["上", "中", "里"], "replacements": ["上", "中", "里"]},
+            {"words": ["前", "后"], "replacements": ["前", "后"]},
+        ]
+    }
+
+    # 关注词：两份词表 + 三级回落（sampled_word -> 按词表 walk match_tree -> match_tree[0]）
+    print(f"关注词表：{ {kind: len(words) for kind, words in load_focus_vocab().items()} }")
+    demo_records = [
+        # 抽样的语料：sampled_word 直接给答案（趋向动词在子节点里，根节点是搭配动词 走）
+        {
+            "sentence": ["他", "走", "进", "村子", "。"],
+            "filter_methods": ["root", "manner_verb_one_complement"],
+            "match_tree": [{"index": 1, "word": "走", "children": [{"index": 2, "word": "进"}]}],
+            "sampled_word": "进",
+        },
+        # 未抽样的语料：按词表 walk（方位词就是根节点）
+        {
+            "sentence": ["在", "硬件", "上", "说", "。"],
+            "filter_methods": ["root", "locality_phrase"],
+            "match_tree": [{"index": 2, "word": "上", "children": [{"index": 1, "word": "硬件"}]}],
+        },
+        # 一个目标词都没匹配上：回落到 match_tree[0] 的搭配动词，此时 kind 是空串（不猜）
+        {
+            "sentence": ["他", "带", "着", "书", "。"],
+            "filter_methods": ["root", "accompany_verb_two_complement"],
+            "match_tree": [{"index": 1, "word": "带", "children": [{"index": 3, "word": "书"}]}],
+        },
+        # 同一个词在搭配动词前后各出现一次：取排在动词之后的那个（族收窄挡不住这一类）
+        {
+            "sentence": ["然后", "我们", "在", "上", "撒", "上", "盐", "。"],
+            "filter_methods": ["root", "cause_verb_one_complement"],
+            "match_tree": [{"index": 4, "word": "撒", "children": [{"index": 3, "word": "上"}, {"index": 5, "word": "上"}]}],
+        },
+    ]
+    for record in demo_records:
+        print(f"  {join_slice(record['sentence'])} -> {pick_focus_word(record)}")
+    print(f"  破平局（「上」两张表都收）：locality 规则 {focus_kind('上', ['locality_phrase'])}；"
+          f"direction 规则 {focus_kind('上', ['direction_verb_as_center'])}")
+
+    print(f"原句: {join_slice(demo_slice)}")
+    print(f"收「上」的组: {json.dumps(find_word_groups('上', demo_rules), ensure_ascii=False)}")
+    print(f"收「里面」的组: {find_word_groups('里面', demo_rules)}")
+
+    new_slices, detail = alter_sentence(demo_slice, demo_info, demo_rules)
+    print(f"待选句 {len(new_slices)} 个：")
+    for index, (candidate, new_slice) in enumerate(zip(detail["candidates"], new_slices)):
+        print(
+            f"  [{index}] {join_slice(new_slice)}"
+            f"（{candidate['replacement']}，来自 {candidate['source']}：{'、'.join(candidate['group'])}）"
+        )
+
+    # 显式指定替换词时只出一个待选句，便于验证规则表外的用法
+    new_slices, detail = alter_sentence(demo_slice, {**demo_info, "replacement": "里"}, demo_rules)
+    print(f"指定替换词后: {[join_slice(s) for s in new_slices]}（applied={detail['applied']}）")
+
+    # 空表（显式传入）不得凭空造出待选句——默认那张表读的是 config_files/localization/
+    # alter_rules.json5，本地已填内容，跑它验不出空表行为
+    new_slices, detail = alter_sentence(demo_slice, demo_info, {})
+    print(f"空表（显式传入）: 待选句 {len(new_slices)} 个（applied={detail['applied']}）：{detail['reason']}")
+
+    # schema 查表：先按关注词收窄、再按特征匹配（多组条件是「或」，多值特征是「任一」）
+    configured = load_schema_table()
+    print(
+        f"  实际配置（{SCHEMA_TABLE_FILE.parent.name}/{SCHEMA_TABLE_FILE.name}）："
+        f"{len(schema_candidates(configured))} 条图式，"
+        f"{len(configured.get('schemas') or {})} 个词条"
+    )
+    demo_table = {
+        "schemas": {
+            "外": {
+                # 词形写在自己这一组的 words 里（与编号同级）：外面/外边/外头 都归「外」这一类，
+                # 名字仍用组名（外1），判定表因此只需按类写一份
+                "words": ["外", "外面", "外边", "外头"],
+                "1": {
+                    "description": "目标物在参照物外部、与之贴近或邻近",
+                    "match": [
+                        {"area": ["[-容器内]"], "distance": ["[+紧连]"]},
+                        {"area": ["[-容器内]"], "distance": ["[+近]"]},
+                    ],
+                },
+                "2": {
+                    "description": "目标物在参照物外部、相距很远",
+                    "match": [{"area": ["[-容器内]"], "distance": ["[+远]"]}],
+                },
+            },
+            "上": {"1": {"description": "方位短语表处所", "match": {"area": ["[+边界内]"]}}},
+        }
+    }
+    near = {"area": ["[-容器内]"], "distance": ["[+近]"]}
+    multi = {**near, "distance": ["[+近]", "[+远]"]}
+    print(f"  「外」+ 距离[+近] -> {lookup_schema(near, demo_table, {'word': '外'})[0]}")
+    print(f"  「外」+ 多值特征 距离[+近,+远] -> {lookup_schema(multi, demo_table, {'word': '外'})[0]}")
+    print(f"  「上」+ 同一组特征（被关注词排除）-> {lookup_schema(near, demo_table, {'word': '上'})[1]}")
+    print(f"  「外面」经 words 归入「外」-> {sorted(schema_candidates(demo_table, {'word': '外面'}))}"
+          f"，组名 {schema_group_key(demo_table, {'word': '外面'})}")
+    print(f"  「桌面」不在任何 words 里 -> {schema_candidates(demo_table, {'word': '桌面'})}"
+          f"，组名 {schema_group_key(demo_table, {'word': '桌面'})}")
+    print(f"  没有关注词时不收窄 -> {lookup_schema({**near, 'area': ['[+边界内]']}, demo_table)[0]}")
+    judge_rows = [
+        ["", "位移-进入", "位移-离开", "未判出"],
+        ["位移-进入", "", "", "○"],
+        ["位移-离开", "", "", ""],
+        ["未判出", "", "○", ""],
+    ]
+    judge_table = _judge_table_from_rows(judge_rows)
+    print(f"  判定表：{judge_table['labels']}，已填 {judge_table['filled']} 格，问题 {judge_table['problems']}")
+    for a, b in (("位移-进入", "位移-进入"), ("位移-进入", "位移-离开"), ("未判出", "未判出"), ("位移-离开", "未判出"), ("位移-离开", "位移-离开")):
+        same, detail = lookup_judgement(a, b, judge_table)
+        print(f"    {a} × {b} -> same={same} source={detail['source']} cell={detail['cell']!r}")
