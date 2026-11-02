@@ -11,7 +11,7 @@ python annotate --help
 python annotate --engine all-in-one --help
 ```
 
-- `extract/`：提取入口、Windows/Linux 执行器、规则与 LTP 缓存、切句、语义闸门、原句筛选、提取日志、按词采样及 LTP 诊断脚本。
+- `extract/`：提取入口、Windows/Linux 执行器、规则与 LTP 缓存、切句、语义闸门、原句筛选、提取日志及按词采样。
 - `replace/`：机械替换、两侧检查和句对数据契约。
 - `annotate/`：分步/单次标注、空间 agent/图/工具、提示示例选择、投票、CSV 导出/抽样和结果 ID 迁移。
 - **本版是入口兼容性变更。** 上一版（`2770a92`、`f6e2936`）暂存的根目录同名 `.py` 转发入口和 `legacy_entry.py` 已彻底删除。`python sentence_extract.py`、`python spatial_runner.py` 等旧命令及 `import spatial_tools` 等旧导入不再支持，部署前必须更新外部调用。
@@ -47,9 +47,16 @@ from annotate import spatial_tools, spatial_runner, all_in_one
 | `python sample_pairs_csv.py ...` | `python -m annotate.sample_pairs_csv ...` |
 | `python migrate_result_ids.py ...` | `python -m annotate.migrate_result_ids ...` |
 | `python sentenceFilters.py` | `python -m extract.sentenceFilters`（会执行 LTP 自测） |
-| `python temp.py` | `python -m extract.temp`（历史 LTP 诊断，仍需模型及适合本机的模型路径） |
 
-删除范围仅为 25 个阶段模块的根目录转发文件及 `legacy_entry.py`。`pipeline.py`、上述共享模块和三个阶段目录中的实现都保留；旧入口不是可单独恢复的运行方案。
+此前已删除 25 个阶段模块的根目录转发文件及 `legacy_entry.py`。`pipeline.py`、上述共享模块和三个阶段目录中的生产实现都保留；旧入口不是可单独恢复的运行方案。
+
+### 最小运行版的提交范围
+
+本次另追加取消跟踪提交，排除非运行必需内容：`extract/temp.py`、`.docs/plans/2026-11-02-stage-layout.md`、`tests/`、`filter_sentence/`、`filtered_sentences.csv`、`note.txt` 和 `项目审查与改进建议.md`。本地副本保留供后续开发，并通过定向忽略规则防止再次被批量加入；服务器更新后不能依赖这些文件。
+
+运行所需的三个阶段包、共享基础模块、`annotate/prompt_examples.py`、`replace/corpus_pairs.py`、`replace/sentence_replace.py`、`system_prompt/judgement_criteria.txt` 和四个示例 JSON5 均继续跟踪。不要把运行时提示示例误当作本地语料样例删除，也不要忽略所有 CSV，配置目录中的判定表仍是运行依赖。
+
+这是追加删除提交，不改写已有历史，因此上述文件仍可能出现在先前提交中。忽略文件不受 Git 跟踪，也不会进入 `git stash -u`；后续开发前应另行备份或有选择地提交到开发分支，勿用 `git clean -fdx` 清理它们。
 
 ## 单阶段调用
 
@@ -120,23 +127,23 @@ Git 会同步已跟踪的包路径改动和旧入口删除，不会同步被忽�
 6. `git fetch origin` 后使用 `git pull --ff-only origin main`。若有服务器本地提交导致不能快进，停下来人工决定 merge/rebase，不强制覆盖。
 7. 如需恢复 stash，先 `git stash apply`，确认内容和测试后再决定是否删除 stash。服务器对旧大文件/兼容壳的修改可能产生 modify/delete 冲突，或让旧文件重新出现：把业务改动迁入阶段包中的实现，并同步修改 import，**不要恢复已删除的根目录转发文件**。
 8. **恢复任务前，先完成外部调用迁移：**检查 cron、systemd、nohup/批处理脚本、IDE 启动配置、Notebook 及自定义 Python 脚本，按上表替换旧命令、import 和字符串补丁路径。设置工作目录为项目根目录，使用原虚拟环境解释器；服务器上仅 `git pull` 不会自动修改仓库外的定时任务。`pipeline.py` 的现有调用不需要改名。
-9. 确认原模型路径、API 配置和依赖环境仍可用；本次未新增第三方依赖。运行下方测试和四个目录 `--help`，然后小批量验证现有模型接口。**旧 cron/nohup 命令现在会失败，验证前不能恢复调度。**
+9. 确认原模型路径、API 配置和依赖环境仍可用；本次未新增第三方依赖。按下方部署验证执行命令，再小批量验证现有模型接口。**旧 cron/nohup 命令现在会失败，验证前不能恢复调度。**
 10. 若需回滚部署，优先切换到事先备份的完整旧版本代码目录，同时恢复与该版本对应的外部启动命令。不要只复制几个旧入口，也不要在未备份的共享工作区强制重置。
 
 若采用文件复制而非 Git，必须把三个包目录和共享文件作为同一版本完整同步；还应对照本次 Git 删除清单，仅移除根目录的 25 个转发文件和 `legacy_entry.py`。不要直接删除全部根目录 `.py` 文件。**禁止使用带删除的广域同步命令**（例如未审查的 `rsync --delete`），以免删掉共享代码、服务器数据、模型或密钥。
 
-## 验证
+## 最小运行版的部署验证
+
+在装有项目依赖的虚拟环境中，从项目根目录运行：
 
 ```sh
-python -m unittest discover -s tests -v
+python pipeline.py --help
+python extract --help
+python replace --help
+python annotate --help
+python annotate --engine all-in-one --help
 ```
 
-测试覆盖既有句对/提示流程、目录入口及 engine 分派、资源根路径、在禁止全部旧模块名的独立解释器中加载阶段包、根目录转发文件已删除、多进程 spawn、全部六种连续区间、参数透传、路径与覆盖检查、dry-run 无副作用和失败即停。不包含真实在线模型请求及服务器端运行；这些需在自己的环境小样本验证。
+这些命令检查入口与依赖能否加载，不发送模型请求，也不能证明模型配置、语料内容或最终标注质量正确。再用独立的小样本输入执行 `pipeline.py ... --dry-run` 检查实际路径，确认后按前文命令进行小批量验证；真实模型验证可能产生费用。
 
-本次移除兼容层的验证记录：
-
-- 先验证包路径改写：删除前的 44 项回归通过（完整执行所有业务测试、隔离导入测试、资源路径和 spawn 测试；目录 CLI 及文件删除断言留待删除后执行）。
-- 逐一核对待删除文件内容，确认 25 个文件均为未改动的转发层，再删除它们及 `legacy_entry.py`。删除后检查全部 26 个旧模块名均不能再被解析，共享基础模块和 `pipeline.py` 仍可解析。
-- 31 个阶段包文件经语法树对比，除导入路径和帮助/提示文字外无可执行逻辑改动。独立代码复核未发现待修复问题。
-- 首轮删除后的全量测试已通过前 45 项，但在最后一项 spawn 测试期间触及执行工具的 600 秒总时限，未计为全量通过；随后 spawn 单项独立通过（108.225 秒）。本机新解释器加载 LTP/torch 等依赖较慢，全量验证需要为执行工具预留超过 10 分钟的总时限，不能通过跳过测试掩盖超时。
-- 增加工具总时限后，删除兼容文件的最终完整测试 **46/46 通过**（`python -m unittest discover -s tests -v`，测试运行时间 486.861 秒；另有发现/导入测试模块的启动时间）。本次未调用在线模型、未登录或修改服务器。
+完整回归测试曾在精简前通过 46 项；测试源码当前仅保留在本地供后续开发，不随本次部署提交。因此不要在服务器运行 `python -m unittest discover -s tests -v` 作为本版本的验证：没有本项目 `tests/` 时可能报错或发现第三方同名测试包。需要复现完整回归时，应取得相应的开发分支/测试文件，并确认测试确实来自本项目。
