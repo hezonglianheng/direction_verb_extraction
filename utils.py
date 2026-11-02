@@ -6,9 +6,10 @@
 目录用 __file__ 解析成绝对路径，与运行时 cwd 无关（与 config.py / spatial_tools.py 同一做法）。
 agent 在构造期调用 read_prompt / render_prompt 把正文读进来，见 spatial_agents.BaseAgent。
 
-例外是 reality_agent 那一份：它的判据按语料类型分，所以与它那组配置表一起放在
-config_files/<语料类型>/ 下（见 spatial_tools.CONFIG_PROMPT_FILES），读法是 read_prompt_path
-——两条路的读法与报错文案是同一套，只有路径的来源不同。
+例外是空间判据片段 reality.txt：它按语料类型分，所以与那组配置表一起放在
+config_files/<语料类型>/ 下（见 spatial_tools.CONFIG_PROMPT_FILES），由 screen_<类型>.txt
+与 all_in_one 共同注入；读法是 read_prompt_path——两条路的读法与报错文案是同一套，
+只有路径的来源不同。
 """
 
 import re

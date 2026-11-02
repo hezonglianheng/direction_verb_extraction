@@ -1,153 +1,31 @@
-// 语义特征类别表（feature_agent 用）
-//
-// 语义特征分为 4 类，本文件定义这 4 类是什么。feature_agent 是一个 deep agent，
-// 每一类交给一个 subagent 负责：subagent 拿到句子后先调 parse_sentence 取句法证据，
-// 再按 description 里的判据给出该类的取值，最后由主 agent 汇总成一个特征对象。
-//
-// 每类需要填的字段：
-//   key         特征字段名，会作为最终特征对象的键，也是 schema_table.json5 里 match 用的键
-//   name        中文名，显示用
-//   description 该类特征要抽什么、按什么判据抽。这句话会原样进 subagent 的提示语，
-//               写得越具体（列出可选取值、边界情形怎么算）抽取越稳
-//   values      可选取值列表（留空表示开放式取值，由模型自行概括）
-//   examples    正例，形如 {"sentence": "...", "<key>": "<取值>", "instruction": "..."}
-//               instruction 是一段提示语，说明「怎么判断这句话属于这个取值」，会缩进渲染在
-//               该条示例的 JSON 行下面。可留空（留空则该条只显示句子与取值）；没写这个字段
-//               与写了空串效果一样。示例最多渲染前 5 条（见 spatial_agents.render_example_lines）
-//
-// 4 个槽位留空待填：key 为空的类别会被跳过（不建对应 subagent）。
-// 4 类全空时 feature_agent 退化为单个 agent 自由抽取特征，结果记录里的
-// features_source 会标成 "unfilled_config"，提醒这不是按既定类别抽的。
-//
-// 填完后可直接跑 .venv/bin/python spatial_runner.py --graph pair --limit 5 观察抽取结果。
+// 方位词空间特征类别。保留类别定义和可选标签；示例迁至独立文件，按关注词选择。
+// 活跃示例：system_prompt/examples/feature_localization.json5。
+// 每类 key 必须唯一，也供同目录 schema_table.json5 的 match 引用。
 {
     "classes": [
         {
             "key": "area",
             "name": "范围",
             "description": "请判断该句子中目标物（关键词关联的空间方位表达中，被描述空间信息的实体）是否处于一个由参照物确定的空间范围内，以及这个空间范围究竟属于容纳一个物体的容器，还是表示一个空间区域的边界。",
-            "values": ["[+容器内]", "[+边界内]", "[-容器内]", "[-边界内]",], 
-            "examples": [
-                {
-                    "sentence": "杯子里盛着一些水。",
-                    "area": "[+容器内]",
-                    "instruction": "当需要描述的实体位于一个三维容器的内部时，使用“[+容器内]”。",
-                },
-                {
-                    "sentence": "一群人站在操场里。",
-                    "area": "[+边界内]",
-                    "instruction": "当需要描述的实体位于一个空间区域之内，或者位于该空间区域的边界内时，使用“[+边界内]”。",
-                },
-                {
-                    "sentence": "这个房间外面有一张桌子。",
-                    "area": "[-容器内]",
-                    "instruction": "当需要描述的实体位于一个三维容器的外部时，使用“[-容器内]”。",
-                },
-                {
-                    "sentence": "他站在围墙外面。",
-                    "area": "[-边界内]",
-                    "instruction": "当需要描述的实体位于一个空间区域的外部时，使用“[-边界内]”。",
-                },
-            ],
+            "values": ["[+容器内]", "[+边界内]", "[-容器内]", "[-边界内]"],
         },
         {
             "key": "vertical_direction",
             "name": "竖直方向",
             "description": "请判断该句子中目标物（关键词关联的空间方位表达中，被描述空间信息的实体）和参照物之间在竖直方向上的相对位置关系。",
             "values": ["[+上方]", "[+下方]", "[无]"],
-            "examples": [
-                {
-                    "sentence": "桌子上放着一个杯子。",
-                    "vertical_direction": "[+上方]",
-                    "instruction": "当需要描述的实体的高度高于参照物时，使用“[+上方]”。",
-                },
-                {
-                    "sentence": "书放在桌子下面。",
-                    "vertical_direction": "[+下方]",
-                    "instruction": "当需要描述的实体的高度低于参照物时，使用“[+下方]”。",
-                },
-                {
-                    "sentence": "这个房间里有一张桌子。",
-                    "vertical_direction": "[无]",
-                    "instruction": "当需要描述的实体与参照物在竖直方向上没有明显的相对位置关系时，使用“[无]”。",
-                },
-            ],
         },
         {
             "key": "horizontal_direction",
             "name": "水平方向",
             "description": "请判断该句子中目标物和参照物之间在水平方向上的相对位置关系。目标物环绕参照物、四个水平方向（前、后、左、右）同时成立时，用“[+四周]”概括，不要再单判成其中某一个方向。",
             "values": ["[+前方]", "[+后方]", "[+左方]", "[+右方]", "[+侧面]", "[+四周]", "[无]"],
-            "examples": [
-                {
-                    "sentence": "他站在我前面。",
-                    "horizontal_direction": "[+前方]",
-                    "instruction": "当需要描述的实体位于参照物的前方时，使用“[+前方]”。",
-                },
-                {
-                    "sentence": "我坐在他后面。",
-                    "horizontal_direction": "[+后方]",
-                    "instruction": "当需要描述的实体位于参照物的后方时，使用“[+后方]”。",
-                },
-                {
-                    "sentence": "书架在教室的左边。",
-                    "horizontal_direction": "[+左方]",
-                    "instruction": "当需要描述的实体位于参照物的左方时，使用“[+左方]”。",
-                },
-                {
-                    "sentence": "门在房间的右边。",
-                    "horizontal_direction": "[+右方]",
-                    "instruction": "当需要描述的实体位于参照物的右方时，使用“[+右方]”。",
-                },
-                {
-                    "sentence": "他站在汽车的侧面。",
-                    "horizontal_direction": "[+侧面]",
-                    "instruction": "当需要描述的实体位于参照物的左侧或者右侧，但不能确定具体在哪一侧时，使用“[+侧面]”。如果可以确定具体的位置，则使用“[+左方]”或“[+右方]”。",
-                },
-                {
-                    "sentence": "他站在大槐树的旁边。",
-                    "horizontal_direction": "[+四周]",
-                    "instruction": "当需要描述的实体位于参照物周遭的某个位置，但不能确定具体的位置时，使用“[+四周]”。如果可以确定具体的位置，则使用“[+前方]”、“[+后方]”、“[+左方]”或“[+右方]”。",
-                },
-                {
-                    "sentence": "这个房间里有一张桌子。",
-                    "horizontal_direction": "[无]",
-                    "instruction": "当需要描述的实体与参照物在水平方向上没有明显的相对位置关系时，使用“[无]”。",
-                },
-            ],
         },
         {
             "key": "distance",
             "name": "距离",
             "description": "请判断该句子中目标物（关键词关联的空间方位表达中，被描述空间信息的实体）和参照物之间的距离关系。",
             "values": ["[+邻接]", "[+紧连]", "[+近]", "[+远]", "[无]"],
-            "examples": [
-                {
-                    "sentence": "海报贴在墙上",
-                    "distance": "[+紧连]",
-                    "instruction": "当需要描述的实体附着在参照物表面时，使用“[+紧连]”。",
-                },
-                {
-                    "sentence": "蒋一轮靠在树上",
-                    "distance": "[+邻接]",
-                    "instruction": "当需要描述的实体与参照物较为松散地接触时，使用“[+邻接]”。",
-                },
-                {
-                    "sentence": "桌子旁边有一把椅子。",
-                    "distance": "[+近]",
-                    "instruction": "当需要描述的实体与参照物之间有一定的距离且较近时，使用“[+近]”。",
-                },
-                {
-                    "sentence": "他们通过线上教学和外面的老师互动。",
-                    "distance": "[+远]",
-                    "instruction": "当需要描述的实体与参照物之间有一定的距离且较远时，使用“[+远]”。",
-                },
-                {
-                    "sentence": "这个房间里有一张桌子。",
-                    "distance": "[无]",
-                    "instruction": "当需要描述的实体被参照物容纳时，使用“[无]”。",
-                }, 
-            ],
         },
     ],
 }

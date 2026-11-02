@@ -2,9 +2,9 @@
 //
 // 语义特征类别表（feature_agent 用）
 //
-// 语义特征分为若干类，本文件定义这几类是什么。feature_agent 是一个 deep agent，
-// 每一类交给一个 subagent 负责：subagent 拿到句子后先调 parse_sentence 取句法证据，
-// 再按 description 里的判据给出该类的取值，最后由主 agent 汇总成一个特征对象。
+// 语义特征分为若干类，本文件定义这几类是什么。feature_agent 默认是**单次调用**：
+// 把各类的判据、可选取值与示例拼进一份提示语，一次产出全部特征字段。
+// 传 --feature-deep 时才改用 deep agent，每一类交给一个 subagent 负责。
 //
 // 每类需要填的字段：
 //   key         特征字段名，会作为最终特征对象的键，也是 schema_table.json5 里 match 用的键
@@ -12,12 +12,14 @@
 //   description 该类特征要抽什么、按什么判据抽。这句话会原样进 subagent 的提示语，
 //               写得越具体（列出可选取值、边界情形怎么算）抽取越稳
 //   values      可选取值列表（留空表示开放式取值，由模型自行概括）
-//   examples    正例，形如 {"sentence": "...", "<key>": "<取值>", "instruction": "..."}
-//               instruction 是一段提示语，说明「怎么判断这句话属于这个取值」，会缩进渲染在
-//               该条示例的 JSON 行下面。可留空（留空则该条只显示句子与取值）；没写这个字段
-//               与写了空串效果一样。示例最多渲染前 5 条（见 spatial_agents.render_example_lines）
+// 示例独立存放在 system_prompt/examples/feature_direction.json5，按关注词精确选择。
+// 本表不再读取 examples；每组示例的格式是 {words: [...], examples: [{sentence, instruction}]}。
 //
-// 槽位留空待填：key 为空的类别会被跳过（不建对应 subagent）。
+// instruction 可以写多行：JSON5 字符串里用 \n 换行，后续每一行都会缩进渲染到「说明：」下面。
+//   例："instruction": "先确认主体是否真的位移。\n再看位移的起点与终点。\n\n据此标注 [+趋近]。"
+// 不要直接在引号里敲裸换行（JSON5 不允许未转义的换行），也不要用行尾反斜杠续行（不保留换行）。
+//
+// 槽位留空待填：key 为空的类别会被跳过。
 // 全空时 feature_agent 退化为单个 agent 自由抽取特征，结果记录里的
 // features_source 会标成 "unfilled_config"，提醒这不是按既定类别抽的。
 //
