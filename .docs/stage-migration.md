@@ -58,16 +58,59 @@ from annotate import spatial_tools, spatial_runner, all_in_one
 
 这是追加删除提交，不改写已有历史，因此上述文件仍可能出现在先前提交中。忽略文件不受 Git 跟踪，也不会进入 `git stash -u`；后续开发前应另行备份或有选择地提交到开发分支，勿用 `git clean -fdx` 清理它们。
 
+### 标注提示词资源维护
+
+当前可随运行代码发布的维护索引是 [`system_prompt/README.md`](../system_prompt/README.md)。三条正式链路只读取合格句对，不在标注中重新筛选：
+
+- pair 的主提示词为 `system_prompt/annotate_pair_feature_flat.txt`（默认）、`annotate_pair_feature_deep.txt`（可选 deep）、`annotate_pair_feature_unfilled.txt`（类别表未填）、`annotate_pair_schema.txt` 与 `annotate_pair_judgement.txt`。
+- synonym 独立读取 `system_prompt/annotate_synonym_judgement.txt`，不读特征、图式或判定表。
+- all_in_one 读取 `system_prompt/annotate_all_in_one.txt`，单次完成特征、图式及同义判断，后置查表仍优先；不再注入筛选判据。
+- `annotate_shared_feature_class.txt`、`annotate_shared_feature_usage_deep.txt`、`annotate_shared_feature_usage_flat.txt` 是共享类别片段；single 诊断复用 pair 的特征和图式资源。四个 `system_prompt/examples/*.json5` 仍按步骤/词性共享，不按链路复制。
+
+部署时必须同步十项资源重命名、代码引用和旧名删除，不能把新旧提示词双份保留。筛选用的 `screen_*.txt`、`judgement_criteria.txt`、`semantic.txt` 及 `config_files/<词性目录>/reality.txt` 不在此次重命名范围。纯文件名变化不改变 agent 名和渲染消息，因此不应主动清空已有内容缓存。
+
+旧名 → 新名的十项精确映射见 [`system_prompt/README.md` 的部署表](../system_prompt/README.md#部署重命名映射旧名必须删除)。其中 `feature.txt` 是 deep 主提示词，`feature_flat.txt` 是默认 flat，不能按名称相似度误配。复制部署也必须逐项删除旧名，不能只新增 `annotate_*.txt` 而让维护者继续修改失效副本；不要删除整份提示词目录。
+
 ## 单阶段调用
 
 ```sh
 python extract raw.jsonl -f config_files/localization_expressions.json5 -t results -o location_corpus
 python replace --corpus results/location_corpus.jsonl --corpus-type 方位词 --out-file results/location_pairs.jsonl
-python annotate --corpus results/location_pairs.jsonl --corpus-type 方位词 --out-file results/location_annotated.jsonl --limit 100
-python annotate --engine all-in-one --corpus results/location_pairs.jsonl --corpus-type 方位词 --limit 100
+python annotate --graph pair --corpus results/location_pairs.jsonl --corpus-type 方位词 --out-file results/location_annotated.jsonl --limit 100
+python annotate --graph synonym --corpus results/location_pairs.jsonl --corpus-type 方位词 --out-file results/location_synonym.jsonl --limit 100
+python annotate --graph all_in_one --corpus results/location_pairs.jsonl --corpus-type 方位词 --out-file results/location_all_in_one.jsonl --limit 1
 ```
 
 独立提取入口仍要求 `-t` 目录已存在，且保留原有允许重写提取结果的行为。替换和标注默认拒绝覆盖已有结果，需要 `--overwrite`。正式标注只读取两侧检查均合格的句对，不在标注时补做替换/检查。`--no-llm` 不会把未经检查的句对变成合格数据。
+
+### 三路共用的设置与旧命令
+
+三路都由 `annotate/spatial_runner.py` 执行，同步、Batch 波次、多模型投票、预算、日志、JSONL/CSV/summary 和收尾排序共用实现。pair 保留分步 feature → schema → judge，synonym 保留独立判断，all_in_one 保留单次完整响应及后置本地图式/判定表优先级。
+
+| 设置 | pair | synonym | all_in_one |
+| --- | --- | --- | --- |
+| 未指定 `--limit` | 100 | 100 | 1 |
+| 结构化错误补发默认 | 允许 | 允许 | 禁止 |
+| 显式覆盖补发 | `--allow-retry` / `--no-allow-retry` | 同左 | 同左 |
+| 传输重试/超时/退避 | 按模型配置 | 按模型配置 | 按模型配置 |
+
+共同参数还包括 `--model` / `--models`、`--workers` / `--model-workers`、`--offset`、`--max-requests` / `--batch-max-requests`、`--batch auto|native|off`（默认 auto）、`--batch-cache` / `--batch-resume`、`--no-pairs-csv`、`--overwrite`。all_in_one 现支持 `--models`；投票沿用完整代表记录，不跨模型拼接特征或图式，平票/缺票转复核。同步 `requests` 为逻辑调用，`actual_requests` 为观测到的同步模型开始，原生 Batch 项数/批次数另计，旧 `pair_llm_calls` 不代表真实请求数。
+
+`python -m annotate` 与目录命令等价；旧 `--engine staged`（默认 pair）、`--engine all-in-one` 及 `python -m annotate.all_in_one` 仍有效，all-in-one 旧入口只是共同 runner 的转发层。显式冲突的 engine/graph 及重复的不同 graph/engine 选择会报错，重复相同值允许。`--feature-deep` 仅用于 pair/single，在 all_in_one 报错；正式标注拒绝 `--alter-rules`，应传给 replace。旧 `--all-candidates`、`--no-syntax`、正式图中的 `--batch-inference` 只兼容并提示，不再展开候选或准备句法。
+
+三条正式图都支持 `--print-prompt`：不读模型密钥/权重、不建模型/日志/输出、不提交 Batch。pair 展示真实特征输入及 system prompt，下游 schema/judge 的动态输入依赖真实前序结果，预览会说明此边界而不伪造结果；synonym/all_in_one 展示完整渲染消息，空 synonym 提示语不会调用模型。
+
+### 1.3 结果语义与 ID-only 迁移边界
+
+正式结果 `schema_version="1.3"`，`annotation_mode` 明确为 `pair`、`synonym` 或 `all_in_one`。三路共用 `id`、`sentence_id`、`content_hash`、`candidate_key`、来源和两侧 preparation 证据；JSONL 与默认同名 CSV 都按 `(line_no, candidate.index)` 排序，summary 包含实际重试策略及文本/JSONL 日志路径。四段 ID 是本次输入内编号，跨文件溯源应使用稳定的 `sentence_id` / `candidate_key`。
+
+准入不是仅检查执行 `status`：pair/all_in_one 仍须特征、图式与判定证据；synonym 的特征/图式准入为 `not_applicable`，不运行无关步骤，CSV 图式/查表列为空。筛选已确认且独立 LLM 判断为真实布尔值时，正/负同义标签均可准入；未知、no-llm、空提示语、调用错误或预算拒绝不准入并需复核。不能用 `not_applicable` 绕过 pair 的抽取要求。
+
+```sh
+python -m annotate.migrate_result_ids old.jsonl -o new.jsonl --csv-out new.csv
+```
+
+此工具只改 ID/来源文档编号、排序和导出 CSV，**保留原 schema_version，包括未声明版本或已是 1.3 的值**；它不会把 1.1/1.2 或旧 synonym 的缺失证据猜测补齐，不会仅因全局常量变为 1.3 就伪装升级。旧输出只读保留，不原地覆盖；需要完整 1.3 契约时须另行标注/核验，而非只改版本标签。
 
 ## 选择起点和终点
 
@@ -111,7 +154,7 @@ Batch 缓存/jobs/meta（含自定义 `--batch-cache`）和多模型原始结果
 python pipeline.py --source raw.jsonl --annotation-engine all-in-one --extract-args '["--screen-model","screen-model","--filter-workers","1"]' --replace-args '["--model","screen-model","--workers","4"]' --annotate-args '["--model","annotation-model","--limit","500","--batch","off"]'
 ```
 
-流水线管理的输入、输出、词性、覆盖和 engine 参数不能通过透传覆盖；请使用驱动的对应选项。涉及路径规划的透传选项必须写全名，不能用 argparse 缩写（例如 `--out-f`、`--batch-c`）。独立阶段仍接受全部旧参数。标注的默认 limit 沿用原程序：分步 100、all-in-one 1；要处理更多句对，务必显式指定 `--limit`。未选中阶段的透传参数不执行。
+流水线管理的输入、输出、词性、覆盖和 engine 参数不能通过透传覆盖；请使用驱动的对应选项。涉及路径规划的透传选项必须写全名，不能用 argparse 缩写（例如 `--out-f`、`--batch-c`、`--gra`）。`--annotate-args '["--graph","all_in_one","--models","model-a","model-b"]'` 可不指定 `--annotation-engine`；显式指定引擎时必须与图兼容。预检和共同 runner 共用轻量选择校验，`--graph=x` 和拆分写法均不能靠最后一个值掩盖冲突；冲突在任何上游阶段启动/建目录之前报错。独立阶段仍接受全部旧参数。默认 limit 为 pair/synonym 100、all_in_one 1；要处理更多句对，务必显式指定 `--limit`。未选中阶段的透传参数不执行。
 
 这次整理没有填写语言学配置。趋向动词替换规则仍可能没有启用组，运行前应检查 `config_files/direction/alter_rules.json5`，或在替换参数中传 `--alter-rules`；没有候选并不代表已构建出有效语料。
 
@@ -130,7 +173,7 @@ Git 会同步已跟踪的包路径改动和旧入口删除，不会同步被忽�
 9. 确认原模型路径、API 配置和依赖环境仍可用；本次未新增第三方依赖。按下方部署验证执行命令，再小批量验证现有模型接口。**旧 cron/nohup 命令现在会失败，验证前不能恢复调度。**
 10. 若需回滚部署，优先切换到事先备份的完整旧版本代码目录，同时恢复与该版本对应的外部启动命令。不要只复制几个旧入口，也不要在未备份的共享工作区强制重置。
 
-若采用文件复制而非 Git，必须把三个包目录和共享文件作为同一版本完整同步；还应对照本次 Git 删除清单，仅移除根目录的 25 个转发文件和 `legacy_entry.py`。不要直接删除全部根目录 `.py` 文件。**禁止使用带删除的广域同步命令**（例如未审查的 `rsync --delete`），以免删掉共享代码、服务器数据、模型或密钥。
+若采用文件复制而非 Git，必须把三个包目录、共享文件及上述提示词资源作为同一版本完整同步；还应对照 Git 删除/重命名清单，逐项移除根目录的 25 个转发文件、`legacy_entry.py` 和已重命名的旧提示词文件。不要直接删除全部根目录 `.py` 或全部提示词。**禁止使用带删除的广域同步命令**（例如未审查的 `rsync --delete`），以免删掉共享代码、服务器数据、模型或密钥。
 
 ## 最小运行版的部署验证
 
@@ -146,4 +189,8 @@ python annotate --engine all-in-one --help
 
 这些命令检查入口与依赖能否加载，不发送模型请求，也不能证明模型配置、语料内容或最终标注质量正确。再用独立的小样本输入执行 `pipeline.py ... --dry-run` 检查实际路径，确认后按前文命令进行小批量验证；真实模型验证可能产生费用。
 
-完整回归测试曾在精简前通过 46 项；测试源码当前仅保留在本地供后续开发，不随本次部署提交。因此不要在服务器运行 `python -m unittest discover -s tests -v` 作为本版本的验证：没有本项目 `tests/` 时可能报错或发现第三方同名测试包。需要复现完整回归时，应取得相应的开发分支/测试文件，并确认测试确实来自本项目。
+测试源码当前仅保留在被忽略的本地 `tests/`，设计/计划仍在私有 `.docs/superpowers/`，忽略策略不变；可发布维护入口是 `system_prompt/README.md` 和本说明。服务器的最小运行版不能依赖这些开发文件，也不要在没有本项目 `tests/` 时运行 unittest discovery：可能报错或发现第三方同名测试包。需要复现回归时，应取得对应测试文件并确认来源；保留既有提示词/渲染/缓存摘要，不重新生成基线。
+
+开发环境的 `python -m unittest discover -s tests -v` 含真实目录 CLI help、包加载和 spawn 检查，冷启动应给足总超时；完成的完整运行可同时作为业务集和布局集证据，不为重复输出再跑昂贵套件。三模式 CLI 集成使用 `TemporaryDirectory` 和 mock 模型，验证实际 JSONL/CSV/summary/log、稳定身份、逆序完成后的排序及输入/附属路径保护，不改既有语料。`ANNOTATION_TEST_TEMP` 可覆盖测试临时根（必须已存在）；Windows 优先 `%LOCALAPPDATA%/Temp/opencode`，否则使用平台默认临时目录。
+
+离线预览、mock/native 假客户端、help/包加载或回归通过都不是在线供应商 Batch 成功、密钥可用、费用或标注质量的证明。本次不访问真实模型；部署后的实际 API/Batch 需维护者另行授权、在备份及路径核对后用独立小样本验证。

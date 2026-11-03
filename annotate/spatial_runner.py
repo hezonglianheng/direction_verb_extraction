@@ -3,7 +3,7 @@
 """空间语义标注跑批：读取合格句对 → feature → schema → judge → 落盘汇总。
 
 语料提取见 extract/sentence_extract.py，机械替换及两侧检查见 replace/sentence_replace.py。
-正式 pair/synonym 图只消费替换阶段的句对，不展开候选、不重新筛选、不准备句法证据。
+正式 pair/synonym/all_in_one 图只消费替换阶段的句对，不展开候选、不重新筛选、不准备句法证据。
 原句和替换句各用自己的关注词与三元组，特征/图式示例从 system_prompt/examples 按词选择。
 single/alter_check 保留为显式诊断图，不是正式句对标注入口。
 
@@ -19,6 +19,9 @@ single/alter_check 保留为显式诊断图，不是正式句对标注入口。
     python annotate --models model-a model-b --workers 4
     python annotate --batch native --batch-resume --batch-cache results/run.batch-cache.jsonl
     python annotate --list-graphs
+    python annotate --engine all-in-one --limit 1
+    python annotate --graph all_in_one --models model-a model-b
+    python annotate --graph pair --print-prompt
 
 --models 保留模型独立执行与加权投票，缺票及平票转人工复核。--batch auto 优先使用原生 Batch，
 不可用时明确回退同步；native 不允许回退。批处理仅包含特征、图式和判定波次，查表优先级不变。
@@ -46,12 +49,14 @@ from annotate import spatial_agents as sa
 from annotate import spatial_graphs as sg
 from annotate import spatial_tools as st
 from annotate import voting
+from annotate.cli_args import ConsistentSelection, resolve_graph_selection
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CORPUS = _PROJECT_ROOT / "results" / st.CORPUS_TYPE_CORPORA[st.DEFAULT_CORPUS_TYPE]
 """默认语料：默认语料类型（方位词）的那一份。按类型取用见 st.CORPUS_TYPE_CORPORA"""
 DEFAULT_MODEL = sa.DEFAULT_MODEL
 """默认模型配置名（model_config/api_keys.json 里的键）"""
+FORMAL_GRAPHS = ("pair", "synonym", "all_in_one")
 
 
 # --------------------------------------------------------------------------
@@ -115,15 +120,10 @@ class ResultWriter:
         等到花完预填充的钱才发现），所以这项由 main 在预填充之后补写到属性上。
         """
         self.agent_stats: dict[str, dict] = {}
-        """各 agent 的调用统计：{名字: {"roundtrips", "failed", "cache_hits"[, "first_error"]}}
-        （见 spatial_agents.BaseAgent.stats）
+        """收尾保存 BaseAgent.stats 原值：requests=同步逻辑执行，actual_requests=回调观测的同步开始。
 
-        run() 结束时才拿得到，同 reality_prefill：由 main 在收尾前补写到属性上。
-        模型往返数是花费的直接口径（缓存命中省下的那部分不在这里，单列 cache_hits）；
-        failed 是发出去但抛异常的调用数，**与 roundtrips 相加才是发出过的调用数**——
-        整批被接口挡下时 roundtrips 是 0，光看它会误判成「一个请求都没发出去」（见
-        _print_agent_stats）。失败过的 agent 另带 first_error（截断后的首个异常）。
-        没跑到的 agent（--no-llm、或图没走到）报全 0，不是漏记。
+        roundtrips 是可见回复数，failed 是失败的逻辑执行，不可相加推算实际请求。
+        原生 Batch 的提交、回放与续跑指标单列在 batch；缓存和回放不冒充模型开始。
         """
         self.csv_columns = tuple(csv_columns)
         """成对记录拍平 csv 的列序（见 spatial_graphs.GraphSpec.csv_columns）；空 = 本次不导
@@ -191,8 +191,8 @@ class ResultWriter:
         """把已落盘的 jsonl 按 (line_no, candidate.index) 重排（键见 sg.record_order_key）
 
         write() 是各 worker 在 save 节点并发追加（见模块 docstring），落盘顺序 = 完成顺序，
-        与输入顺序无关。收尾统一重排，于是本脚本与 all_in_one.py 的 finish() 走同一段代码、
-        产出同一个顺序，两份文件可逐行对账。all_in_one 本来就按输入顺序写，这里重排是兜底。
+        与输入顺序无关。三条正式图（含旧 all_in_one 入口）共用这里的收尾排序，
+        相同输入的不同链路/模型产物因此可逐行对账。
 
         流式落盘照旧：跑的过程中文件仍是完成顺序，tail 得到进度；只收尾重排一次。
         先写临时文件再原子替换，重排途中被打断也不会把结果文件截断。
@@ -347,7 +347,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         epilog=__doc__.split("用法：")[-1],
     )
     add_batch_args(parser)
-    parser.add_argument("--graph", default="pair", choices=sorted(sg.GRAPHS), help="跑哪张图（见 --list-graphs）")
+    parser.add_argument("--graph", default=None, action=ConsistentSelection, choices=sorted(sg.GRAPHS), help="跑哪张图（默认 pair，见 --list-graphs）")
+    parser.add_argument("--engine", choices=("staged", "all-in-one"), action=ConsistentSelection, default=None,
+                        help="兼容旧命令：staged 默认 pair，all-in-one 映射为 --graph all_in_one；不能与相反的图组合")
     parser.add_argument("--list-graphs", action="store_true", help="打印可用的图与各自需要的 agent，然后退出")
     parser.add_argument(
         "--corpus-type",
@@ -395,9 +397,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--limit",
         type=int,
-        default=100,
+        default=None,
         help="最多处理多少条两侧已通过检查的句对（过滤后计数）；"
-        "可用数量不足时会报告。默认 100",
+        "可用数量不足时会报告。未指定时按图默认：pair/synonym=100，all_in_one=1",
     )
     parser.add_argument("--offset", type=int, default=0, help="跳过前多少条可用判定语料（过滤后计数）")
     model_group = parser.add_mutually_exclusive_group()
@@ -438,15 +440,41 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "默认是单次调用直接产出全部特征字段，一次省下约一个数量级的模型往返。"
         "deep 只在需要对照或单次调用抽得不好时开",
     )
+    parser.add_argument("--print-prompt", action="store_true",
+                        help="离线预览正式图的实际提示语及输入，不读模型密钥、不预热、不建日志或输出；pair 下游说明依赖")
+    repair = parser.add_mutually_exclusive_group()
+    repair.add_argument("--allow-retry", dest="allow_retry", action="store_true",
+                        help="显式允许结构化输出错误补发（不改变传输重试配置）")
+    repair.add_argument("--no-allow-retry", dest="allow_retry", action="store_false",
+                        help="显式禁止结构化补发；未指定时 pair/synonym 允许，all_in_one 禁止")
+    parser.set_defaults(allow_retry=None)
+    parser.add_argument("--all-candidates", action="store_true",
+                        help="兼容旧 all-in-one 参数：现为一行一个合格句对，不再展开；指定时会提示")
+    parser.add_argument("--no-syntax", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--no-pairs-csv",
         action="store_true",
         help="不把成对信息（原句/替换句/图式/同义判断）另导一份 csv。"
         "默认**导出**到与结果 jsonl 同名、同目录的 .csv，行序与 jsonl 一致（收尾排序后同一份记录写就，"
         "见 ResultWriter.finish），供 Excel 查看；列序见 spatial_tools.PAIR_CSV_COLUMNS。"
-        "只有 pair 图有这些成对字段，换别的图本就不导",
+        "正式 pair/synonym/all_in_one 图均可导出；single/alter_check 诊断图不导出",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    try:
+        args.graph = resolve_graph_selection(args.graph, args.engine)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if args.limit is None:
+        args.limit = sg.get_graph(args.graph).default_limit
+    if args.graph in FORMAL_GRAPHS and args.alter_rules:
+        parser.error("正式标注不再替换句子；请将 --alter-rules 传给 python replace")
+    if args.graph == "all_in_one" and args.feature_deep:
+        parser.error("--feature-deep 不适用于 all_in_one：它必须一次完成完整标注；请使用 --graph pair")
+    if args.print_prompt and args.graph not in FORMAL_GRAPHS:
+        parser.error("--print-prompt 只支持正式 pair/synonym/all_in_one 图；诊断图的动态执行不能离线预览")
+    if args.graph not in FORMAL_GRAPHS and (args.all_candidates or args.no_syntax):
+        parser.error("--all-candidates / --no-syntax 仅为正式标注的旧命令兼容参数，不适用于诊断图")
+    return args
 
 
 def _print_graphs() -> None:
@@ -455,6 +483,7 @@ def _print_graphs() -> None:
         print(f"  {spec.name:<12}需要 agent：{'、'.join(spec.needs)}")
         print(f"  {' ' * 12}{spec.doc}")
         print(f"  {' ' * 12}产出：results/{spec.prefix}/")
+        print(f"  {' ' * 12}默认 limit：{spec.default_limit}")
 
 
 def _warn_corpus_type_mismatch(corpus_path: Path, corpus_type: str) -> None:
@@ -477,13 +506,37 @@ def _warn_corpus_type_mismatch(corpus_path: Path, corpus_type: str) -> None:
         )
 
 
+def _config_reports(agents) -> list[dict]:
+    """从已构造的业务 agent 收集全部表；all_in_one 不为打印报告另建三套 agent。"""
+    reports = []
+    for agent in agents.values():
+        if not isinstance(agent, sa.AllInOneAgent):
+            report = agent.config_report()
+            if report is not None:
+                reports.append(report)
+            continue
+        groups = agent.schema_table.get("schemas") or {}
+        judge = agent.judge_table
+        filled = judge.get("filled") or 0
+        descriptions = (
+            ("feature_classes", f"{len(agent.feature_classes)} 类特征", not agent.feature_classes,
+             "特征自由抽取（features_source=unfilled_config）", []),
+            ("schema_table", f"{len(st.schema_candidates(agent.schema_table))} 条图式／{len(groups)} 个词条"
+             f"（覆盖 {len(st.schema_forms(agent.schema_table))} 个词形）", not groups,
+             "图式查表未命中时采信本次完整标注给出的合法图式", []),
+            ("judge_table", f"{len(judge.get('labels') or [])} 个标签／已填 {filled} 格", not filled,
+             "未有本地判定的句对采信本次完整标注给出的同义关系", judge.get("problems") or []),
+        )
+        for table, summary, empty, degrade, warnings in descriptions:
+            path = agent.table_paths[table]
+            reports.append({"table": table, "path": path, "summary": summary, "empty": empty,
+                            "missing": sa._table_missing(path), "degrade": degrade, "warnings": warnings})
+    return reports
+
+
 def _config_tables(agents) -> dict[str, str]:
-    """本次实际读的配置表 {逻辑表名: 路径}（写进 .summary.json 的凭据）"""
-    return {
-        report["table"]: report["path"]
-        for agent in agents.values()
-        if (report := agent.config_report()) is not None
-    }
+    """本次实际读的全部配置表 {逻辑表名: 路径}（写进 .summary.json 的凭据）"""
+    return {report["table"]: report["path"] for report in _config_reports(agents)}
 
 
 def _print_config_tables(agents) -> None:
@@ -500,7 +553,7 @@ def _print_config_tables(agents) -> None:
     表自己报出来的问题（agent 的 warnings）一律按**警告**打印，且与空不空无关：判定表里
     留空的格子就是这类——表填了一半，那些格没人裁定，跑批会照常降级交 LLM，但不该静悄悄过去。
     """
-    reports = [report for agent in agents.values() if (report := agent.config_report()) is not None]
+    reports = _config_reports(agents)
     if not reports:
         return
     print("配置表：")
@@ -522,56 +575,84 @@ def _print_config_tables(agents) -> None:
             print(f"            请把替换规则组填进 {report['path']}，或用 --alter-rules <路径> 指定另一张表")
 
 
+def _print_numbered(title: str, text: str) -> None:
+    print(f"\n===== {title}（共 {len(text.splitlines())} 行）=====")
+    for index, line in enumerate(text.splitlines(), 1):
+        print(f"{index:>4}| {line}")
+
+
+def _print_prompt(args, spec: sg.GraphSpec, corpus_type: str, records: list[dict]) -> None:
+    """只构造离线 agent 并渲染真实可用输入；不 warm/run/invoke，不推演模型输出。"""
+    agents = sa.build_agents(spec.needs, model_key=args.model, llm=False, corpus_type=corpus_type,
+                             overrides=_build_overrides(args, spec), allow_structured_retry=args.allow_retry)
+    print(f"离线提示语预览：{spec.name}；{len(records)} 条合格句对（不调用模型、不建日志或输出）")
+    if args.models:
+        print("模型选择：" + "、".join(args.models) + "；这里只预览共同输入，不读取模型配置、密钥或投票权重")
+    _print_config_tables(agents)
+    for name, agent in agents.items():
+        _print_numbered(f"{name} system prompt", agent.system_prompt)
+        if not agent.system_prompt.strip():
+            print(f"提示：{name} 提示语尚未填写，正式执行也不会调用模型。")
+        for index, prompt in enumerate(getattr(agent, "class_prompts", ()), 1):
+            _print_numbered(f"{name} class {index} system prompt", prompt)
+    for initial in sg.prepared_init_states(records, agents, ""):
+        state = {**initial, **sg.prepared_pair_node(initial)}
+        line = state["record"].get("line_no")
+        print(f"\n输入第 {line} 行：两侧检查来自 preparation，不重复替换、筛选或准备句法。")
+        if spec.name == "pair":
+            feature = agents.need("feature")
+            for side in ("a", "b"):
+                focus = state["focus_word" if side == "a" else "focus_word_b"]
+                _print_numbered(f"feature {side} user message", feature._content(state[f"sentence_{side}"], focus))
+            print("schema a/b 的动态 user message 依赖前序 feature 的真实输出及查表结果；"
+                  "judge 的动态 user message 依赖两侧真实 features/schema 及判定表。"
+                  "此处只展示它们的实际 system prompt，不伪造前序输出，也不假装模型已执行。")
+        else:
+            agent = agents.need(spec.name)
+            _print_numbered(f"{spec.name} user message", agent._content(
+                state["sentence_a"], state["sentence_b"], state["focus_word"], state["focus_word_b"]))
+
+
 def _print_agent_stats(stats: dict[str, dict]) -> None:
-    """收尾打印各 agent 的模型往返数、失败数、超预算未发数与缓存命中数
-
-    （写进汇总的那份，见 ResultWriter.agent_stats）
-
-    这是花掉的钱的直接口径：往返数含工具往返与结构化输出那次；命中数是被按 message 缓存
-    省下的重复问（命中不花往返）。全 0 的 agent 是没走到或根本没调模型（--no-llm）。
-
-    失败数单独列，且**与往返数一样显眼**：往返数只数拿到回复的那些，一个请求都没成功时它是 0，
-    而 0 次往返读起来正是「一个请求都没发出去」。整批被接口挡下（403 区域限制、欠费、连不上）
-    时真相恰好相反——发是发了，全被拒。所以这里把失败数印在同一行，并在「一次都没成功却失败过」
-    时额外把首个失败原因摊开：那种情况下收尾的这几行就是唯一的诊断入口，不该逼人去翻 jsonl。
-
-    超预算未发数（budget_exceeded）与失败数是两件事：后者发出去了但被拒，前者**根本没发**。
-    不印出来的话，超预算成片发生时调用账看起来只是「往返少」，看不出是预算掐断的。
-    """
+    """同步逻辑调用、回调观测开始、可见回复及 Batch 回放分账，绝不互相推算。"""
     if not stats:
         return
     parts = []
     budget = 0
     for name, item in stats.items():
-        part = f"{name} {item['roundtrips']} 次往返"
+        part = (f"{name} 同步逻辑执行 {item.get('requests', 0)} 次"
+                f"／同步模型开始 {item.get('actual_requests', 0)} 次"
+                f"／可见回复 {item.get('roundtrips', 0)} 次")
         if item.get("failed"):
             part += f"／{item['failed']} 次失败"
         if item.get("budget_exceeded"):
             budget += item["budget_exceeded"]
             part += f"／{item['budget_exceeded']} 次超预算未发"
         if item.get("retries"):
-            part += f"／{item['retries']} 次重试"
+            part += f"／{item['retries']} 次传输重试决定"
+        if item.get("internal_requests"):
+            part += f"／框架内部额外开始 {item['internal_requests']} 次"
         if item.get("batch_items") or item.get("batch_hits"):
             part += f"／批处理登记 {item.get('batch_items', 0)} 项、回放 {item.get('batch_hits', 0)} 次"
         parts.append(part + f"／{item['cache_hits']} 次命中")
-    total = sum(item["roundtrips"] for item in stats.values())
+    total = sum(item.get("actual_requests", 0) for item in stats.values())
     failed = sum(item.get("failed", 0) for item in stats.values())
     hits = sum(item["cache_hits"] for item in stats.values())
     tail = f"，{failed} 次失败" if failed else ""
-    print(f"模型调用账（共 {total} 次往返{tail}，缓存省下 {hits} 次）：" + "；".join(parts))
+    print(f"模型调用账（同步模型开始共 {total} 次{tail}，缓存命中 {hits} 次；原生 Batch 另计）：" + "；".join(parts))
     if budget:
         print(
             f"提示：有 {budget} 次调用因请求预算未发出，记录里记为 source=error 并转入人工复核；"
             "需要放宽时调 --max-requests（每条候选）或 --batch-max-requests（整批）"
         )
-    if total or not failed:
+    if any(item.get("roundtrips") for item in stats.values()) or not failed:
         return
     # 一次往返都没成却冒出失败：整批调用没一个成功的，这是最容易被误读成「没发请求」的形状
     reason = next(
         (item["first_error"] for item in stats.values() if item.get("first_error")),
         "（异常没留下可读的 repr）",
     )
-    print(f"警告：本次没有任何一次模型调用成功，{failed} 次调用全部失败（请求已发出，被接口拒绝或没能连上）")
+    print(f"警告：同步逻辑执行中有 {failed} 次失败且没有成功回复；同步模型开始由回调观测共 {total} 次")
     print(f"      首次失败：{reason}")
     print("      逐条失败原因见各记录的 status_reason；若全部是同一条 403/超时，先查模型可达性再重跑")
 
@@ -741,6 +822,7 @@ def _build_model_agents(args, spec: sg.GraphSpec, corpus_type: str, model_key: s
             if args.batch_max_requests is None
             else args.batch_max_requests
         ),
+        allow_structured_retry=getattr(args, "allow_retry", None),
     )
     for agent in agents.values():
         agent.warm()
@@ -755,6 +837,29 @@ def _batch_cache_path(args, out_path: str | Path, model_key: str) -> Path:
         model_key=model_key,
         multi_model=bool(getattr(args, "models", None) and len(args.models) > 1),
     )
+
+
+def _validate_multi_model_outputs(args, spec, corpus_path, out_path: Path, model_names: list[str]) -> None:
+    """在日志/模型/文件创建之前，同表检查最终结果、所有原始结果及其附属路径。"""
+    raw_paths = voting.model_output_paths(out_path, model_names)[1]
+    main_outputs = []
+    for path in (out_path, *raw_paths.values()):
+        main_outputs.append(path)
+        if spec.csv_columns and not args.no_pairs_csv:
+            main_outputs.append(st.pairs_csv_path(path))
+        main_outputs.append(path.with_suffix(".summary.json"))
+    sidecars = []
+    if not args.no_llm and getattr(args, "batch", "off") != "off":
+        for name, path in raw_paths.items():
+            sidecars.extend(bi.sidecar_paths(_batch_cache_path(args, path, name)))
+    file_paths.validate_output_paths([corpus_path], main_outputs + sidecars)
+    for path in main_outputs + sidecars:
+        if path.exists() and not path.is_file():
+            raise ValueError(f"输出路径不是文件：{path}")
+    if not args.overwrite:
+        for path in main_outputs:
+            if path.exists():
+                raise ValueError(f"输出文件 {path} 已存在；请换一个输出路径，或显式加 --overwrite 覆盖它")
 
 
 def _execute_run(
@@ -776,7 +881,7 @@ def _execute_run(
     单模型与多模型的单模型分支共用这一段。``prefill_ltp`` 只表示**这个分支是否负责**
     准备 LTP 句法证据；批大小由 ``--batch-inference`` 决定。多模型模式下协调层统一
     准备一次，各模型分支传 False。
-    ``log`` 是跑批入口建好的 agent 日志；本函数只补两个阶段事件，逐 agent 的记录由图节点写。
+    ``log`` 是跑批入口建好的 agent 日志；本函数补阶段与策略事件，逐 agent 的记录由图节点写。
     """
     out_path = Path(out_path)
     if log is not None:
@@ -795,7 +900,7 @@ def _execute_run(
         tally=spec.tally,
         corpus_type=corpus_type,
         config_tables=_config_tables(agents),
-        # 成对信息 csv：默认导出（--no-pairs-csv 关），列序由图给（只有 pair 图有）
+        # 成对信息 csv：三条正式图默认导出（--no-pairs-csv 关），列序由图给。
         csv_columns=csv_columns,
         model_name=model_key if not args.no_llm else None,
         overwrite=args.overwrite,
@@ -803,13 +908,28 @@ def _execute_run(
     )
     try:
         graph = spec.build(agents, writer)
+        if spec.name in FORMAL_GRAPHS:
+            writer.extra_summary["annotation_mode"] = spec.name
+        writer.extra_summary["structured_retry"] = {
+            name: agent.allow_structured_retry for name, agent in agents.items()
+        }
         # 实际生效的请求策略（超时/重试/退避）写进汇总：事后看到某轮特别慢，
         # 能直接判断是模型慢还是重试多，不必翻 config.py 与模型配置去猜
         first_agent = next(iter(agents.values()), None)
         policy = getattr(first_agent, "retry_policy", None)
         if policy:
             writer.extra_summary["request_policy"] = dict(policy)
+        # 启动信息与汇总共用已解析的实际值，不重读模型配置；多模型分支也不能因 verbose=False 漏报。
+        retry_settings = {
+            name: writer.extra_summary[name]
+            for name in ("structured_retry", "request_policy")
+            if name in writer.extra_summary
+        }
+        print(f"{writer.progress_prefix}重试策略：" + "；".join(
+            f"{name}={json.dumps(value, ensure_ascii=False)}" for name, value in retry_settings.items()
+        ), flush=True)
         if log is not None:
+            log.event("retry_policy", stage="annotation", model=model_key, **retry_settings)
             # 把本轮 agent 日志的路径写进 .summary.json：事后拿到一份结果，能顺着汇总直接找到
             # 它是哪一轮跑出来的、每个 agent 当时怎么判的，不必在 log/ 里按时间猜。
             if getattr(log, "path", None) is not None:
@@ -895,7 +1015,8 @@ def _execute_run(
 
         if batch_session is not None:
             if verbose:
-                print(f"批处理：{len(states)} 个状态进入波次执行（原生优先，失败回退同步）")
+                strategy = "原生严格模式，不回退同步" if getattr(args, "batch", "auto") == "native" else "原生优先，失败回退同步"
+                print(f"批处理：{len(states)} 个状态进入波次执行（{strategy}）")
             # 批量波次会把同一条候选重放多次；候选预算必须跨波次保留同一份，
             # 否则每条候选每波都会拿到一份新预算，max_requests 形同虚设。
             scopes = {id(state): agents.new_budget_scope() for state in states}
@@ -933,6 +1054,17 @@ def _execute_run(
 
         # 各 agent 的调用账（往返数、重试数与缓存命中数）：跑完才齐，收尾补写到 writer 上、进汇总
         writer.agent_stats = {name: agent.stats() for name, agent in agents.items()}
+        if spec.name == "all_in_one":
+            stats = writer.agent_stats["all_in_one"]
+            # 旧字段保留，但只从同步统计取得；原生提交成本只看 BatchSession.summary。
+            logical, actual = stats.get("requests", 0), stats.get("actual_requests", 0)
+            writer.extra_summary["all_in_one_calls"] = {
+                "rounds": logical, "requests": actual, "retried": max(0, actual - logical),
+                "transport_retries": stats.get("retries", 0),
+                "internal_requests": stats.get("internal_requests", 0),
+                "counting": "rounds=同步逻辑执行；requests=回调观测的同步模型开始；retried=开始数超出逻辑执行数部分，"
+                            "不等于结构补发次数；原生 Batch 另见 batch；pair_llm_calls 仅旧诊断，不是请求数",
+            }
         summary = writer.finish()
         if verbose:
             print(
@@ -1024,6 +1156,7 @@ def _run_multi_model(
     stage_start 的 output_file 区分；这样一次 --models 只会留下一个时间戳、两份文件，
     不必在 log/ 里按模型再拼文件名。
     """
+    _validate_multi_model_outputs(args, spec, corpus_path, Path(out_path), model_names)
     log = _start_agent_log(
         args,
         spec,
@@ -1087,6 +1220,9 @@ def _model_summary_entry(
             "agent_stats": writer.agent_stats,
             "reality_prefill": writer.reality_prefill,
             "request_policy": writer.extra_summary.get("request_policy"),
+            "structured_retry": writer.extra_summary.get("structured_retry"),
+            **({"all_in_one_calls": writer.extra_summary["all_in_one_calls"]}
+               if "all_in_one_calls" in writer.extra_summary else {}),
             "batch": writer.extra_summary.get("batch"),
         }
     exc = failed.get(name)
@@ -1139,36 +1275,6 @@ def _run_multi_model_impl(
             ("配置权重", "voting.configured_weight"),
             ("缺票模型", "voting.missing_models"),
         )
-
-    # 所有输出（最终投票文件 + 各模型原始文件及其 csv/summary）放进同一张清单，
-    # 一次检查输入/输出别名与已有文件：分开逐组检查看不出“最终文件”和某个原始文件
-    # 其实是同一个硬链接/软链接的情况。
-    main_outputs: list[Path] = [out_path]
-    if csv_columns:
-        main_outputs.append(st.pairs_csv_path(out_path))
-    main_outputs.append(out_path.with_suffix(".summary.json"))
-    for raw_path in raw_paths.values():
-        main_outputs.append(raw_path)
-        if csv_columns:
-            main_outputs.append(st.pairs_csv_path(raw_path))
-        main_outputs.append(raw_path.with_suffix(".summary.json"))
-    sidecars: list[Path] = []
-    if not args.no_llm and getattr(args, "batch", "off") != "off":
-        for name in model_names:
-            # 执行阶段 _execute_run 拿到的是 raw_paths[name]，不是最终投票 out_path；
-            # 默认 sidecar 跟着实际输出文件走，预检必须用同一个基路径。
-            cache_path = _batch_cache_path(args, raw_paths[name], name)
-            sidecars.extend(bi.sidecar_paths(cache_path))
-    # sidecar 允许已存在（--batch-resume 要复用），但绝不能与语料或任一主产物同路径：
-    # 否则每个模型建会话时会截断别人的结果/原始语料。
-    file_paths.validate_output_paths([corpus_path], main_outputs + sidecars)
-    if not args.overwrite:
-        for output in main_outputs:
-            if output.exists():
-                raise ValueError(
-                    f"输出文件 {output} 已存在（默认拒绝覆盖，免得混入历史记录与重复 id）；"
-                    "请换一个输出路径，或显式加 --overwrite 覆盖它"
-                )
 
     print(f"多模型投票：{len(model_names)} 个模型（权重 " + "，".join(f"{n}={weights[n]}" for n in model_names) + "）")
     print(f"最终输出：{out_path}")
@@ -1313,6 +1419,7 @@ def _run_multi_model_impl(
         progress_prefix="[voting] ",
     )
     voting_writer.extra_summary = {
+        **({"annotation_mode": spec.name} if spec.name in FORMAL_GRAPHS else {}),
         "voting": voting.summarize_voting(final_records),
         "model_names": list(model_names),
         "voting_weights": dict(weights),
@@ -1354,11 +1461,12 @@ def _run_multi_model_impl(
             )
             continue
         stats = result["writer"].agent_stats
-        roundtrips = sum(item.get("roundtrips", 0) for item in stats.values())
+        logical = sum(item.get("requests", 0) for item in stats.values())
+        actual = sum(item.get("actual_requests", 0) for item in stats.values())
         call_failed = sum(item.get("failed", 0) for item in stats.values())
         retries = sum(item.get("retries", 0) for item in stats.values())
         print(
-            f"  模型 {name}（权重 {weights[name]}）：{roundtrips} 次往返"
+            f"  模型 {name}（权重 {weights[name]}）：同步逻辑执行 {logical} 次／同步模型开始 {actual} 次（原生 Batch 另计）"
             + (f"／{call_failed} 次失败" if call_failed else "")
             + (f"／{retries} 次重试" if retries else "")
         )
@@ -1392,20 +1500,8 @@ def main(argv: list[str] | None = None) -> None:
     multi_model = len(selected_models) > 1
     if args.models and not multi_model:
         print(f"提示：--models 只给了一个模型（{selected_models[0]}），按单模型模式运行")
-    if multi_model and args.no_llm:
+    if multi_model and args.no_llm and not args.print_prompt:
         raise SystemExit("错误：--models 多模型投票必须有模型判定，不能与 --no-llm 同用")
-
-    # 权重在花钱之前校验完：写错一个字段就当场退出，而不是跑完几个模型才发现权重没生效。
-    # 单模型不读模型配置：--no-llm 的用途之一就是在没有 api_keys.json 的机器上验纯规则，
-    # 这里不能因为一个用不到的投票权重把那条路堵死。
-    weights: dict[str, int] = {}
-    if multi_model:
-        for name in selected_models:
-            cfg = agent_factory.load_model_config(name)
-            weights[name] = voting.normalize_weight(
-                cfg.get(voting.VOTING_WEIGHT_FIELD), model_name=name
-            )
-
     # args.corpus_type 已被 argparse 规范化（None 仍是 None），这里才落默认值：
     # 落到 None 上就分不清「没指定」与「显式指定方位词」，启动打印要说出类型是哪来的
     corpus_type = st.normalize_corpus_type(args.corpus_type)
@@ -1419,11 +1515,13 @@ def main(argv: list[str] | None = None) -> None:
     _warn_corpus_type_mismatch(corpus_path, corpus_type)
 
     spec = sg.get_graph(args.graph)
-    if spec.name in ("pair", "synonym"):
+    if spec.name in FORMAL_GRAPHS:
         if not args.corpus:
             corpus_path = _PROJECT_ROOT / "results" / cp.PAIR_CORPORA[corpus_type]
-        if args.alter_rules:
-            raise SystemExit("错误：标注阶段不再替换句子；请将 --alter-rules 传给 python replace")
+        if args.all_candidates:
+            print("提示：--all-candidates 为旧命令兼容参数；现在一行一个合格句对，不再展开候选。")
+        if args.no_syntax or args.batch_inference:
+            print("提示：正式标注不准备句法；--no-syntax / --batch-inference 不改变本次输入或执行。")
         records = cp.read_prepared_pairs(corpus_path, limit=args.limit, offset=args.offset)
         if any(record.get("corpus_type") != corpus_type for record in records):
             raise ValueError("句对的 corpus_type 与 --corpus-type 不一致，不能使用另一词性的标注配置")
@@ -1442,6 +1540,16 @@ def main(argv: list[str] | None = None) -> None:
     if args.feature_deep and "feature" not in spec.needs:
         # 图不建 feature agent，这个开关就无从生效；静默忽略会让人以为 deep 跑过了
         print(f"提示：--feature-deep 对本图（{spec.name}）无效——它不建 feature agent")
+
+    # 必须早于路径生成、模型配置/权重读取、预热、日志及任何写入。多模型也只预览共同输入。
+    if args.print_prompt:
+        _print_prompt(args, spec, corpus_type, records)
+        return
+    weights: dict[str, int] = {}
+    if multi_model:
+        for name in selected_models:
+            cfg = agent_factory.load_model_config(name)
+            weights[name] = voting.normalize_weight(cfg.get(voting.VOTING_WEIGHT_FIELD), model_name=name)
 
     out_dir = Path(args.out_dir) if args.out_dir else _PROJECT_ROOT / "results" / spec.prefix
     out_path = Path(args.out_file) if args.out_file else st.build_output_path(out_dir, prefix=spec.prefix)

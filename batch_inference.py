@@ -6,7 +6,7 @@
     七个 agent 的同步链路已经很长（消息构造、缓存、预算、重试、结构化输出），把
     provider 的「上传 JSONL → 建 batch → 轮询 → 下载结果」塞进各个 agent 里，会让
     每一处都各写一份协议细节。本模块只负责**把一批已经拼好的请求送出去、再把结果按
-    稳定 ID 收回来**，业务提示语与结果校验仍留在 spatial_agents/all_in_one。
+    稳定 ID 收回来**，业务提示语与结果校验仍留在 spatial_agents。
 
 两种模式，口径必须分清：
     native      原生 Batch API，按 profile.protocol 分两套：
@@ -1066,8 +1066,8 @@ class BatchSession:
     def execute(self, items: list[BatchItem] | None = None, *, fallback_workers: int = 1) -> int:
         """把一批请求送出去并收结果（原生优先，失败/不支持则同步回退）
 
-        items=None 是图波次（结果由 run_waves 重放消费）；给了 items 是 all_in_one 的直接
-        提交。两者的回退方式不同：图波次把 fallback_mode 置位，下一波重放时缺的项由
+        items=None 是图波次（正式标注统一由 run_waves 重放消费）；给了 items 是通用预组装
+        提交接口。两者的回退方式不同：图波次把 fallback_mode 置位，下一波重放时缺的项由
         `_invoke_sync` 补（仍经过 agent.run 的业务校验）；直接提交没有下一波，立即用
         `sync_call` 逐条补齐。
         """
@@ -1183,7 +1183,7 @@ class BatchSession:
             self.mode = "fallback"
 
     def submit_direct(self, items: list[BatchItem], *, fallback_workers: int = 1) -> int:
-        """all_in_one 用：请求已经由调用方拼好，直接送这一批"""
+        """通用预组装条目接口；保留共享 API，正式标注只走 run_waves，不调用此接口。"""
         return self.execute(items, fallback_workers=fallback_workers)
 
     def _job_submitted(self, job: BatchJob) -> None:

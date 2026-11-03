@@ -73,7 +73,7 @@ def record_identity(record: dict) -> tuple[int, int, int, str]:
 
 
 def _pair_ballot(record: dict) -> tuple[str | None, str]:
-    """pair / synonym 图的票：先看闸门与语义闸门，再看同义判定
+    """pair / synonym / all_in_one 图的票：先看已有检查，再看同义判定
 
     把“不是现实空间用法”“句子不通顺”也当成一种**有效标签**，而不是弃权：
     模型之间对“这条语料该不该进入同义判定”的分歧，本身就是标注结果的一部分；
@@ -156,14 +156,14 @@ def ballot_label(graph_name: str, record: dict) -> tuple[str | None, str]:
     """取一条记录在该图下的投票标签；返回 ``(label, reason)``，label 为 None 表示弃权
 
     各图的标签口径：
-        pair / synonym   not_spatial / not_fluent_a|b|ab / same / different
+        pair / synonym / all_in_one   not_spatial / not_fluent_a|b|ab / same / different
         single           not_spatial / not_fluent / schema:<名字>
         alter_check      not_spatial / fluent:a=1,b=0 这类复合标签
 
     弃权只发生在“模型确实没给出结论”的情形（调用失败、判定为空、特征失败）；
     明确的否定结论（非空间、不通顺）是有效票，不是弃权。
     """
-    if graph_name in ("pair", "synonym"):
+    if graph_name in ("pair", "synonym", "all_in_one"):
         return _pair_ballot(record)
     if graph_name == "single":
         return _single_ballot(record)
@@ -297,7 +297,7 @@ def combine_model_records(
     """把多个模型的记录按候选对齐、投票、合成最终记录
 
     Args:
-        graph_name: pair / single / alter_check / synonym
+        graph_name: pair / all_in_one / single / alter_check / synonym
         model_records: {模型名: 该模型的全部结果记录}
         weights: {模型名: 正整数票数}
         model_order: 配置顺序（决定代表记录与输出顺序的稳定性）
@@ -381,7 +381,7 @@ def combine_model_records(
             final["status"] = "discarded"
             final["status_reason"] = reason
 
-            if graph_name in ("pair", "synonym"):
+            if graph_name in ("pair", "synonym", "all_in_one"):
                 judge = dict(final.get("judgement") or {})
                 judge["same_meaning"] = None
                 judge["source"] = f"voting_{voting['status']}"

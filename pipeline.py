@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from file_paths import collect_jsonl_inputs, validate_output_paths, resolve_cache_path, sidecar_paths
+from annotate.cli_args import ConsistentSelection, resolve_graph_selection
 from annotate.voting import model_output_paths
 
 
@@ -26,7 +27,8 @@ def parse_args(argv=None):
     parser.add_argument("--pairs", help="替换阶段输出/标注阶段输入 JSONL")
     parser.add_argument("--output", help="标注结果 JSONL")
     parser.add_argument("--filter-config", help="提取规则，默认按 --corpus-type 选择")
-    parser.add_argument("--annotation-engine", choices=("staged", "all-in-one"), default="staged")
+    parser.add_argument("--annotation-engine", choices=("staged", "all-in-one"), default=None, action=ConsistentSelection,
+                        help="兼容引擎选择；未指定时由 --annotate-args 的 --graph 选择（默认 pair）")
     for stage in STAGES:
         parser.add_argument(f"--{stage}-args", default="[]", help="透传给本阶段的 JSON 字符串数组，不允许覆盖流水线管理的路径/词性")
     parser.add_argument("--overwrite", action="store_true", help="允许覆盖各阶段产物（绝不允许覆盖输入）")
@@ -47,7 +49,7 @@ def _extra_args(value: str, stage: str) -> list[str]:
     }
     # Legacy CLIs accept long-option abbreviations. Any option used by path
     # planning must be spelled in full here, or the child could bypass preflight.
-    planned = {"--batch-cache", "--batch", "--models", "--model", "--no-llm", "--no-pairs-csv", "--batch-resume"}
+    planned = {"--batch-cache", "--batch", "--models", "--model", "--no-llm", "--no-pairs-csv", "--batch-resume", "--graph"}
     for token in tokens:
         option = token.split("=", 1)[0]
         if option in reserved or (stage == "extract" and token.startswith(("-t", "-o", "-f")) and not token.startswith("--")):
@@ -91,23 +93,27 @@ def build_commands(args) -> list[tuple[str, list[str]]]:
     sidecars = []
     # Share the exact naming functions with the actual annotation runners.
     if "annotate" in selected:
-        parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+        parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False, exit_on_error=False)
         parser.add_argument("--batch-cache")
         parser.add_argument("--batch", choices=("auto", "native", "off"), default="auto")
         parser.add_argument("--batch-resume", action="store_true")
         parser.add_argument("--no-llm", action="store_true")
         parser.add_argument("--no-pairs-csv", action="store_true")
         parser.add_argument("--models", nargs="+")
-        options, _ = parser.parse_known_args(extras["annotate"])
+        parser.add_argument("--graph", choices=("pair", "synonym", "all_in_one", "single", "alter_check"),
+                            action=ConsistentSelection)
+        try:
+            options, _ = parser.parse_known_args(extras["annotate"])
+        except argparse.ArgumentError as exc:
+            raise ValueError(str(exc)) from exc
+        graph = resolve_graph_selection(options.graph, args.annotation_engine, engine_option="--annotation-engine")
         models = options.models or []
         multi = len(models) > 1
-        if models and args.annotation_engine == "all-in-one":
-            raise ValueError("all-in-one 不支持 --models；请使用 staged 引擎")
         raw = model_output_paths(output, models)[1] if multi else {}
         results = [output, *raw.values()]
         outputs.extend(raw.values())
         for result in results:
-            if not options.no_pairs_csv:
+            if not options.no_pairs_csv and graph in ("pair", "synonym", "all_in_one"):
                 outputs.append(result.with_suffix(".csv"))
             outputs.append(result.with_suffix(".summary.json"))
         if not options.no_llm and options.batch != "off":
@@ -131,7 +137,7 @@ def build_commands(args) -> list[tuple[str, list[str]]]:
         if stage == "extract":
             command += [str(source), "-f", str(filter_config), "-t", str(extracted.parent), "-o", extracted.name]
         else:
-            if stage == "annotate":
+            if stage == "annotate" and args.annotation_engine is not None:
                 command += ["--engine", args.annotation_engine]
             command += ["--corpus", str(extracted if stage == "replace" else pairs),
                         "--corpus-type", args.corpus_type, "--out-file", str(paths[stage])]

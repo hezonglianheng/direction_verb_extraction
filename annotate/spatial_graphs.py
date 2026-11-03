@@ -5,7 +5,8 @@
 正式标注图：
     pair     read_pair → feature（a/b）→ schema（a/b）→ judge → save
     synonym  read_pair → synonym → save
-两者只接受 python replace 产出的合格句对；不再改写或请求语法/空间义判断。
+    all_in_one  read_pair → all_in_one → save
+三者只接受 python replace 产出的合格句对；不再改写或请求语法/空间义判断。
 read_pair 将两侧原有检查写入兼容的 reality/semantic 输出块，来源标记 preparation。
 两侧分别使用自己的关注词、三元组与示例；旧输入必须先经过替换步骤。
 
@@ -1084,6 +1085,8 @@ ADMISSION_FAILED = "failed"
 """准入维度：这一项执行出错（特征提取失败）"""
 ADMISSION_ABSENT = "absent"
 """准入维度：这条记录压根没走到这一步（改写未命中、提前收尾）"""
+ADMISSION_NOT_APPLICABLE = "not_applicable"
+"""准入维度：本任务不执行这一项（仅 synonym 的特征与图式）"""
 
 ADMISSION_SCHEMA_CONFIGURED = "configured"
 """schema 那一维：名字来自配置表（查表命中）"""
@@ -1136,14 +1139,15 @@ def _admission_fluency(state: dict) -> str:
 
 
 def _admission_features(state: dict) -> str:
-    """特征那一维：两侧都抽出来才算确认；任一侧 error 是 failed，no_llm 是 unknown"""
+    """两侧都抽出来才确认；error 为 failed，no_llm 或试图标成不适用均为 unknown。"""
     details = state.get("features_detail") or {}
     if not details:
         return ADMISSION_ABSENT
     statuses = [(details.get(side) or {}).get("status") for side in ("a", "b")]
     if "error" in statuses:
         return ADMISSION_FAILED
-    if "skipped" in statuses:
+    sources = [state.get("features_source")] + [(details.get(side) or {}).get("source") for side in ("a", "b")]
+    if "skipped" in statuses or ADMISSION_NOT_APPLICABLE in statuses + sources:
         return ADMISSION_UNKNOWN
     return ADMISSION_CONFIRMED
 
@@ -1321,11 +1325,10 @@ def record_order_key(record: dict) -> tuple[int, int]:
     )
 
 
-def serialize_pair(state: PairState) -> dict:
-    """把最终状态整理成一条结果记录
+def _serialize_pair_common(state: dict, *, mode: str, status: str, admission: dict) -> dict:
+    """装配正式句对结果的公共身份、来源、句对及上下文，不执行任务判断。
 
-    一条记录包含：两个句子、各自的语义特征、各自对应的 schema、判定信息，
-    以及逐节点的上下文历史（context.history）。candidate 块标明这是一条语料展开出的第几个待选句。
+    status 与 admission 由各任务给出；特征、图式和判定由各自的序列化器补入。
 
     focus_word（a 侧）与 focus_word_b（b 侧）都落盘：两侧的 schema 是各按自己那侧的关注词收窄出来的，
     事后要核对"这一对落在判定表哪一格、为什么"就得两份都在。
@@ -1343,10 +1346,11 @@ def serialize_pair(state: PairState) -> dict:
     record = state["record"]
     return {
         "id": _record_id(state),
-        "status": pair_final_status(state),
+        "status": status,
         "stage": state.get("stage", "unknown"),
         "status_reason": state.get("status_reason", ""),
         "schema_version": st.RESULT_SCHEMA_VERSION,
+        "annotation_mode": mode,
         "pair_screening": record.get("pair_screening", {}),
         "sentence_id": st.sentence_id(record),
         "content_hash": st.content_hash(record.get("sentence") or []) if record.get("sentence") else None,
@@ -1383,16 +1387,27 @@ def serialize_pair(state: PairState) -> dict:
             },
         },
         "semantic": state.get("semantic", {}),
+        # 数据准入与流程状态分开，由具体任务决定哪些维度适用。
+        "admission": admission,
+        "context": {
+            "history": state.get("history", []),
+        },
+    }
+
+
+def serialize_pair(state: PairState, *, annotation_mode: str = "pair") -> dict:
+    """完整句对标注：公共字段 + 两侧特征/图式与最终判定，准入要求保持 pair 口径。
+
+    annotation_mode 允许单次完整标注复用同一结果契约，不改变 pair 的状态与准入计算。
+    """
+    return {
+        **_serialize_pair_common(state, mode=annotation_mode, status=pair_final_status(state),
+                                 admission=pair_admission(state)),
         "features": state.get("features", {}),
         "features_source": state.get("features_source"),
         "features_detail": state.get("features_detail", {}),
         "schema": state.get("schema", {}),
         "judgement": state.get("judge", {}),
-        # 数据准入（A1）：与 status 并列，正式导出按它筛，别拿「流程成功」当「数据可用」
-        "admission": pair_admission(state),
-        "context": {
-            "history": state.get("history", []),
-        },
     }
 
 
@@ -1542,6 +1557,53 @@ def _save_node(serialize, writer: "ResultWriter") -> Callable[[dict], dict]:
         return {"history": [_step("save", status=record["status"], output_file=str(writer.path))]}
 
     return node
+
+
+class AllInOneState(PairState):
+    """完整标注沿用 PairState；另存单次 agent 的诊断，不另建执行路径。"""
+
+    all_in_one: dict
+
+
+def all_in_one_node(agent) -> Callable[[dict], dict]:
+    def update(state: dict, value: dict) -> dict:
+        return {
+            **pair_feature_update(state, value["feature_results"]),
+            "schema": value["schema"],
+            "judge": value["judgement"],
+            "all_in_one": value["meta"],
+        }
+
+    def detail(state: dict, value: dict, wrote: dict) -> dict:
+        meta = value["meta"]
+        return {"source": value["source"], "error": meta.get("error"),
+                "llm_calls": meta.get("llm_calls", 0), "requests": meta.get("requests", 0)}
+
+    return agent_node(
+        agent, node="all_in_one",
+        inputs={"sentence_a": "sentence_a", "sentence_b": "sentence_b",
+                "focus_word_a": "focus_word", "focus_word_b": "focus_word_b"},
+        update=update, detail=detail, state_type=AllInOneState,
+    )
+
+
+def serialize_all_in_one(state: AllInOneState) -> dict:
+    """与 pair 同一正式结果契约，保留 agent 的旧诊断字段（不据此推算请求）。"""
+    return {**serialize_pair(state, annotation_mode="all_in_one"),
+            "all_in_one": state.get("all_in_one", {})}
+
+
+def build_all_in_one_graph(agents, writer: "ResultWriter"):
+    """read_pair → 一次完整标注及后置查表 → save；由共同 runner 驱动。"""
+    graph = StateGraph(AllInOneState)
+    graph.add_node("read_pair", prepared_pair_node)
+    graph.add_node("all_in_one", all_in_one_node(agents.need("all_in_one")))
+    graph.add_node("save", _save_node(serialize_all_in_one, writer))
+    graph.add_edge(START, "read_pair")
+    graph.add_conditional_edges("read_pair", route_after_semantic, {"feature": "all_in_one", "save": "save"})
+    graph.add_edge("all_in_one", "save")
+    graph.add_edge("save", END)
+    return graph.compile()
 
 
 # --------------------------------------------------------------------------
@@ -1930,12 +1992,38 @@ def synonym_final_status(state: SynonymState) -> str:
     return "ok" if stage == "semantic_ok" else "ok_no_semantic_gate"
 
 
-def serialize_synonym(state: SynonymState) -> dict:
-    """沿用改写检查的成对记录，增加与 pair 图同口径的 id 和独立 agent 的同义判定。"""
+def synonym_admission(state: dict) -> dict:
+    """独立同义任务只要求空间性、通顺性与有效的模型判定；不要求特征或图式。
+
+    True / False 都是有效结论；未判定、未调用、提示语未填、调用失败（含预算拒绝）
+    都不能准入，且必须进入复核通道，不能因为 status 不是 ok 而遗漏。
+    """
+    judgement = state.get("synonym") or {}
+    valid = isinstance(judgement.get("same_meaning"), bool) and judgement.get("source") == "llm"
+    dimensions = {
+        "reality": _admission_reality(state),
+        "fluency": _admission_fluency(state),
+        "features": ADMISSION_NOT_APPLICABLE,
+        "schema": ADMISSION_NOT_APPLICABLE,
+        "judgement": ADMISSION_JUDGEMENT_LLM if valid else ADMISSION_UNKNOWN if judgement else ADMISSION_ABSENT,
+    }
+    reasons = [name for name in ("reality", "fluency", "judgement")
+               if dimensions[name] not in ADMISSION_READY[name]]
     return {
-        "id": _record_id(state),
-        **serialize_alter_check(state),
+        **dimensions,
+        "source": judgement.get("source") or "",
         "status": synonym_final_status(state),
+        "is_admitted": not reasons,
+        "review_required": bool(reasons),
+        "reasons": reasons,
+    }
+
+
+def serialize_synonym(state: SynonymState) -> dict:
+    """独立同义判定复用公共句对契约，不携带无关的特征、图式或查表结论。"""
+    return {
+        **_serialize_pair_common(state, mode="synonym", status=synonym_final_status(state),
+                                 admission=synonym_admission(state)),
         "judgement": state.get("synonym", {}),
     }
 
@@ -2005,9 +2093,11 @@ class GraphSpec(NamedTuple):
     csv_columns: tuple[tuple[str, str], ...] = ()
     """这张图的记录拍平成 csv 的列序（表头 -> 点分路径，见 st.write_pairs_csv）；空 = 不导出
 
-    成对字段只有 pair 图有（见 serialize_pair 与 st.PAIR_CSV_COLUMNS）；单句图与改写检查图的
-    记录里没有 pair/judgement 两块，照着成对列序导只会得到一排空格子，所以留空、由驱动跳过。
+    正式 pair / synonym 共用 st.PAIR_CSV_COLUMNS；synonym 的图式与查表列自然留空。
+    诊断用的单句图与改写检查图不导出这份正式句对视图，由驱动跳过。
     """
+    default_limit: int = 100
+    """未指定 --limit 时的共同读取上限；all_in_one 保留旧默认 1。"""
 
 
 GRAPHS: dict[str, GraphSpec] = {
@@ -2099,8 +2189,20 @@ GRAPHS: dict[str, GraphSpec] = {
             "replacement_kinds",
         ),
         tally=synonym_tally,
+        csv_columns=st.PAIR_CSV_COLUMNS,
     ),
 }
+
+
+GRAPHS["all_in_one"] = GraphSpec(
+    name="all_in_one", prefix="all_in_one",
+    doc="已检查句对的一次完整标注：read_pair → all_in_one；图式和同义判定后置查表优先",
+    state=AllInOneState, needs=("all_in_one",), init_states=prepared_init_states,
+    build=build_all_in_one_graph, serialize=serialize_all_in_one,
+    plan=prepared_plan, gate_queries=no_gate_queries,
+    counter_names=GRAPHS["pair"].counter_names, tally=pair_tally,
+    csv_columns=st.PAIR_CSV_COLUMNS, default_limit=1,
+)
 
 
 def get_graph(name: str) -> GraphSpec:

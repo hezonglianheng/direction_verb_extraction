@@ -2,14 +2,15 @@
 
 """提示语的读取与渲染。
 
-提示语正文绝大多数放在项目根目录的 system_prompt/ 下，一个 agent 一份（多份时用 <名字>_<用途>.txt），
+提示语正文绝大多数放在项目根目录的 system_prompt/ 下，正式标注按链路/步骤命名，
+共享片段只保留一份，维护索引见 system_prompt/README.md。
 目录用 __file__ 解析成绝对路径，与运行时 cwd 无关（与 config.py / spatial_tools.py 同一做法）。
 agent 在构造期调用 read_prompt / render_prompt 把正文读进来，见 spatial_agents.BaseAgent。
 
 例外是空间判据片段 reality.txt：它按语料类型分，所以与那组配置表一起放在
 config_files/<语料类型>/ 下（见 spatial_tools.CONFIG_PROMPT_FILES），由 screen_<类型>.txt
-与 all_in_one 共同注入；读法是 read_prompt_path——两条路的读法与报错文案是同一套，
-只有路径的来源不同。
+注入；正式 pair/synonym/all_in_one 不重复筛选，也不注入这份判据。读法是 read_prompt_path，
+与 system_prompt/ 的读法和报错文案是同一套，只有路径的来源不同。
 """
 
 import re
