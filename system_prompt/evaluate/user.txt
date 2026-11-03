@@ -1,0 +1,7 @@
+原句：{{sentence_a}}
+改写句：{{sentence_b}}
+
+原句关注词：{{focus_word}}
+改写句关注词：{{focus_word_b}}
+
+请判断这两句话是否同义，并简要说明理由。

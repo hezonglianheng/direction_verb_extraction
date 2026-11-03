@@ -169,6 +169,20 @@ VOTING_MODEL_WORKERS = 0
 若接口侧有限流，可把本项调小，或同时调小 --workers。
 """
 
+EVALUATE_WORKERS = 8
+"""同义判断评测时，单个模型内部的并发请求数（``evaluate --workers`` 可覆盖）
+
+评测是纯 IO 密集的（每条请求只带句对，不做 LTP），默认比标注阶段高；
+接口限流时调小本项。
+"""
+
+EVALUATE_MODEL_WORKERS = 0
+"""同时评测几个模型；0 = ``--models`` 给了几个就同时跑几个
+
+每个模型内部仍按 EVALUATE_WORKERS 并发，所以总线程数约为
+``模型数 × EVALUATE_WORKERS``。某个模型失败不会取消其他模型，各自写报告。
+"""
+
 CANDIDATE_MAX_REQUESTS = 8
 """一条候选最多发几次模型请求（0 表示不限）
 

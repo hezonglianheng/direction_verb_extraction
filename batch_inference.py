@@ -52,6 +52,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
 from pydantic import BaseModel
@@ -174,12 +175,35 @@ class BatchProfile:
             "model_key": self.model_key,
             "provider": self.provider,
             "model": self.model,
-            "base_url": self.base_url,
+            "base_url": _fingerprint_base_url(self.base_url),
             "protocol": self.protocol,
             "temperature": self.temperature,
             "completion_window": self.completion_window,
             "extra": json.dumps(self.extra, ensure_ascii=False, sort_keys=True),
         }
+
+
+def _fingerprint_base_url(value: str) -> str:
+    """身份签名里的 base_url：去掉账号、密码与查询参数
+
+    `.meta.json` 会落盘这份签名，用于 --batch-resume 时核对是否同一模型；
+    它只需要「同一个端点」的判断依据，不需要把 URL 里的凭据一起写进 sidecar。
+    比对口径随之变成忽略账号/查询参数；地址真正换了主机或路径仍会拒绝续跑。
+    """
+    text = str(value or "")
+    try:
+        parts = urlsplit(text)
+    except ValueError:
+        return "<invalid-url>"
+    if not parts.scheme or not parts.hostname:
+        return text.split("?", 1)[0]
+    netloc = parts.hostname
+    try:
+        if parts.port:
+            netloc = f"{netloc}:{parts.port}"
+    except ValueError:
+        pass
+    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
 
 
 def _default_protocol(provider: str) -> str:
@@ -529,10 +553,20 @@ class NativeBatchClient:
                     "请先在 OpenRouter 控制台确认，再决定是否重跑",
                 ) from exc
             raise
-        body = response.json()
-        batch_id = body.get("id")
+        # HTTP 成功但响应体坏掉/缺 id 时，远端很可能已经受理：归入 BatchTimeout，
+        # 让调用方按「受理状态不确定」处理，而不是当成未受理去同步重发。
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise BatchTimeout(
+                "OpenRouter 建批请求已返回成功，但响应体不是有效 JSON；可能已被受理。"
+                "为避免重复计费，本轮停止，请先在控制台确认",
+            ) from exc
+        batch_id = body.get("id") if isinstance(body, dict) else None
         if not batch_id:
-            raise RuntimeError(f"创建 OpenRouter batch 后没有拿到 id：{response.text[:500]}")
+            raise BatchTimeout(
+                f"创建 OpenRouter batch 后没有拿到 id（可能已被受理）：{response.text[:500]}"
+            )
         job = BatchJob(
             batch_id=str(batch_id),
             keys=[item.key for item in items],
@@ -592,10 +626,19 @@ class NativeBatchClient:
                     "本轮停止。请先在供应商控制台确认，再决定是否重跑",
                 ) from exc
             raise
-        payload = created.json()
-        batch_id = payload.get("id")
+        # 与 OpenRouter 同理：建批 HTTP 成功但响应坏掉/缺 id 时，不能假设未受理。
+        try:
+            payload = created.json()
+        except ValueError as exc:
+            raise BatchTimeout(
+                "建批请求已返回成功，但响应体不是有效 JSON；可能已被受理。"
+                "为避免重复计费，本轮停止，请先在供应商控制台确认",
+            ) from exc
+        batch_id = payload.get("id") if isinstance(payload, dict) else None
         if not batch_id:
-            raise RuntimeError(f"创建 batch 后没有拿到 id：{created.text[:500]}")
+            raise BatchTimeout(
+                f"创建 batch 后没有拿到 id（可能已被受理）：{created.text[:500]}"
+            )
         job = BatchJob(
             batch_id=str(batch_id),
             keys=[item.key for item in items],
@@ -819,6 +862,7 @@ class BatchSession:
         chunk_size: int = 5000,
         retry_policy: dict | None = None,
         logger: Callable[[str], None] = print,
+        sanitize_error: Callable[[str], str] | None = None,
         client: NativeBatchClient | None = None,
         resume: bool = False,
         strict_native: bool = False,
@@ -833,6 +877,8 @@ class BatchSession:
         self.chunk_size = chunk_size
         self.retry_policy = dict(retry_policy or {"max_retries": 0})
         self.logger = logger
+        self.sanitize_error = sanitize_error
+        """错误文本落盘前的脱敏钩子；None = 保持原样（annotate 的既有行为）"""
         self.resume = bool(resume)
         self.strict_native = bool(strict_native)
         """True = --batch native：需要回退时直接报错，不静默走同步链路"""
@@ -958,6 +1004,8 @@ class BatchSession:
             temp.unlink(missing_ok=True)
 
     def _append_result(self, key: str, dumps: dict | None, error: str | None) -> None:
+        if error is not None and self.sanitize_error is not None:
+            error = self.sanitize_error(error)
         with self._lock:
             self.results[key] = {"dumps": dumps, "error": error}
             if dumps is not None:
@@ -1210,9 +1258,9 @@ class BatchSession:
                 continue
             if all(key in self.results for key in needed):
                 continue
-            if job.status == "cancelling":
-                # 还在取消中，任务可能仍在跑；先不动，避免与远端抢着处理同一批
-                continue
+            # cancelling 不是终态：persisted 状态可能已经过时，必须继续向远端
+            # wait/collect，才能在它进入 cancelled/completed 后收到结果。跳过它
+            # 会让本地永远停在 cancelling，下次 resume 也拿不到远端已产出的结果。
             # completed/failed/expired/cancelled 都先收一次：expired/partial 也可能
             # 带回了部分成功结果；completed 更要再 GET 一次拿 output_file_id/results。
             try:
@@ -1235,6 +1283,11 @@ class BatchSession:
                     if self.strict_native:
                         self._append_result(key, None, f"批量结果解析失败：{exc!r}")
                     # 非 strict：解析失败的项同样留给同步回退
+            if self.strict_native:
+                # 终态结果里完全没出现的 key 也要记失败，否则 execute() 会把它
+                # 当成待发请求重新提交。
+                for key in needed.difference(set(self.results)):
+                    self._append_result(key, None, f"batch {job.batch_id} 没有返回这一项")
             self._job_status(job)
 
     # -- 汇总 --------------------------------------------------------------
