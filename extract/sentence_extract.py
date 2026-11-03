@@ -8,6 +8,7 @@ import time
 
 import config
 from extract import extraction_log
+from extract import local_model_service
 from extract import sentenceFilters
 from extract import sentence_screening
 from extract.entry_in_linux import run_linux_entry
@@ -199,54 +200,61 @@ def main(
     )
     for family, screener in screeners.items():
         print(f"[LLM 筛选计划] {family}：{screener.describe()}")
-        # 提示语已填时提前建模型：模型配置错在启动时暴露，不留给筛选线程
-        screener.warm()
 
-    print(f"[筛选计划] 共 {len(filter_configs)} 套规则：")
-    for config_path, output_path in zip(filter_configs, output_paths):
-        print(f"    {config_path}  ->  {output_path}")
-    if vocabs:
-        print(f"[筛选计划] 初筛词表 {len(vocabs)} 个词语，未通过初筛的句子不会送入 LTP")
-    else:
-        print("[筛选计划] 未使用初筛")
+    # 本地小模型（api_keys.json 里该模型带 local_service 块）在这里拉起服务；
+    # 远程模型或筛选器整体未启用时是空上下文，不会碰任何进程。
+    # 范围一直包到漏斗日志写盘之后，保证正常结束、异常与 Ctrl-C 都会走到 stop()。
+    screen_active = screen_llm and any(screener.enabled for screener in screeners.values())
+    with local_model_service.for_model(screen_model, enabled=screen_active):
+        for family, screener in screeners.items():
+            # 提示语已填时提前建模型：模型配置错在启动时暴露，不留给筛选线程
+            screener.warm()
 
-    started_at = time.time()
-    if sys.platform.startswith("win"):
-        stats = run_windows_entry(
-            src_path,
-            filter_configs,
-            output_paths,
-            vocabs,
-            screeners=screeners,
-            extract_workers=extract_workers,
-            filter_workers=filter_workers,
-            screen_kind=screen_kind,
+        print(f"[筛选计划] 共 {len(filter_configs)} 套规则：")
+        for config_path, output_path in zip(filter_configs, output_paths):
+            print(f"    {config_path}  ->  {output_path}")
+        if vocabs:
+            print(f"[筛选计划] 初筛词表 {len(vocabs)} 个词语，未通过初筛的句子不会送入 LTP")
+        else:
+            print("[筛选计划] 未使用初筛")
+
+        started_at = time.time()
+        if sys.platform.startswith("win"):
+            stats = run_windows_entry(
+                src_path,
+                filter_configs,
+                output_paths,
+                vocabs,
+                screeners=screeners,
+                extract_workers=extract_workers,
+                filter_workers=filter_workers,
+                screen_kind=screen_kind,
+            )
+        else:
+            stats = run_linux_entry(
+                src_path,
+                filter_configs,
+                output_paths,
+                vocabs,
+                screeners=screeners,
+                extract_workers=extract_workers,
+                filter_workers=filter_workers,
+                screen_kind=screen_kind,
+            )
+
+        # 两个平台共用同一个成功出口：语料文件已原子替换后才写漏斗日志。
+        # 运行中途抛错不会走到这里，避免留下一份“看起来完整”的统计。
+        extraction_log.write_extract_log(
+            stats,
+            src_path=src_path,
+            filter_configs=filter_configs,
+            output_paths=output_paths,
+            vocab_count=len(vocabs),
+            screening_stats={family: screener.stats() for family, screener in screeners.items()},
+            log_dir=log_dir,
+            started_at=started_at,
+            finished_at=time.time(),
         )
-    else:
-        stats = run_linux_entry(
-            src_path,
-            filter_configs,
-            output_paths,
-            vocabs,
-            screeners=screeners,
-            extract_workers=extract_workers,
-            filter_workers=filter_workers,
-            screen_kind=screen_kind,
-        )
-
-    # 两个平台共用同一个成功出口：语料文件已原子替换后才写漏斗日志。
-    # 运行中途抛错不会走到这里，避免留下一份“看起来完整”的统计。
-    extraction_log.write_extract_log(
-        stats,
-        src_path=src_path,
-        filter_configs=filter_configs,
-        output_paths=output_paths,
-        vocab_count=len(vocabs),
-        screening_stats={family: screener.stats() for family, screener in screeners.items()},
-        log_dir=log_dir,
-        started_at=started_at,
-        finished_at=time.time(),
-    )
 
 
 if __name__ == "__main__":
