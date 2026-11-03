@@ -13,8 +13,8 @@
    哪一组文件缺了或内容为空都按空表跑，对应环节退化为 LLM 兜底或原样返回，并在结果记录的
    source 字段里如实标记来源；跑批入口启动时会逐张打印实际路径与内容摘要，绝不静默降级。
    这两组目录下还各有一份空间判据片段（reality.txt，见 CONFIG_PROMPT_FILES），由
-   system_prompt/screen_<词类型>.txt 与 all_in_one 共同注入；reality/semantic agent 的主判据
-   与语料筛选共用这一份。路径与读法见 config_prompt_path / utils.read_prompt_path。
+   system_prompt/screen_<词类型>.txt 注入；reality/semantic 诊断 agent 与语料筛选共用这一份。
+   正式三条标注链路不重筛或注入此片段。路径与读法见 config_prompt_path / utils.read_prompt_path。
 2. 纯规则工具：切片改写 alter_sentence（一个原句按命中的规则组产出多个待选句）、词组定位
    find_word_groups、schema 查表 lookup_schema（先按关注词收窄、再按语义特征匹配）、
    判定查表 lookup_judgement、结果落盘 write_jsonl、成对记录拍平 write_pairs_csv —— 不调 LLM，
@@ -1881,7 +1881,7 @@ def lookup_judgement(schema_a: str | None, schema_b: str | None, table: dict | N
 # --------------------------------------------------------------------------
 
 
-RESULT_SCHEMA_VERSION = "1.2"
+RESULT_SCHEMA_VERSION = "1.3"
 """结果 jsonl 的 schema 版本号，写进每条记录与运行汇总
 
 正式产物一律带版本号：读取侧据此判断这份文件能不能直接解析，旧格式走一次性迁移并有异常
@@ -1889,7 +1889,9 @@ RESULT_SCHEMA_VERSION = "1.2"
 1.1：顶层 id 由 `sentence_id-位置-替换` 改为 `源行号-第几个目标词位置-第几个替换句`。
 1.2：id 最前面加来源文档编号，变成
 `来源文档编号-源行号-第几个目标词位置-第几个替换句`；source 块新增 source_document_no。
-（迁移脚本见 migrate_result_ids.py）。"""
+（迁移脚本见 migrate_result_ids.py）。
+1.3：正式 pair / synonym / all_in_one 共用身份与来源字段，必有 annotation_mode；
+synonym 的特征与图式准入为 not_applicable。仅迁移 id 不会升级结果契约版本。"""
 
 RESULT_REQUIRED_FIELDS: tuple[str, ...] = (
     "id",
@@ -1900,6 +1902,7 @@ RESULT_REQUIRED_FIELDS: tuple[str, ...] = (
     "candidate_key",
     "admission",
     "schema_version",
+    "annotation_mode",
 )
 """一条正式结果记录必有的顶层字段（schema 检查用）
 
@@ -1923,6 +1926,8 @@ def validate_result_record(record: dict) -> list[str]:
     version = record.get("schema_version")
     if version != RESULT_SCHEMA_VERSION:
         problems.append(f"schema_version 是 {version!r}，当前版本 {RESULT_SCHEMA_VERSION!r}（需迁移后再用）")
+    if "annotation_mode" in record and record["annotation_mode"] not in ("pair", "synonym", "all_in_one"):
+        problems.append(f"annotation_mode 是 {record['annotation_mode']!r}，应为 pair / synonym / all_in_one")
     return problems
 
 
@@ -2028,8 +2033,8 @@ PAIR_CSV_COLUMNS: tuple[tuple[str, str], ...] = (
 """成对记录拍平 csv 的列序：表头 -> 记录里的点分路径（形状见 spatial_graphs.serialize_pair）
 
 真源就在这里：跑批收尾（spatial_runner.ResultWriter.finish）与独立的导出脚本
-（export_pairs_csv.py）都用这一份，改列只改这里。只有 pair 图画得成这张表——单句图与
-改写检查图的记录里没有 pair/judgement 两块（见 spatial_graphs.GraphSpec.csv_columns）。
+（export_pairs_csv.py）都用这一份，改列只改这里。正式 pair / synonym 共用这张表，
+synonym 不做图式与查表，对应列留空；单句与改写检查诊断图不导出（见 GraphSpec.csv_columns）。
 首列 id 是记录标识（来源文档编号-源行号-第几个目标词位置-第几个替换句，口径见
 spatial_graphs._record_id），在记录里就是顶层一个字段、点分路径只有一段；旧记录缺它时这一格留空。
 编号只在同一次跑批的输入内唯一（文档编号随 --offset 重排），跨文件的身份仍看「句子ID」。

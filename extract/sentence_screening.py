@@ -238,8 +238,8 @@ def prompt_path(kind: str) -> Path:
 def spatial_criteria_path(kind: str) -> Path:
     """该类语料的空间判据片段（config_files/<类型>/reality.txt）
 
-    它同时被 all_in_one 注入，所以 screen_<类型>.txt 与 all_in_one 的“是否表示空间语义”
-    永远读同一份正文；两份提示语只各写自己的任务说明。
+    screen_<类型>.txt 与 reality/semantic 诊断 agent 共用这份空间判据；
+    正式 pair/synonym/all_in_one 读取合格句对，不再注入判据或重新筛选。
     """
     directory = _CONFIG_DIRS.get(kind)
     if directory is None:
@@ -253,7 +253,7 @@ def load_system_prompt(kind: str) -> str:
     占位符：
         ``{{judgement_criteria}}``  语法 + 空间自洽（system_prompt/judgement_criteria.txt）
         ``{{spatial_criteria}}``    本类语料的空间判据片段（config_files/<类型>/reality.txt）
-    两个占位符是“同一份正文只写一次”的落点：screen_<类型>.txt 与 all_in_one.txt 都从这里取。
+    两个占位符是“同一份正文只写一次”的落点：语料筛选与诊断回退读取同一份筛选模板。
     """
     template = utils.read_prompt_path(prompt_path(kind))
     if not template.strip():

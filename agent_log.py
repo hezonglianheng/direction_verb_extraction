@@ -90,6 +90,7 @@ _OUTPUT_KEYS: dict[str, tuple[str, ...]] = {
     "schema": ("name", "source", "reason"),
     "judge": ("same_meaning", "source", "lookup", "reason"),
     "synonym": ("same_meaning", "source", "reason"),
+    "all_in_one": ("source", "reason", "schema", "judgement"),
     "alter": ("applied", "source", "detail"),
 }
 """各 agent 最值得写进日志的输出字段；其余字段（整棵匹配树、全部候选句等）不落日志。"""
@@ -226,6 +227,18 @@ def _summarize_output(agent_name: str, result: Any) -> Any:
             output[key] = _compact(result[key])
     if agent_name == "feature":
         output["features"] = _feature_summary(result.get("features"))
+    if agent_name == "all_in_one":
+        output["feature_results"] = {
+            side: {"features": _feature_summary(item.get("features")),
+                   **{key: _compact(item[key]) for key in ("source", "reason", "validation") if key in item}}
+            for side, item in (result.get("feature_results") or {}).items()
+            if isinstance(item, Mapping)
+        }
+        meta = result.get("meta") or {}
+        # 不重复记录 raw 完整结构化响应；只留下本次执行的调用账及失败原因。
+        output["meta"] = {key: _compact(meta[key]) for key in (
+            "model", "corpus_type", "llm_calls", "requests", "cache_hits", "batch_hits", "error", "elapsed_seconds"
+        ) if key in meta}
     if agent_name == "alter":
         output["candidate_sentences"] = len(result.get("sentences") or ())
         output["candidate_slices"] = len(result.get("slices") or ())
@@ -403,9 +416,11 @@ class AgentLog:
                 if not isinstance(item, Mapping):
                     lines.append(f"  {name}: {item}")
                     continue
+                tables = (json.dumps(item["table_paths"], ensure_ascii=False)
+                          if item.get("table_paths") else item.get("table_path") or "-")
                 lines.append(
                     f"  {name}: llm={item.get('llm')} model={item.get('model')} "
-                    f"table={item.get('table_path') or '-'} prompt="
+                    f"table={tables} prompt="
                     f"{json.dumps(item.get('prompt_paths') or {}, ensure_ascii=False)}"
                 )
             return "\n".join(lines)
@@ -427,6 +442,8 @@ class AgentLog:
                 "table_path": getattr(agent, "table_path", None),
                 "cacheable_sources": list(getattr(agent, "CACHEABLE_SOURCES", ()) or ()),
             }
+            if getattr(agent, "table_paths", None):
+                item["table_paths"] = agent.table_paths
             describe = getattr(agent, "describe", None)
             if callable(describe):
                 try:
@@ -625,6 +642,9 @@ class AgentLog:
         agent_stats = summary.get("agent_stats") or {}
         if agent_stats:
             lines.append("模型调用统计（BaseAgent.stats）:")
+            lines.append("  requests=同步逻辑调用；actual_requests=同步模型开始（含传输重试及内部补发）；"
+                         "roundtrips=返回的可见回复，failed=逻辑调用异常，三者不相加。")
+            lines.append("  Batch 登记/回放不计同步请求；原生提交项数与批次数另见 batch 汇总。")
             for name, stats in agent_stats.items():
                 lines.append(f"  {name}: {json.dumps(stats, ensure_ascii=False)}")
         if summary.get("log_error"):

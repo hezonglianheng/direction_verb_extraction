@@ -8,7 +8,7 @@
 形式，两份产物不能直接按 id 对账。本脚本读旧 jsonl、按新口径重算 id，写出**新的 jsonl 与
 新的 csv**：
 
-    新 jsonl  除 id（以及 schema_version）外，逐字段照抄旧记录，行序按
+    新 jsonl  更新 id 与 source.source_document_no，保留原 schema_version，其余逐字段照抄；行序按
               (line_no, candidate.index) 重排，与跑批收尾一致
     新 csv    列序与单元格口径完全走 spatial_tools.PAIR_CSV_COLUMNS / write_pairs_csv，
               与 spatial_runner 产出的成对信息 csv 相同
@@ -318,7 +318,8 @@ def _replace_id(record: dict, new_id: str | None, document_no: int | None = None
     """保持 id 在第一个键上（与跑批产物一致），其余字段顺序不变。
 
     同时把来源文档编号写回 `source.source_document_no`（紧跟 source_document_id），
-    迁移后的记录因此与 1.2 版程序产物同形，不必再靠 id 反推。
+    不必再靠 id 反推。只迁移身份不等于完成结果契约迁移，schema_version 原样保留：
+    尤其不能因全局常量升级，就把缺少 annotation_mode / admission 的旧结果标成 1.3。
     """
     out = {"id": new_id}
     for key, value in record.items():
@@ -337,8 +338,6 @@ def _replace_id(record: dict, new_id: str | None, document_no: int | None = None
                 source = rebuilt
             value = source
         out[key] = value
-    if "schema_version" in out:
-        out["schema_version"] = st.RESULT_SCHEMA_VERSION
     return out
 
 
