@@ -13,6 +13,51 @@ from extract.sentenceTable import SentenceTaskCache
 cache = SentenceTaskCache(max_size=config.CACHE_MAX_SIZE)
 
 
+def build_sentence_context(sentence: str) -> dict[str, Any]:
+    """构造一句句子的只读检索索引
+
+    同一句可能同时被多套规则（以及 or_all 下的多个叶子规则）判断。索引只依赖 LTP
+    的四项结果，与具体规则无关，因此由调用方构造一次、传给该句的所有规则节点复用。
+    """
+    words = cache.get_task_value(sentence, config.CWS)
+    pos_tags = cache.get_task_value(sentence, config.POS)
+    dep = cache.get_task_value(sentence, config.DEP)
+    sdp = cache.get_task_value(sentence, config.SDP)
+
+    word_indices_map: dict[str, set[int]] = defaultdict(set)
+    for idx, w in enumerate(words):
+        word_indices_map[w].add(idx)
+
+    pos_indices_map: dict[str, set[int]] = defaultdict(set)
+    for idx, p in enumerate(pos_tags):
+        pos_indices_map[p].add(idx)
+
+    dep_label_indices_map: dict[str, set[int]] = defaultdict(set)
+    dep_child_map: dict[tuple[int, str], set[int]] = defaultdict(set)
+    for idx, (head, label) in enumerate(zip(dep["head"], dep["label"])):
+        dep_label_indices_map[label].add(idx)
+        dep_child_map[(head - 1, label)].add(idx)
+
+    sdp_label_indices_map: dict[str, set[int]] = defaultdict(set)
+    sdp_child_map: dict[tuple[int, str], set[int]] = defaultdict(set)
+    for idx, (head, label) in enumerate(zip(sdp["head"], sdp["label"])):
+        sdp_label_indices_map[label].add(idx)
+        sdp_child_map[(head - 1, label)].add(idx)
+
+    return {
+        "words": words,
+        "word_indices_map": word_indices_map,
+        "pos_indices_map": pos_indices_map,
+        "dep_label_indices_map": dep_label_indices_map,
+        "dep_child_map": dep_child_map,
+        "sdp_label_indices_map": sdp_label_indices_map,
+        "sdp_child_map": sdp_child_map,
+        # 同一句的多条规则常共享词表/词性条件；候选索引按条件缓存，避免重复遍历。
+        "_vocab_indices_cache": {},
+        "_pos_indices_cache": {},
+    }
+
+
 def load_vocab_file(path: str, base_dir: str | Path | None = None) -> set[str]:
     """加载 JSON5 词表文件（内容为词条列表）
 
@@ -123,10 +168,12 @@ class JudgeMethod(abc.ABC):
         """
         return self.judge(sentence), set()
 
-    def explain(self, sentence: str) -> tuple[bool, dict]:
+    def explain(self, sentence: str, context: dict[str, Any] | None = None) -> tuple[bool, dict]:
         """解释句子是否符合判断条件的要求
         Args:
             sentence (str): 待判断的句子
+            context (dict | None): 可选的句子检索索引；由调用方构造一次后供多套规则复用。
+                为 None 时各实现自行构造，保持旧调用方式兼容。
         Returns:
             Tuple[bool, dict]: 句子是否符合判断条件要求，以及解释信息的字典，包含以下字段：
                 - matched (bool): 句子是否符合判断条件要求
@@ -170,12 +217,12 @@ class AndJudgeMethod(JudgeMethod):
             sets.append(indices)
         return True, set.intersection(*sets) if sets else set()
 
-    def explain(self, sentence: str):
+    def explain(self, sentence: str, context: dict[str, Any] | None = None):
         all_nodes = {}
         methods = [self.name]
 
         for m in self.judge_methods:
-            ok, res = m.explain(sentence)
+            ok, res = m.explain(sentence, context=context)
             if not ok:
                 return False, {
                     "matched": False,
@@ -224,11 +271,11 @@ class OrJudgeMethod(JudgeMethod):
                 return True, result
         return False, set()
 
-    def explain(self, sentence: str):
+    def explain(self, sentence: str, context: dict[str, Any] | None = None):
         methods = [self.name]
 
         for m in self.judge_methods:
-            ok, res = m.explain(sentence)
+            ok, res = m.explain(sentence, context=context)
             if ok:
                 methods.extend(res["methods"])
                 return True, {
@@ -281,12 +328,12 @@ class OrAllJudgeMethod(JudgeMethod):
                 result.update(indices)
         return matched, result
 
-    def explain(self, sentence: str):
+    def explain(self, sentence: str, context: dict[str, Any] | None = None):
         all_nodes = {}
         methods = [self.name]
 
         for m in self.judge_methods:
-            ok, res = m.explain(sentence)
+            ok, res = m.explain(sentence, context=context)
             if not ok:
                 continue
 
@@ -345,9 +392,11 @@ class SingleJudgeMethod(JudgeMethod):
                 # 这里兜底处理直接构造 SingleJudgeMethod 的场景
                 if self.VOCAB in config_dict:
                     raise ValueError(f"规则 {self.name} 不能同时指定 {self.VOCAB} 与 {self.VOCAB_FILE}")
-                compiled[self.VOCAB] = load_vocab_file(value, self.base_dir)
+                compiled[self.VOCAB] = tuple(sorted(load_vocab_file(value, self.base_dir)))
             elif key == self.VOCAB:
-                compiled[key] = set(value)
+                # 词表在规则加载时就排好序并去重。set 的迭代顺序受 PYTHONHASHSEED 影响，
+                # 且旧实现每句每规则都要 sorted 一次；这里固定顺序后推理循环只读不排序。
+                compiled[key] = tuple(sorted(set(value)))
             elif key == self.LINK and isinstance(value, dict):
                 compiled[key] = {name: self._compile_config(cond) for name, cond in value.items()}
             else:
@@ -374,8 +423,9 @@ class SingleJudgeMethod(JudgeMethod):
     # explain（树）
     # -------------------------
 
-    def explain(self, sentence: str):
-        context = self._build_sentence_context(sentence)
+    def explain(self, sentence: str, context: dict[str, Any] | None = None):
+        if context is None:
+            context = self._build_sentence_context(sentence)
         result_map = self._search_with_explain_with_context(context, self.config)
 
         return (
@@ -394,50 +444,26 @@ class SingleJudgeMethod(JudgeMethod):
     # -------------------------
 
     def _build_sentence_context(self, sentence: str) -> dict[str, Any]:
-        words = cache.get_task_value(sentence, config.CWS)
-        pos_tags = cache.get_task_value(sentence, config.POS)
-        dep = cache.get_task_value(sentence, config.DEP)
-        sdp = cache.get_task_value(sentence, config.SDP)
+        return build_sentence_context(sentence)
 
-        word_indices_map: dict[str, set[int]] = defaultdict(set)
-        for idx, w in enumerate(words):
-            word_indices_map[w].add(idx)
+    def _get_vocab_indices(self, context: dict[str, Any], vocab_words: tuple[str, ...]) -> set[int]:
+        if not isinstance(vocab_words, tuple):
+            # 兼容直接构造/旧调用方传入 set 的情况；生产路径已在加载时转成有序元组。
+            vocab_words = tuple(sorted(vocab_words))
+        vocab_cache = context.setdefault("_vocab_indices_cache", {})
+        cached = vocab_cache.get(vocab_words)
+        if cached is not None:
+            return cached
 
-        pos_indices_map: dict[str, set[int]] = defaultdict(set)
-        for idx, p in enumerate(pos_tags):
-            pos_indices_map[p].add(idx)
-
-        dep_label_indices_map: dict[str, set[int]] = defaultdict(set)
-        dep_child_map: dict[tuple[int, str], set[int]] = defaultdict(set)
-        for idx, (head, label) in enumerate(zip(dep["head"], dep["label"])):
-            dep_label_indices_map[label].add(idx)
-            dep_child_map[(head - 1, label)].add(idx)
-
-        sdp_label_indices_map: dict[str, set[int]] = defaultdict(set)
-        sdp_child_map: dict[tuple[int, str], set[int]] = defaultdict(set)
-        for idx, (head, label) in enumerate(zip(sdp["head"], sdp["label"])):
-            sdp_label_indices_map[label].add(idx)
-            sdp_child_map[(head - 1, label)].add(idx)
-
-        return {
-            "words": words,
-            "word_indices_map": word_indices_map,
-            "pos_indices_map": pos_indices_map,
-            "dep_label_indices_map": dep_label_indices_map,
-            "dep_child_map": dep_child_map,
-            "sdp_label_indices_map": sdp_label_indices_map,
-            "sdp_child_map": sdp_child_map,
-        }
-
-    def _get_vocab_indices(self, context: dict[str, Any], vocab_set: set[str]) -> set[int]:
         word_indices_map = context["word_indices_map"]
         result: set[int] = set()
-        # 必须按固定顺序遍历：set[str] 的迭代顺序受 PYTHONHASHSEED 随机化影响，
-        # 而此处写入 result 的顺序会决定该 int 集合的内部布局，进而影响
-        # final_indices 的迭代顺序与 match_tree 的节点顺序——同一份输入会在不同进程
-        # 得到内容相同但顺序不同的 match_tree（判定结果不受影响，但产物无法逐字节比对）。
-        for vocab in sorted(vocab_set):
+        # 词表已在 _compile_config 中按固定顺序排好：set[str] 的迭代顺序受
+        # PYTHONHASHSEED 随机化影响，而此处写入 result 的顺序会决定该 int 集合的内部布局，
+        # 进而影响 final_indices 的迭代顺序与 match_tree 的节点顺序。
+        # 同一句的多条规则通常共享词表，因此结果也按词表缓存在 context 里。
+        for vocab in vocab_words:
             result.update(word_indices_map.get(vocab, set()))
+        vocab_cache[vocab_words] = result
         return result
 
     def _collect_base_indices(self, context: dict[str, Any], config_dict: dict[str, Any], specific_idx=None) -> dict[str, set[int] | None]:
@@ -450,9 +476,17 @@ class SingleJudgeMethod(JudgeMethod):
             vocab_indices = self._get_vocab_indices(context, config_dict[self.VOCAB])
 
         if self.POS in config_dict:
-            pos_indices = set()
-            for pos_tag in _as_tag_tuple(config_dict[self.POS]):
-                pos_indices |= context["pos_indices_map"].get(pos_tag, set())
+            pos_tags = _as_tag_tuple(config_dict[self.POS])
+            pos_cache = context.setdefault("_pos_indices_cache", {})
+            # 用有序元组作键：不同标签顺序的并集内容相同，但插入顺序会影响集合迭代顺序，
+            # 进而影响 match_tree 节点顺序，不能合并。
+            cache_key = tuple(pos_tags)
+            pos_indices = pos_cache.get(cache_key)
+            if pos_indices is None:
+                pos_indices = set()
+                for pos_tag in pos_tags:
+                    pos_indices |= context["pos_indices_map"].get(pos_tag, set())
+                pos_cache[cache_key] = pos_indices
 
         if self.SYNTAX in config_dict:
             syntax_indices = set()

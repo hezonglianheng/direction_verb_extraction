@@ -207,6 +207,14 @@ FILTER_WORKERS = 1
 故默认为 1。多进程分支保留在 entry_in_linux.py 与 entry_in_win.py 中，需要时改回即可；
 命令行 --filter-workers 可以临时覆盖，不必改文件。"""
 
+FILTER_PREFETCH_BATCHES = 1
+"""单进程筛选时允许后台预计算的批数（1 = 当前批等 LLM 时算下一批；0 = 完全串行）
+
+只影响单进程分支；多进程分支已有在途批次。预取批数越大，LTP/规则与 LLM 的重叠越多，
+但内存里同时保留的批结果也越多，故默认只领先一批。调大时必须同步保证
+``CACHE_MAX_SIZE >= FILTER_BATCH_SIZE * (FILTER_PREFETCH_BATCHES + 1)``，否则 LTP
+缓存会淘汰仍在生产的批，触发重复推理。"""
+
 EXTRACT_WORKERS = 4
 """文本切句阶段的并发线程数（0 = 自动使用 CPU 核数，最多 8）
 

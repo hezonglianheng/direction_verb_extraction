@@ -19,7 +19,7 @@ from extract import sentence_split
 from extract import sentence_screening
 import file_paths
 from file_paths import atomic_write_text
-from pipeline_utils import ROW_ID_FIELD, prefetch_iter, row_key, tag_rows
+from pipeline_utils import ROW_ID_FIELD, prefetch_batches, prefetch_iter, row_key, tag_rows
 
 
 _WORKER_FILTERS: list[tuple[str, Any]] = []
@@ -56,22 +56,25 @@ def _filter_sentence_batch(batch: list[dict[str, Any]]) -> tuple[list[list[dict[
 	filtered_batches: list[list[dict[str, Any]]] = [[] for _ in _WORKER_FILTERS]
 	any_hit_count = 0
 	for item in batch:
+		curr_sentence = item.get("sentence", "")
+		# 同一句的索引只依赖 LTP 结果，与规则无关：构造一次，供本句所有规则族复用。
+		context = sentenceFilters.build_sentence_context(curr_sentence)
 		cws_result = None
 		hit_any = False
 		for idx, (family, curr_filter) in enumerate(_WORKER_FILTERS):
-			judge_result, explanation = curr_filter.explain(item.get("sentence", ""))
+			judge_result, explanation = curr_filter.explain(curr_sentence, context=context)
 			if not judge_result:
 				continue
 			hit_any = True
 			if cws_result is None:
-				cws_result = sentenceFilters.cache.get_task_value(item.get("sentence", ""), config.CWS)
+				cws_result = sentenceFilters.cache.get_task_value(curr_sentence, config.CWS)
 			filter_methods = explanation.get("methods", [])
 			match_tree: list[sentenceFilters.MatchNode] = explanation.get("match_tree", [])
 			simplified_tree = sentenceFilters.simplify_tree(match_tree, tokens=cws_result)
 			record = item | {"sentence": cws_result, "filter_methods": filter_methods, "match_tree": simplified_tree}
 			localization_grounding.attach_analysis(
 				record,
-				item.get("sentence", ""),
+				curr_sentence,
 				sentenceFilters.cache,
 				kind=_kind_for_family(family),
 			)
@@ -105,10 +108,11 @@ def _filter_sentence(item: dict[str, Any]) -> list[dict[str, Any] | None]:
 		raise RuntimeError("过滤进程尚未初始化过滤器")
 
 	curr_sentence: str = item.get("sentence", "")
+	context = sentenceFilters.build_sentence_context(curr_sentence)
 	results: list[dict[str, Any] | None] = []
 	cws_result = None
 	for family, curr_filter in _WORKER_FILTERS:
-		judge_result, explanation = curr_filter.explain(curr_sentence)
+		judge_result, explanation = curr_filter.explain(curr_sentence, context=context)
 		if not judge_result:
 			results.append(None)
 			continue
@@ -438,17 +442,15 @@ def filter_sentences_streaming(
 				_init_filter_worker(filter_config_paths)
 			else:
 				_init_filter_worker(filter_config_paths, screen_kind)
-			batch: list[dict[str, Any]] = []
-			for sentence_item in sentences:
-				batch.append(sentence_item)
-				if len(batch) >= batch_size:
-					candidate_count += len(batch)
-					filtered_batches, any_hit_count = _filter_sentence_batch(batch)
-					_consume(filtered_batches, any_hit_count, len(batch), pbar)
-					batch = []
-			if batch:
+			# 单进程时也把「下一批 LTP + 规则」放到后台线程：当前批在等 LLM 时，
+			# 下一批已经算好，主线程只按原顺序做语义闸门、LLM 与写盘。
+			for batch, result in prefetch_batches(
+				_batch_sentences(sentences, batch_size),
+				_filter_sentence_batch,
+				max_pending=config.FILTER_PREFETCH_BATCHES,
+			):
 				candidate_count += len(batch)
-				filtered_batches, any_hit_count = _filter_sentence_batch(batch)
+				filtered_batches, any_hit_count = result
 				_consume(filtered_batches, any_hit_count, len(batch), pbar)
 		else:
 			max_pending = max_workers * 2

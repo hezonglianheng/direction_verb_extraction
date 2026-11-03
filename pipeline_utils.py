@@ -18,7 +18,9 @@
 
 import queue
 import threading
-from typing import Any, Iterable, Iterator
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Callable, Iterable, Iterator
 
 _SENTINEL = object()
 
@@ -143,3 +145,49 @@ def prefetch_iter(iterable: Iterable[Any], maxsize: int) -> Iterator[Any]:
                 buffer.get_nowait()
         except queue.Empty:
             pass
+
+
+def prefetch_batches(
+    batches: Iterable[Any],
+    produce: Callable[[Any], Any],
+    *,
+    max_pending: int = 1,
+) -> Iterator[tuple[Any, Any]]:
+    """在单个后台线程里预计算下一批，主线程按原顺序消费
+
+    用于把「下一批 LTP + 规则筛选」与「当前批 LLM 筛选」重叠起来。只有一个生产线程，
+    因此同一份 LTP 模型不会被并发调用；``max_pending`` 限制已提交但未消费的批数，
+    内存不会随语料规模增长。
+
+    Args:
+        batches: 按顺序产出的批次
+        produce: 对单批做计算的函数（在后台线程执行）
+        max_pending: 最多允许领先消费者多少批；0 表示完全串行（用于回退/对照）
+
+    Yields:
+        tuple[Any, Any]: ``(batch, produce(batch))``，顺序与 ``batches`` 一致
+
+    Raises:
+        生产函数里的异常会在消费者取到该批时原样抛出，不会静默丢批。
+    """
+    max_pending = max(0, int(max_pending))
+    if max_pending == 0:
+        for batch in batches:
+            yield batch, produce(batch)
+        return
+
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="batch-prefetch") as pool:
+        pending: deque[tuple[Any, Any]] = deque()
+        try:
+            for batch in batches:
+                pending.append((batch, pool.submit(produce, batch)))
+                if len(pending) > max_pending:
+                    done_batch, future = pending.popleft()
+                    yield done_batch, future.result()
+            while pending:
+                done_batch, future = pending.popleft()
+                yield done_batch, future.result()
+        finally:
+            # 消费方提前退出时取消尚未开始的批次；已经开始的批次由线程池 shutdown 等它结束。
+            for _, future in pending:
+                future.cancel()

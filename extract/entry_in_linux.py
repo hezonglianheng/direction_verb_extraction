@@ -21,7 +21,7 @@ from extract import sentence_split
 from extract import sentence_screening
 import file_paths
 from file_paths import atomic_write_text
-from pipeline_utils import ROW_ID_FIELD, prefetch_iter, row_key, tag_rows
+from pipeline_utils import ROW_ID_FIELD, prefetch_batches, prefetch_iter, row_key, tag_rows
 
 
 _WORKER_FILTERS: list[tuple[str, Any]] = []
@@ -79,11 +79,13 @@ def _filter_sentence_batch(batch: list[dict[str, Any]]) -> tuple[list[list[dict[
 	any_hit_count = 0
 	for s in batch:
 		curr_sentence: str = s.get("sentence", "")
+		# 同一句的索引只依赖 LTP 结果，与规则无关：构造一次，供本句所有规则族复用。
+		context = sentenceFilters.build_sentence_context(curr_sentence)
 		cws_result = None
 		hit_any = False
 		for idx, (family, curr_filter) in enumerate(_WORKER_FILTERS):
 			# explain 的真值判定与 judge 严格等价（同一套 context + 集合运算），单次调用即可
-			judge_result, explanation = curr_filter.explain(curr_sentence)
+			judge_result, explanation = curr_filter.explain(curr_sentence, context=context)
 			if not judge_result:
 				continue
 
@@ -453,9 +455,15 @@ def filter_sentences_streaming(
 			_init_filter_worker(filter_config_paths)
 		else:
 			_init_filter_worker(filter_config_paths, screen_kind)
-		for batch in _iter_batches(sentences, batch_size):
+		# 单进程时也把「下一批 LTP + 规则」放到后台线程：当前批在等 LLM 时，
+		# 下一批已经算好，主线程只按原顺序做语义闸门、LLM 与写盘。
+		for batch, result in prefetch_batches(
+			_iter_batches(sentences, batch_size),
+			_filter_sentence_batch,
+			max_pending=config.FILTER_PREFETCH_BATCHES,
+		):
 			candidate_count += len(batch)
-			filtered_batches, any_hit_count = _filter_sentence_batch(batch)
+			filtered_batches, any_hit_count = result
 			_consume(filtered_batches, any_hit_count, len(batch))
 	else:
 		max_pending = max_workers * 2

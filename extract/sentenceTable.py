@@ -142,6 +142,12 @@ class SentenceTaskCache:
 
         注意必须统一以 list 调 pipeline：传裸 str 时 is_batch=False，LTPOutput 会把
         单句结果解包一层，result[t] 就不再是逐句列表了。
+
+        为什么暂不做「先 CWS/POS，切分后再跑 DEP/SDP」的两阶段优化：LTP 的
+        ``pipeline()`` 每次调用都会重新跑一遍 backbone（见 ltp/nerual.py），公开 API
+        无法复用第一次前向的隐藏状态。拆开后未切分句要多一次编码前向，省下的只是
+        受影响句第一次前向里的 DEP/SDP 任务头，收益取决于切分率。本机 CPU 小样本
+        （25% 切分率）实测两阶段约慢 14%；真实语料切分率尚未测量，故暂不替换。
         """
         # 整段（含 _correct_splits 里那次重跑）都在推理锁内：两个线程各跑一半前向没有意义，
         # 反而让"在途推理组数"变成不可控的量（见 _infer_lock）
