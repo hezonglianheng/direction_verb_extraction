@@ -15,6 +15,7 @@ from pathlib import Path
 import config
 from replace import corpus_pairs as cp
 import file_paths
+from extract import local_model_service
 from extract import sentence_screening as ss
 from annotate import spatial_agents as sa
 from annotate import spatial_tools as st
@@ -155,30 +156,35 @@ def main(argv=None):
     preparer = PairPreparer(corpus_type=args.corpus_type,
                             rules=st.load_alter_rules(args.alter_rules) if args.alter_rules else None,
                             model_key=args.model, llm=not args.no_llm, workers=args.workers)
-    preparer.screener.warm()
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with source.open(encoding="utf-8") as reader, file_paths.atomic_write_text(output) as writer:
-        batch = []
+    # 本地小模型（api_keys.json 里该模型带 local_service 块）在启动时拉起服务，
+    # 退出（含异常/Ctrl-C）时关闭；远程模型或 --no-llm 时是空上下文。
+    with local_model_service.for_model(
+        args.model, enabled=not args.no_llm and preparer.screener.enabled
+    ):
+        preparer.screener.warm()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with source.open(encoding="utf-8") as reader, file_paths.atomic_write_text(output) as writer:
+            batch = []
 
-        def emit():
-            for pair in preparer.prepare_rows(batch):
-                writer.write(json.dumps(pair, ensure_ascii=False) + "\n")
+            def emit():
+                for pair in preparer.prepare_rows(batch):
+                    writer.write(json.dumps(pair, ensure_ascii=False) + "\n")
 
-        for line_no, line in enumerate(reader, 1):
-            if not line.strip():
-                continue
-            row = json.loads(line)
-            if "pair_schema_version" in row:
-                raise ValueError("输入已是句对，请勿再次替换；将它交给 python annotate 或其 --engine all-in-one 模式")
-            source_line_no = st.record_line_no(row)
-            row["source_line_no"] = source_line_no if source_line_no is not None else line_no
-            row["line_no"] = line_no
-            batch.append(row)
-            if len(batch) >= max(1, args.chunk_size):
+            for line_no, line in enumerate(reader, 1):
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                if "pair_schema_version" in row:
+                    raise ValueError("输入已是句对，请勿再次替换；将它交给 python annotate 或其 --engine all-in-one 模式")
+                source_line_no = st.record_line_no(row)
+                row["source_line_no"] = source_line_no if source_line_no is not None else line_no
+                row["line_no"] = line_no
+                batch.append(row)
+                if len(batch) >= max(1, args.chunk_size):
+                    emit()
+                    batch = []
+            if batch:
                 emit()
-                batch = []
-        if batch:
-            emit()
     print(f"句对输出：{output}；统计：{dict(preparer.counts)}")
 
 

@@ -259,6 +259,57 @@ SCREEN_CACHE_MAX = 10000
 缓存跨批保留，命中的重复句/重复词不再发请求；但语料是流式的，无上限的 dict 会一直吃内存，
 所以按插入顺序淘汰最旧的一条（近似 LRU 的 FIFO，足够应付重复句集中在邻近批次的情形）。"""
 
+# ---- 本地部署模型服务（OpenAI 兼容，见 extract/local_model_service.py）----
+# 使用本地小模型时，在 model_config/api_keys.json 的对应模型配置里加 "local_service" 块；
+# 模型的请求地址仍写在该条目的 "base_url"（例如 http://127.0.0.1:8000/v1）。
+# 下面的值只是 local_service 未显式给出时的默认值。
+LOCAL_MODEL_SERVICE_DIR = "/home/qinyuhang/model_service"
+"""本地推理服务代码目录（含 service.sh）。相对路径按项目根目录解析。"""
+
+LOCAL_MODEL_SERVICE_START_COMMAND = ("bash", "service.sh", "start", "--wait")
+"""启动命令；在 LOCAL_MODEL_SERVICE_DIR 下执行。
+
+默认的 service.sh start --wait 会一直等到 /health 就绪；换自定义服务时请保证命令返回时
+模型已可连接，或通过 local_service.health_timeout 让本模块继续轮询健康检查。
+"""
+
+LOCAL_MODEL_SERVICE_STOP_COMMAND = ("bash", "service.sh", "stop")
+"""停止命令；在 LOCAL_MODEL_SERVICE_DIR 下执行。"""
+
+LOCAL_MODEL_SERVICE_STATUS_COMMAND = ("bash", "service.sh", "status")
+"""查询服务状态的命令；退出码约定：0=运行且健康，1=进程在但不健康，3=未运行。
+
+用于区分“本次程序启动的服务”和“用户事先已启动的服务”：只有前者会在程序结束时被关闭。
+自定义服务没有状态命令时，可在 local_service 里写 "status_command": null；此时无法区分
+服务是否由外部启动，程序会按“本次负责启动并关闭”处理。
+"""
+
+LOCAL_MODEL_SERVICE_HEALTH_PATH = "/health"
+"""健康检查路径。会拼到 base_url 去掉末尾 /v1 后的地址上。"""
+
+LOCAL_MODEL_SERVICE_START_TIMEOUT_SECONDS = 14400
+"""启动命令的超时秒数（默认 4 小时，与 model_service/service.sh 的首次下载/加载窗口对齐）"""
+
+LOCAL_MODEL_SERVICE_HEALTH_TIMEOUT_SECONDS = 14400
+"""启动命令返回后，继续等待 /health 就绪的超时秒数"""
+
+LOCAL_MODEL_SERVICE_STOP_TIMEOUT_SECONDS = 90
+"""停止命令的超时秒数；超时只告警，不阻断程序退出
+
+默认 90s：model_service/service.sh stop 自身最多等 45s（SIGINT）+20s（SIGTERM）+1s，
+留出余量，避免外层先超时、服务其实还在退出。
+"""
+
+LOCAL_MODEL_SERVICE_STATUS_TIMEOUT_SECONDS = 30
+"""状态命令的超时秒数"""
+
+LOCAL_MODEL_SERVICE_EXTRA_ENV = {}
+"""启动子进程额外注入的环境变量（local_service.extra_env 可覆盖）
+
+默认启动 service.sh 时会自动补 STARTUP_TIMEOUT，与上面的启动超时保持一致；
+其他变量（例如 STARTUP_IDLE_TIMEOUT）可按需写在这里或 local_service.extra_env。
+"""
+
 # ---- 趋向动词三元组的目标物义原闸门（用户可直接改这一节）----
 # 判定口径：
 #   目标物：至少一个义项的义原沿 hypernym 到达 DIRECTION_TARGET_SEMEME_ROOTS 之一。

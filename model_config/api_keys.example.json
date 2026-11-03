@@ -20,6 +20,30 @@
     "timeout": 120,
     "max_retries": 6
   },
+  "local-qwen": {
+    "model_name": "Qwen/Qwen3.8-27B",
+    "provider": "openai",
+    "base_url": "http://127.0.0.1:8000/v1",
+    "api_key": "EMPTY",
+    "temperature": 0,
+    "proxy": false,
+    "timeout": 600,
+    "max_retries": 6,
+    "disable_thinking": {
+      "extra_body": {
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        }
+      }
+    },
+    "local_service": {
+      "enabled": true,
+      "service_dir": "/home/qinyuhang/model_service",
+      "start_command": ["bash", "service.sh", "start", "--wait"],
+      "stop_command": ["bash", "service.sh", "stop"],
+      "status_command": ["bash", "service.sh", "status"]
+    }
+  },
   "openrouter-batch": {
     "model_name": "provider-model-c",
     "provider": "openrouter",
