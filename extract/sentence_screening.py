@@ -42,14 +42,16 @@
     ``build_item_content`` + 本模块的提示语（与筛选逐字同一实现）。
 
 批量请求：
-    一次 LLM 请求可以放入 ``config.SCREEN_BATCH_SIZE`` 条「句子 + 目标词」判定项，模型按
+    一次 LLM 请求最多放入 ``config.SCREEN_BATCH_SIZE`` 条「句子 + 目标词」判定项，模型按
     ``item_id`` 返回同样数量、同样顺序无关的结果；单条的判据与逐条请求时完全一致。
     累计发送条数受 ``config.SCREEN_MAX_ITEMS`` 限制（<=0 不限）；达到上限后不再发新请求，
     未发送项按 ``source="limit"`` / ``extractable=None`` 保留，语料继续落盘。
 
 并发与缓存：
     多个批请求由 ``screen_rows`` 用线程池并发；线程数由 ``--screen-workers`` /
-    ``config.SCREEN_WORKERS`` 控制。相同 (句子, 词, 相关成分) 的判定按**单条**规范内容缓存
+    ``config.SCREEN_WORKERS`` 控制。``SCREEN_ADAPTIVE_BATCHING`` 开启时，请求数不足线程数
+    的小批任务会均匀拆小，利用空闲并发；代价是请求数与重复提示词开销增加。
+    相同 (句子, 词, 相关成分) 的判定按**单条**规范内容缓存
     （上限见 ``config.SCREEN_CACHE_MAX``），因此批组合方式不会影响缓存命中。模型请求的
     超时/重试沿用 agents.request_policy 与 retry.call_with_retry。
 """
@@ -484,6 +486,7 @@ class SentenceScreener:
         self.llm = bool(llm)
         self.workers = max(1, int(config.SCREEN_WORKERS if workers is None else workers))
         self.batch_size = max(1, int(config.SCREEN_BATCH_SIZE))
+        self.adaptive_batching = bool(config.SCREEN_ADAPTIVE_BATCHING)
         self.budget = budget if budget is not None else ScreenItemBudget(config.SCREEN_MAX_ITEMS)
         self.kind = kind or classify_family(family)
         self.prompt_path: Path | None = None
@@ -557,7 +560,8 @@ class SentenceScreener:
             limit = self.budget.max_items if self.budget.max_items is not None else "不限"
             return (
                 f"{self.family}（{self.kind}）：LLM 筛选已启用，提示语 {self.prompt_path}，"
-                f"{self.workers} 线程，每批 {self.batch_size} 条，累计上限 {limit}"
+                f"{self.workers} 线程，每批最多 {self.batch_size} 条，"
+                f"{'自适应小批并发' if self.adaptive_batching else '固定组批'}，累计上限 {limit}"
             )
         return f"{self.family}：{self._disabled_reason}"
 
@@ -748,6 +752,18 @@ class SentenceScreener:
                     )
 
             batches = [allowed[start : start + self.batch_size] for start in range(0, len(allowed), self.batch_size)]
+            if self.adaptive_batching and 0 < len(batches) < self.workers:
+                # 一轮请求不足时，固定组批会让部分线程空闲，等待少数长请求。
+                # 仅在此时均匀拆成一轮非空请求；充足请求保留原分组，避免放大请求开销。
+                # allowed 已完成去重/缓存/额度处理，分组不改变发送条数与任务顺序。
+                batch_count = min(self.workers, len(allowed))
+                size, extra = divmod(len(allowed), batch_count)
+                batches = []
+                start = 0
+                for index in range(batch_count):
+                    end = start + size + (index < extra)
+                    batches.append(allowed[start:end])
+                    start = end
             if batches:
                 with self._stats_lock:
                     self._stats["requests"] += len(batches)
@@ -964,6 +980,7 @@ class SentenceScreener:
         stats["enabled"] = self.enabled
         stats["workers"] = self.workers
         stats["batch_size"] = self.batch_size
+        stats["adaptive_batching"] = self.adaptive_batching
         stats["budget"] = self.budget.stats()
         stats["limit_reached"] = self._limit_warned
         if self.kind:
