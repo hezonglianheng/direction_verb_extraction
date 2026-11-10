@@ -202,10 +202,12 @@ BATCH_MAX_REQUESTS = 0
 FILTER_WORKERS = 1
 """筛选阶段进程数，0 表示自动使用 CPU 核数。
 
-实测单张 GPU 上开 2 个进程仅比单进程快约 1.2 倍，却要多一份 LTP 模型副本
-（约 0.66GB 显存）和约 5s 的进程启动开销；配合 LTP 批量推理后单进程已能打满单卡，
-故默认为 1。多进程分支保留在 entry_in_linux.py 与 entry_in_win.py 中，需要时改回即可；
-命令行 --filter-workers 可以临时覆盖，不必改文件。"""
+实测在 config.LTP_DEVICE = "cuda" 时，单张 GPU 上开 2 个进程仅比单进程快约 1.2 倍，
+却要多一份 LTP 模型副本（约 0.66GB 显存）和约 5s 的进程启动开销；配合 LTP 批量推理后
+单进程已能打满单卡，故默认为 1。config.LTP_DEVICE = "cpu" 时没有显存副本，但每多一个
+进程仍会多一份模型内存与启动开销，是否加速取决于 CPU 核数与批大小，需要实测。多进程
+分支保留在 entry_in_linux.py 与 entry_in_win.py 中，需要时改回即可；命令行
+--filter-workers 可以临时覆盖，不必改文件。"""
 
 FILTER_PREFETCH_BATCHES = 1
 """单进程筛选时允许后台预计算的批数（1 = 当前批等 LLM 时算下一批；0 = 完全串行）
@@ -227,6 +229,19 @@ EXTRACT_PREFETCH_ITEMS = FILTER_BATCH_SIZE * 2
 
 预取线程与规则筛选并行：生产者只比消费者最多快这么多条，避免大语料下把整份语料读进内存。
 太小会让两边频繁互相等待，太大则失去内存上界。"""
+
+SENTENCE_DEDUP_WINDOW = 200_000
+"""句子去重窗口：只记住最近多少个词表初筛后的唯一句哈希
+
+规则：按词表初筛后的**原句精确匹配**，保留首次出现；窗口满时淘汰最早的哈希。
+0 表示关闭去重。之所以默认用有界窗口而不是全量集合，是为了不让抽取阶段从
+「流式、内存有界」退化成 O(全语料)：
+
+- 200k 窗口约 20–30MiB（128 位哈希 set + deque，实测约 90–100B/条）；
+- 实测重复大多发生在邻近位置，10 万句窗口已能覆盖约 77–86% 的重复；
+- 窗口越大去重越彻底，跨窗口的旧重复仍可能再次产出，这是有意的空间取舍；
+- 设为大于语料唯一句数的值等价于全量去重（7.8M 句约 0.6GiB），由使用者显式承担。
+"""
 
 SCREEN_MODEL = "deepseek-flash"
 """LLM 筛选默认使用的模型配置名（model_config/api_keys.json 里的键）
@@ -256,7 +271,8 @@ SCREEN_ADAPTIVE_BATCHING = True
 服务端并发能力和限流；请求配额紧张时可设为 False，恢复固定组批。
 """
 
-SCREEN_MAX_ITEMS = 100000
+# SCREEN_MAX_ITEMS = 100000
+SCREEN_MAX_ITEMS = 0
 """LLM 筛选累计最多向模型发送多少条语料（<=0 表示不限）
 
 计数单位同样是「句子 + 目标词」判定项，按缓存未命中的首次发送计；重试、缓存命中不重复计数。
@@ -363,6 +379,28 @@ LTP_MODEL_PATH = os.environ.get("LTP_MODEL_PATH") or str(_PROJECT_ROOT / "LTP_mo
 """LTP 模型加载路径。默认加载项目根目录下的 base2 基础模型（LTP_model 在 .gitignore 中，
 故新克隆的仓库需自行将模型放置于 config.py 同级目录），如需加载其他本地或线上模型，
 可修改此值或设置 LTP_MODEL_PATH 环境变量。必须是 str：LTP() 内部会调用 .split("@")，不支持 Path。"""
+
+LTP_DEVICE = "cpu"
+"""LTP 推理设备：cpu / gpu / gpu:N / cuda / cuda:N / auto。默认 cpu。
+
+直接修改本变量的值即可，不需要设置环境变量；修改后重启进程生效。
+
+- ``cpu``：强制在 CPU 上推理；即使当前机器有可用 GPU，也不会调用 CUDA。
+- ``gpu`` / ``cuda``：在默认 GPU 上推理；``gpu:1`` / ``cuda:1`` 可指定索引为 1 的卡。
+  GPU 是 ``cuda`` 的别名；当前进程看不到 CUDA 设备时，首次加载 LTP 会直接报错，
+  而不是悄悄回退到 CPU。
+- ``auto``：有可用 CUDA 就用 GPU，否则 CPU（改动前的旧行为）。
+
+本变量是设备选择的唯一来源，不再读取同名环境变量；这样不会出现「改了配置文件，却被
+shell/nohup/CI 里遗留的环境变量覆盖」的情况。子进程（spawn）会重新 import 本模块，
+因此对配置文件的修改会传播到新进程，但运行中修改属性不会影响已加载的模型。
+
+LTP() 构造函数本身只会把权重反序列化到 CPU（``ltp.nerual._from_pretrained`` 的
+``map_location="cpu"``）；真正决定 ``pipeline`` 把张量送到哪里的，是模型自身的
+``device`` 属性。因此必须在加载后调用 ``model.to(device)``（见
+``extract/sentenceTable.py::_get_ltp``）：LTP 的 ``BaseModule.to`` 会同步更新所有
+子模块的 ``_device``，``pipeline`` 随后按 ``self.device`` 搬运输入。"""
+
 # LTP支持的任务：分词 cws、词性 pos、命名实体标注 ner、语义角色标注 srl、依存句法分析 dep、语义依存分析树 sdp、语义依存分析图 sdpg
 CWS = "cws"
 """分词"""
