@@ -215,13 +215,24 @@ def _default_protocol(provider: str) -> str:
     return "openrouter" if provider == "openrouter" else "openai"
 
 
+def _local_service_enabled(cfg: dict) -> bool:
+    """模型条目是否声明了启用中的本地服务（见 extract/local_model_service.py）。"""
+    raw = cfg.get("local_service")
+    if raw is True:
+        return True
+    if isinstance(raw, dict):
+        return bool(raw.get("enabled", True))
+    return False
+
+
 def batch_profile(model_key: str) -> BatchProfile:
     """读取并规范化某个模型的批处理配置（写错在启动时抛，不把错误留到跑批中段）
 
     优先级：
         1. 模型配置里的 `"batch"` 字段（false = 明确关闭；dict = 覆盖端点/模型等）；
-        2. provider 属于 OpenAI/OpenRouter 时默认启用，端点取 base_url；
-        3. 其余 provider 默认关闭，理由写进 disabled_reason。
+        2. 启用中的 local_service 默认关闭：本地 vLLM 没有 /files、/batches；
+        3. provider 属于 OpenAI/OpenRouter 时默认启用，端点取 base_url；
+        4. 其余 provider 默认关闭，理由写进 disabled_reason。
     """
     cfg = agent_factory.load_model_config(model_key)
     # 与 agents.get_model 同一套取法：优先 model_provider，其次 provider。
@@ -230,6 +241,20 @@ def batch_profile(model_key: str) -> BatchProfile:
     # api_keys.json 里的 proxy=false / 显式代理不会作用于批量请求。
     proxy_mode, proxy_url = agent_factory.proxy_policy(cfg, model_key)
     batch = cfg.get("batch")
+    if batch is None and _local_service_enabled(cfg):
+        # 本地 vLLM 只提供同步 OpenAI 兼容接口，没有 /files、/batches；
+        # 不按 provider=openai 误探原生 Batch。需要时仍可显式写 "batch": {...}。
+        return BatchProfile(
+            model_key=model_key,
+            provider=provider,
+            model=str(cfg.get("model") or cfg.get("model_name") or ""),
+            base_url=str(cfg.get("base_url") or ""),
+            api_key=str(cfg.get("api_key") or ""),
+            protocol=_default_protocol(provider),
+            disabled_reason="本地 local_service 不提供原生 Batch API，改用同步并发",
+            proxy_mode=proxy_mode,
+            proxy_url=proxy_url,
+        )
     if batch is False:
         return BatchProfile(
             model_key=model_key,

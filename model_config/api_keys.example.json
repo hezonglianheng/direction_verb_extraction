@@ -29,6 +29,7 @@
     "proxy": false,
     "timeout": 600,
     "max_retries": 6,
+    "batch": false,
     "disable_thinking": {
       "extra_body": {
         "chat_template_kwargs": {
