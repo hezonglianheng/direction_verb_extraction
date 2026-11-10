@@ -154,7 +154,30 @@ Batch 缓存/jobs/meta（含自定义 `--batch-cache`）和多模型原始结果
 python pipeline.py --source raw.jsonl --annotation-engine all-in-one --extract-args '["--screen-model","screen-model","--filter-workers","1"]' --replace-args '["--model","screen-model","--workers","4"]' --annotate-args '["--model","annotation-model","--limit","500","--batch","off"]'
 ```
 
+extract 与 replace 的模型也可以各用一等参数指定，不必手写 JSON 透传：
+
+```sh
+python pipeline.py --source raw.jsonl --extract-model screen-model --replace-model screen-model
+```
+
+`--extract-model` 映射到 `extract --screen-model`（规则命中后的 LLM 筛选），`--replace-model` 映射到 `replace --model`（原句补筛与替换句检查；机械替换本身不调用模型）。二者只在对应阶段被选中时生效，传了未选中阶段的模型参数会被忽略；未指定时流水线不注入默认值，各阶段继续使用自己的默认配置（当前均为 `config.SCREEN_MODEL`）。同一阶段的一等参数与透传里的同义模型选项互斥，即使值相同也报错，`--opt=value` 和前缀缩写同样会被识别（歧义前缀本就会被子命令拒绝）；冲突在任何阶段启动/建目录之前报错。预检只传递模型配置名，不校验 `model_config/api_keys.json` 里的条目是否存在。
+
 流水线管理的输入、输出、词性、覆盖和 engine 参数不能通过透传覆盖；请使用驱动的对应选项。涉及路径规划的透传选项必须写全名，不能用 argparse 缩写（例如 `--out-f`、`--batch-c`、`--gra`）。`--annotate-args '["--graph","all_in_one","--models","model-a","model-b"]'` 可不指定 `--annotation-engine`；显式指定引擎时必须与图兼容。预检和共同 runner 共用轻量选择校验，`--graph=x` 和拆分写法均不能靠最后一个值掩盖冲突；冲突在任何上游阶段启动/建目录之前报错。独立阶段仍接受全部旧参数。默认 limit 为 pair/synonym 100、all_in_one 1；要处理更多句对，务必显式指定 `--limit`。未选中阶段的透传参数不执行。
+
+### JSON5 配置文件
+
+`--config path.json5` 可把三个阶段参数集中到一个 JSON5 文件，完整模板见 `pipeline_config/full.example.json5`。顶层只能是 `extract`、`replace`、`annotate` 三个字典；单次运行只读取 `--from-stage`/`--to-stage` 选中的模块，其他模块即使填了未知参数、错误类型或不存在路径也完全忽略。阶段选择、`--corpus-type`、`--overwrite`、`--dry-run` 仍是流水线 CLI 参数。
+
+```powershell
+python pipeline.py --config pipeline_config/full.example.json5 --corpus-type 方位词 --dry-run
+python pipeline.py --config pipeline_config/full.example.json5 --from-stage replace --to-stage replace
+```
+
+配置里的相对路径按配置文件所在目录解析；`extract.src_path` 是原始输入，`extract.tgt_path` + `out_name` 是提取产物，`replace.corpus`/`out_file` 与 `annotate.corpus`/`out_file` 分别是替换、标注的输入/输出。显式路径都按配置文件目录解析；省略时沿用项目根 `results/` 下的默认文件名。
+
+`null` 表示省略该参数；布尔开关用 `true/false`；`allow_retry` 为三态（`true` → `--allow-retry`，`false` → `--no-allow-retry`，`null` → 不传）；`vocab_config_path` 可写字符串或字符串数组；`models` 必须是非空字符串数组。模块内未知键、错误类型、重复模型名会报错。`corpus_type`、`overwrite` 只能走全局 CLI，不能写进模块。`annotate.out_dir` 与 `out_file` 二选一；`list_graphs: true` 不支持（配置模式会跑完整链路）；正式图不允许 `annotate.alter_rules`。
+
+使用 `--config` 时不能再同时传 `--source`、`--extracted`、`--pairs`、`--output`、`--filter-config`、`--extract-model`、`--replace-model`、`--annotation-engine` 或 `--*-args`；请把对应值放进模块字典。配置文件本身以及配置里声明的词表、替换规则会作为只读输入参与冲突预检，不能被输出覆盖。
 
 这次整理没有填写语言学配置。趋向动词替换规则仍可能没有启用组，运行前应检查 `config_files/direction/alter_rules.json5`，或在替换参数中传 `--alter-rules`；没有候选并不代表已构建出有效语料。
 

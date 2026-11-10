@@ -1,0 +1,121 @@
+// pipeline 的完整参数模板（JSON5：允许注释和尾逗号）。
+//
+// 用法示例（--from-stage/--to-stage 决定实际运行哪几段；未选中段的字典即使填写也完全忽略）：
+//   python pipeline.py --config pipeline_config/full.example.json5 --corpus-type 方位词 --dry-run
+//   python pipeline.py --config pipeline_config/full.example.json5 --from-stage extract --to-stage extract --dry-run
+//   python pipeline.py --config pipeline_config/full.example.json5 --from-stage replace --to-stage replace --dry-run
+//
+// 约定：
+// - 顶层只能有 extract / replace / annotate 三个字典。
+// - 本文件里的相对路径，一律相对于本配置文件所在目录解析。
+// - 值为 null 表示“不传该参数，使用子阶段默认值”；布尔开关用 true/false。
+// - 使用 --config 时，不能再从命令行传 --source/--extracted/--pairs/--output/--filter-config、
+//   两个模型参数、--annotation-engine 或三个 --*-args；请把对应值写进下面的模块。
+// - corpus_type、overwrite 是流水线全局参数，只能用 --corpus-type / --overwrite；下面保留 null 仅作提示。
+// - 示例里的 data/raw.jsonl 等是占位路径，运行前请改成真实路径。
+{
+  extract: {
+    // 原始文章 JSONL 文件或目录（extract 被选中时必填）。
+    src_path: "../data/raw.jsonl",
+
+    // 提取规则；只支持单个文件。省略/null 时按 --corpus-type 使用 config_files/*_expressions.json5。
+    filter_config_path: "../config_files/localization_expressions.json5",
+
+    // 初筛词表；可写一个字符串，也可写字符串数组（等价于重复传 -v）。null = 从规则自动推导。
+    vocab_config_path: null,
+
+    // 提取产物的目录与文件名。文件名必须以小写 .jsonl 结尾。
+    // 省略 tgt_path 时使用项目根 results/；省略 out_name 时使用 <location|direction>_corpus.jsonl。
+    tgt_path: "../results",
+    out_name: "location_corpus.jsonl",
+
+    // 规则命中后的 LLM 筛选。true = 关闭筛选；默认 false。
+    no_llm_screen: false,
+    // 筛选模型配置名（model_config/api_keys.json 的键）；null = config.SCREEN_MODEL。
+    screen_model: null,
+    screen_workers: 8,
+    // 方位词 / 趋向动词；null = 按规则文件名推断。
+    screen_kind: null,
+
+    extract_workers: 4,
+    filter_workers: 1,
+  },
+
+  replace: {
+    // 替换阶段的输入。extract 也被选中时可省略/null（自动接 extract 输出）；
+    // 只跑 replace 时填写已有原句文件，或省略使用默认 results/<类型>_corpus.jsonl。
+    corpus: null,
+
+    // 替换产物（句对 JSONL）。省略/null = results/<类型>_pairs.jsonl。
+    out_file: "../results/location_pairs.jsonl",
+
+    // 机械替换规则表；null = 使用该词性的默认规则。
+    alter_rules: "../config_files/localization/alter_rules.json5",
+
+    // 语法、空间义检查使用的模型配置名；null = config.SCREEN_MODEL。
+    model: null,
+    workers: 4,
+    chunk_size: 100,
+    // true = 不调用模型；未检查的句对不能进入标注。
+    no_llm: false,
+
+    // 以下两项是流水线全局参数，只能用命令行；这里写 null 表示不启用模块内配置。
+    corpus_type: null,
+    overwrite: null,
+  },
+
+  annotate: {
+    // 标注图：pair / synonym / all_in_one / single / alter_check。省略/null = pair。
+    graph: "pair",
+    // 兼容旧入口：staged / all-in-one；null = 由 graph 决定。
+    engine: null,
+    // 配置模式会先跑上游，不能只列图；必须为 false。
+    list_graphs: false,
+
+    // 标注输入。replace 也被选中时可省略/null（自动接 replace 输出）；
+    // 只跑 annotate 时填写已有句对文件，或省略使用默认 results/<类型>_pairs.jsonl。
+    corpus: null,
+
+    // 诊断图 alter_check 的替换规则；正式图（pair/synonym/all_in_one）必须为 null。
+    alter_rules: null,
+
+    // 输出：out_file 与 out_dir 二选一；都省略 = results/<类型>_annotated.jsonl。
+    out_file: "../results/location_annotated.jsonl",
+    out_dir: null,
+
+    max_requests: null,
+    batch_max_requests: null,
+    // null = 按图默认：pair/synonym 100，all_in_one 1。
+    limit: null,
+    offset: 0,
+
+    // 单模型模式与多模型投票二选一；null = 单模型默认值。
+    model: null,
+    models: null,
+    model_workers: 0,
+    workers: 1,
+
+    batch_inference: false,
+    no_llm: false,
+    feature_deep: false,
+    print_prompt: false,
+    // true = --allow-retry；false = --no-allow-retry；null = 不传（按图默认）。
+    allow_retry: null,
+    all_candidates: false,
+    no_syntax: false,
+    no_pairs_csv: false,
+
+    // 批量推理：auto / native / off。
+    batch: "auto",
+    // null = <输出文件>.batch-cache.jsonl。
+    batch_cache: null,
+    batch_resume: false,
+    batch_poll_seconds: 30.0,
+    batch_timeout_seconds: 86400.0,
+    batch_chunk_size: 5000,
+
+    // 以下两项是流水线全局参数，只能用命令行；这里写 null 表示不启用模块内配置。
+    corpus_type: null,
+    overwrite: null,
+  },
+}
