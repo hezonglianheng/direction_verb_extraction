@@ -9,6 +9,8 @@
 统计口径（与 filter_sentences_streaming 的计数点对应）：
     read_sentences     切句 + 长度/空串/字符/缺文过滤后、**词表子串初筛前**的有效句数。
                        词表初筛掉的句子仍算「读入」，只是没进入规则筛选。
+    duplicate_sentences 词表初筛后、进入规则筛选前，被去重窗口排除的重复句数；
+                       只统计窗口内出现的重复，不是全语料终身去重。
     program_selected   规则引擎命中、再经过方位词/趋向动词语义闸门后、**送 LLM 前**的句子数；
                        多套规则同时命中同一句时按句去重（用批内 _corpus_row_id）。
     corpus_written     实际落盘的语料数；false/error/limit/no_llm 也全部落盘。
@@ -33,6 +35,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import config
+from extract import screening_metrics
 from file_paths import atomic_write_text
 
 DEFAULT_LOG_DIR = Path(config._PROJECT_ROOT) / "log"
@@ -43,6 +46,7 @@ def new_stats() -> dict[str, Any]:
     """一份新的漏斗统计；入口可以把它透传给抽取/筛选两段分别累加。"""
     return {
         "read_sentences": 0,
+        "duplicate_sentences": 0,
         "vocab_candidates": 0,
         "program_selected": 0,
         "corpus_written": 0,
@@ -115,6 +119,7 @@ def render_log(
     """把统计渲染成便于人工阅读、也便于 grep 的文本。"""
     stats = ensure_stats(stats)
     read = int(stats.get("read_sentences", 0))
+    duplicates = int(stats.get("duplicate_sentences", 0))
     candidates = int(stats.get("vocab_candidates", 0))
     program = int(stats.get("program_selected", 0))
     written = int(stats.get("corpus_written", 0))
@@ -133,6 +138,7 @@ def render_log(
         f"输出文件: {', '.join(str(item) for item in output_paths) or '（无）'}",
         f"初筛词表词数: {int(vocab_count)}",
         "口径: 读入=切句及空串/长度/缺文过滤后、词表初筛前；"
+        "重复=词表初筛后按原句精确匹配、仅保留去重窗口内首次出现；"
         "程序筛选=规则命中并过方位词/趋向动词语义闸门后、送 LLM 前（按句去重）；"
         "所有筛选结果都落盘，false/error/limit 只标注、不进入判定工作流。",
         "",
@@ -146,7 +152,8 @@ def render_log(
         f"未使用 LLM 筛选的句子数量（已落盘）: {no_llm}",
         "",
         "详细:",
-        f"  词表初筛排除的句子数量: {max(0, read - candidates)}",
+        f"  词表初筛排除的句子数量: {max(0, read - candidates - duplicates)}",
+        f"  去重窗口内排除的重复句数量: {duplicates}",
         f"  词表初筛后进入规则筛选的句子数量: {candidates}",
         f"  规则/语义闸门排除的句子数量: {max(0, candidates - program)}",
         "分规则族（同一句命中多族时各计一次）:",
@@ -170,7 +177,13 @@ def render_log(
         lines.append("")
         lines.append("LLM 筛选器统计:")
         for family, detail in screening_stats.items():
-            lines.append(f"  {family}: {detail}")
+            lines.append(f"  {family}:")
+            if isinstance(detail, dict):
+                lines.extend(screening_metrics.format_stats_lines(detail))
+                lines.append(f"    stats_json: {screening_metrics.stats_json(detail)}")
+            else:
+                # 兼容旧调用方/测试桩传入的非 dict 统计。
+                lines.append(f"    {detail}")
 
     status_counts = stats.get("screening_status") or {}
     if status_counts:

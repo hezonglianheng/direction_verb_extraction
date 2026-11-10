@@ -58,14 +58,16 @@
 
 import json
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from pydantic import BaseModel, Field
 
 import config
 import utils
+from extract import screening_metrics
 from pipeline_utils import prune_tree
 
 SCREEN_PROMPT_FILES: dict[str, str] = {
@@ -205,6 +207,13 @@ class ScreenItemBudget:
     def stats(self) -> dict:
         with self._lock:
             return {"max_items": self.max_items, "items_sent": self.sent}
+
+
+def _positive_int_setting(value: Any, field: str) -> int:
+    """校验模型配置里的 screen_batch_size / screen_workers。"""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{field} 必须是正整数，收到 {value!r}")
+    return value
 
 
 def classify_family(family: str) -> str | None:
@@ -477,15 +486,24 @@ class SentenceScreener:
         model_key: str,
         llm: bool = True,
         workers: int | None = None,
+        batch_size: int | None = None,
         kind: str | None = None,
         budget: ScreenItemBudget | None = None,
+        retry_policy_overrides: dict[str, Any] | None = None,
     ):
         self.family = family
         self.config_path = str(config_path)
         self.model_key = model_key
         self.llm = bool(llm)
+        # 只覆盖显式给出的传输层策略项（目前补判入口用于 --max-retries）；
+        # 其余 timeout/backoff 仍以模型配置为唯一真源。
+        self._retry_policy_overrides = dict(retry_policy_overrides or {})
+        # CLI 显式值 > 模型配置 screen_workers/screen_batch_size > config.py 全局默认。
+        # 模型配置只在筛选器真正启用后才读，提示语为空时不会触发模型配置检查。
+        self._explicit_workers = workers is not None
+        self._explicit_batch_size = batch_size is not None
         self.workers = max(1, int(config.SCREEN_WORKERS if workers is None else workers))
-        self.batch_size = max(1, int(config.SCREEN_BATCH_SIZE))
+        self.batch_size = max(1, int(config.SCREEN_BATCH_SIZE if batch_size is None else batch_size))
         self.adaptive_batching = bool(config.SCREEN_ADAPTIVE_BATCHING)
         self.budget = budget if budget is not None else ScreenItemBudget(config.SCREEN_MAX_ITEMS)
         self.kind = kind or classify_family(family)
@@ -498,6 +516,10 @@ class SentenceScreener:
         self._cache_lock = threading.Lock()
         self._schedule_lock = threading.Lock()
         self._stats_lock = threading.Lock()
+        self._usage_local = threading.local()
+        self._latencies = screening_metrics.LatencyTracker()
+        self._wall_started: float | None = None
+        self._wall_finished: float | None = None
         self._stats = {
             "records": 0,
             "targets": 0,
@@ -515,6 +537,16 @@ class SentenceScreener:
             "items_sent": 0,
             "limit_skipped": 0,
             "invalid_items": 0,
+            "failed_requests": 0,
+            "invalid_batches": 0,
+            "error_items": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "usage_reported_requests": 0,
+            "usage_missing_requests": 0,
+            "output_usage_reported_requests": 0,
+            "output_usage_missing_requests": 0,
         }
         self._limit_warned = False
         self._disabled_reason = ""
@@ -546,6 +578,28 @@ class SentenceScreener:
             return
         if not self._vocab:
             self._disabled_reason = f"从 {self.config_path} 推导出的目标词表为空，LLM 筛选已跳过"
+            return
+        self._apply_model_screen_overrides()
+
+    def _apply_model_screen_overrides(self) -> None:
+        """读取模型条目里的批处理覆盖项（CLI 已显式给出的不覆盖）。
+
+        远程/本地模型都适用；不按 provider 猜，因为本地 vLLM 也常写 provider=openai。
+        写错时在启动期报错，不把一次无效调参留到跑批中段。
+        """
+        if self._explicit_workers and self._explicit_batch_size:
+            return
+        import agents as agent_factory
+
+        cfg = agent_factory.load_model_config(self.model_key)
+        if not self._explicit_workers and "screen_workers" in cfg:
+            self.workers = _positive_int_setting(
+                cfg["screen_workers"], f"模型 {self.model_key!r} 的 screen_workers"
+            )
+        if not self._explicit_batch_size and "screen_batch_size" in cfg:
+            self.batch_size = _positive_int_setting(
+                cfg["screen_batch_size"], f"模型 {self.model_key!r} 的 screen_batch_size"
+            )
 
     @property
     def enabled(self) -> bool:
@@ -576,6 +630,11 @@ class SentenceScreener:
                     import agents as agent_factory
 
                     self._retry_policy = agent_factory.request_policy(self.model_key)
+                    if self._retry_policy_overrides:
+                        self._retry_policy = {
+                            **self._retry_policy,
+                            **self._retry_policy_overrides,
+                        }
                     self._agent = agent_factory.get_agent(
                         self.model_key,
                         [],
@@ -635,28 +694,78 @@ class SentenceScreener:
         import agents as agent_factory
 
         agent = self._model()
-        result = agent_factory.call_with_retry(
-            lambda: agent.invoke({"messages": [{"role": "user", "content": content}]}),
-            policy=self._retry_policy,
-        )
+        attempt_usages: list[dict[str, int]] = []
+
+        def invoke_once():
+            result = agent.invoke({"messages": [{"role": "user", "content": content}]})
+            # 在检查 structured_response 之前先记账：结构非法但模型确实产出了 token，
+            # 这些 token 也必须计入输出吞吐。threading.local 避免并发批之间互相覆盖。
+            # 指标提取是附属逻辑，形状异常时不能把一次有效响应判成失败。
+            try:
+                usage = screening_metrics.usage_from_result(result)
+            except Exception:  # noqa: BLE001 —— usage 字段形状不合法时按 missing 处理
+                usage = None
+            if usage:
+                attempt_usages.append(usage)
+            return result
+
+        try:
+            result = agent_factory.call_with_retry(
+                invoke_once,
+                policy=self._retry_policy,
+            )
+        finally:
+            # 重试时每次尝试都可能消耗 token；合并所有已返回尝试的 usage，而不是
+            # 只保留最后一次。若最后一次在返回前抛错，这里仍会保留此前尝试的用量。
+            self._usage_local.last_usage = screening_metrics.merge_usage(*attempt_usages)
         verdict = result.get("structured_response")
         if verdict is None:
             raise RuntimeError("模型没有返回结构化筛选结果（structured_response 为空）")
         return verdict
 
+    def _record_request_locked(self, elapsed_s: float, usage: dict[str, int] | None, *, failed: bool) -> None:
+        """记录一次逻辑请求的延迟与 token；调用方必须持有 _stats_lock。"""
+        self._latencies.add(elapsed_s)
+        if failed:
+            self._stats["failed_requests"] += 1
+        if usage is None:
+            self._stats["usage_missing_requests"] += 1
+            self._stats["output_usage_missing_requests"] += 1
+            return
+        self._stats["usage_reported_requests"] += 1
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            value = usage.get(key)
+            if value is not None:
+                self._stats[key] += int(value)
+        if usage.get("completion_tokens") is None:
+            self._stats["output_usage_missing_requests"] += 1
+        else:
+            self._stats["output_usage_reported_requests"] += 1
+
     def _ask_batch(self, tasks: list[tuple[int, str, dict, Any, list[str], Any]]) -> list[dict]:
-        """发一次批量请求，按 item_id 映射回每条任务；缺项/重复/越界按 error 记"""
+        """发一次批量请求，按 item_id 映射回每条任务；缺项/重复/越界按 error 记
+
+        同时记录本次逻辑请求的 elapsed_s 和 token usage。计时范围包含重试、退避和
+        结构化结果解析；失败请求也进入延迟分布。
+        """
+        started = time.perf_counter()
+        self._usage_local.last_usage = None
         try:
             verdict: BatchExtractionVerdict = self._invoke(self._content_batch(tasks))
             items = list(verdict.results)
         except Exception as exc:  # noqa: BLE001 —— 整批失败不带走语料，逐条保留落盘、不进入判定
+            elapsed = time.perf_counter() - started
+            usage = getattr(self._usage_local, "last_usage", None)
             with self._stats_lock:
                 self._stats["failed"] += len(tasks)
+                self._stats["error_items"] += len(tasks)
+                self._record_request_locked(elapsed, usage, failed=True)
             return [
                 {"extractable": None, "reason": f"调用失败：{exc!r}", "source": "error"}
                 for _ in tasks
             ]
 
+        usage = getattr(self._usage_local, "last_usage", None)
         by_id: dict[int, dict] = {}
         invalid = 0
         for item in items:
@@ -678,11 +787,18 @@ class SentenceScreener:
                 by_id[item_id]["reason"] = "模型未完整给出语法和空间自洽判定；" + item.reason
 
         missing = [item_id for item_id in range(len(tasks)) if item_id not in by_id]
+        # 延迟包含响应解析与 item_id 校验；失败/非法批也进入分布。
+        elapsed = time.perf_counter() - started
         if invalid or missing:
             # 重复/越界/缺项都说明这份批量响应不可信：整批转 error、保留落盘、不进入判定，
             # 不能拿“第一个重复 id”的结果去丢弃语料，也不能把可疑结果写进缓存。
             with self._stats_lock:
                 self._stats["invalid_items"] += invalid + len(missing)
+                self._stats["invalid_batches"] += 1
+                self._stats["error_items"] += len(tasks)
+                # 非法批不重复计入 failed_requests：request_failure_rate 会把
+                # failed_requests 与 invalid_batches 相加，两者口径分开。
+                self._record_request_locked(elapsed, usage, failed=False)
             detail = []
             if invalid:
                 detail.append(f"重复/越界 item_id {invalid} 条")
@@ -691,6 +807,11 @@ class SentenceScreener:
             reason = "批量响应不完整（" + "；".join(detail) + "），整批保留落盘、不进入判定"
             return [{"extractable": None, "reason": reason, "source": "error"} for _ in tasks]
 
+        incomplete = sum(1 for value in by_id.values() if value.get("source") == "error")
+        with self._stats_lock:
+            if incomplete:
+                self._stats["error_items"] += incomplete
+            self._record_request_locked(elapsed, usage, failed=False)
         return [by_id[item_id] for item_id in range(len(tasks))]
 
     def _cache_get(self, key: str) -> dict | None:
@@ -765,6 +886,11 @@ class SentenceScreener:
                     batches.append(allowed[start:end])
                     start = end
             if batches:
+                if self._wall_started is None:
+                    self._wall_started = time.perf_counter()
+                # 新一轮请求开始后，上一次的结束时间不再代表当前墙钟；清空后
+                # 实时 stats() 会用 now 作为终点，避免 requests/s 被算高。
+                self._wall_finished = None
                 with self._stats_lock:
                     self._stats["requests"] += len(batches)
                     self._stats["batches"] += len(batches)
@@ -806,6 +932,7 @@ class SentenceScreener:
 
                 with ThreadPoolExecutor(max_workers=min(self.workers, len(batch_inputs))) as pool:
                     batch_results = list(pool.map(ask_with_progress, batch_inputs))
+                self._wall_finished = time.perf_counter()
                 for batch_keys, results in zip(batches, batch_results):
                     for key, result in zip(batch_keys, results):
                         resolved[key] = result
@@ -861,6 +988,57 @@ class SentenceScreener:
             {"index": item["target"].get("index"), "word": item["target"].get("word"), **result}
             for item, result in zip(items, self._resolve_tasks(tasks))
         ]
+
+    def _finalize_record(self, row: dict, verdicts: list[dict]) -> str:
+        """按逐词结果重算一条记录的行级状态，并在 true 时裁掉 false 节点。
+
+        ``screen_rows`` 与 ``rescreen_rows`` 共用这一处，避免补判入口和主流程对
+        source/status/extractable 的口径分叉。
+        """
+        true_indices = {v["index"] for v in verdicts if verdict_passes(v)}
+        false_indices = {v["index"] for v in verdicts if verdict_status(v) == SCREENING_FALSE}
+        # 判不出来（调用失败）保留落盘、不进入判定；裁剪 false 父节点时要把它当作要保留的
+        # 后代，不能因为父节点被删就把它一起带走。
+        unknown_indices = {v["index"] for v in verdicts if verdict_status(v) not in (SCREENING_TRUE, SCREENING_FALSE)}
+        sources = {v.get("source") for v in verdicts}
+        if sources == {"llm"}:
+            source = "llm"
+        elif "llm" in sources:
+            source = "mixed"
+        else:
+            source = next(iter(sources), "error")
+        aggregate = True if true_indices else False if false_indices and len(false_indices) == len(verdicts) else None
+        status = _status_from_verdicts(verdicts, aggregate)
+        row["screening"] = {
+            "kind": self.kind,
+            "source": source,
+            "status": status,
+            "extractable": aggregate if status in (SCREENING_TRUE, SCREENING_FALSE) else None,
+            "verdicts": verdicts,
+        }
+        # 只有可判定为 true 的记录才需要裁掉其中被判 false 的词；false/error/limit
+        # 整条已不会进入判定工作流，保留原始 match_tree 便于复核。
+        if status == SCREENING_TRUE and false_indices:
+            row["match_tree"] = _prune_tree(
+                row.get("match_tree") or [], false_indices, true_indices | unknown_indices
+            )
+            try:
+                from extract import direction_grounding
+                from extract import localization_grounding
+
+                # 两类语料各有一个前序整理块；不存在的块会被模块内的形状检查直接跳过。
+                localization_grounding.prune_candidates(
+                    row, false_indices, true_indices | unknown_indices
+                )
+                direction_grounding.prune_candidates(
+                    row, false_indices, true_indices | unknown_indices
+                )
+            except Exception as exc:  # noqa: BLE001 —— 整理块缺失/形状异常不影响筛选主流程，
+                # 但不能静默：树已按 false 裁过、grounding 没裁会留下两边不一致的证据。
+                # 记到该条 screening 块里，事后可查，且不打断整批筛选。
+                row["screening"]["prune_error"] = repr(exc)
+        self._note_record_status(status)
+        return status
 
     def screen_rows(self, rows: list[dict]) -> list[dict]:
         """对一批命中记录逐词筛选，返回**与输入等长**的记录（false 也保留）
@@ -928,55 +1106,187 @@ class SentenceScreener:
                 # 没有目标词（或这一行没进任务）：保留，避免因取词失败丢语料
                 kept.append(row)
                 continue
-            true_indices = {v["index"] for v in verdicts if verdict_passes(v)}
-            false_indices = {v["index"] for v in verdicts if verdict_status(v) == SCREENING_FALSE}
-            # 判不出来（调用失败）保留落盘、不进入判定；裁剪 false 父节点时要把它当作要保留的
-            # 后代，不能因为父节点被删就把它一起带走。
-            unknown_indices = {v["index"] for v in verdicts if verdict_status(v) not in (SCREENING_TRUE, SCREENING_FALSE)}
-            sources = {v.get("source") for v in verdicts}
-            if sources == {"llm"}:
-                source = "llm"
-            elif "llm" in sources:
-                source = "mixed"
-            else:
-                source = next(iter(sources), "error")
-            aggregate = True if true_indices else False if false_indices and len(false_indices) == len(verdicts) else None
-            status = _status_from_verdicts(verdicts, aggregate)
-            row["screening"] = {
-                "kind": self.kind,
-                "source": source,
-                "status": status,
-                "extractable": aggregate if status in (SCREENING_TRUE, SCREENING_FALSE) else None,
-                "verdicts": verdicts,
-            }
-            # 只有可判定为 true 的记录才需要裁掉其中被判 false 的词；false/error/limit
-            # 整条已不会进入判定工作流，保留原始 match_tree 便于复核。
-            if status == SCREENING_TRUE and false_indices:
-                row["match_tree"] = _prune_tree(
-                    row.get("match_tree") or [], false_indices, true_indices | unknown_indices
-                )
-                try:
-                    from extract import direction_grounding
-                    from extract import localization_grounding
-
-                    # 两类语料各有一个前序整理块；不存在的块会被模块内的形状检查直接跳过。
-                    localization_grounding.prune_candidates(
-                        row, false_indices, true_indices | unknown_indices
-                    )
-                    direction_grounding.prune_candidates(
-                        row, false_indices, true_indices | unknown_indices
-                    )
-                except Exception as exc:  # noqa: BLE001 —— 整理块缺失/形状异常不影响筛选主流程，
-                    # 但不能静默：树已按 false 裁过、grounding 没裁会留下两边不一致的证据。
-                    # 记到该条 screening 块里，事后可查，且不打断整批筛选。
-                    row["screening"]["prune_error"] = repr(exc)
-            self._note_record_status(status)
+            self._finalize_record(row, verdicts)
             kept.append(row)
         return kept
+
+    def rescreen_rows(
+        self,
+        rows: list[dict],
+        retry_verdict: Callable[[dict], bool],
+    ) -> tuple[list[dict], dict[str, int]]:
+        """只重判 ``retry_verdict`` 选中的已有 verdict，并重算整行状态。
+
+        与 ``screen_rows`` 的区别：
+        - 目标不是从 match_tree 重新推导全部目标词，而是**逐条复用原 verdict 的
+          index/word**；因此 mixed 记录里已经成功的 llm verdict 不会被重跑；
+        - 未选中的 verdict 原样保留；
+        - 只对真正重判过的行调用 ``_finalize_record``，其余行不动。
+
+        该入口只供显式补判程序使用；筛选器未启用时直接报错，避免把未判记录
+        静默降级成 no_llm。
+        """
+        if not self.enabled:
+            raise RuntimeError(f"筛选器未启用，不能补判：{self.disabled_reason or '未知原因'}")
+        if not rows:
+            return rows, {
+                "rows_rescreened": 0,
+                "verdicts_retried": 0,
+                "verdicts_updated": 0,
+                "unmappable_verdicts": 0,
+            }
+
+        with self._stats_lock:
+            self._stats["records"] += len(rows)
+
+        tasks: list[tuple[int, str, dict, Any, list[str], Any]] = []
+        slots: list[tuple[int, int]] = []
+        retried_rows: set[int] = set()
+        unmappable = 0
+        for row_index, row in enumerate(rows):
+            block = row.get("screening")
+            if not isinstance(block, dict):
+                continue
+            verdicts = block.get("verdicts")
+            if not isinstance(verdicts, list):
+                continue
+            sentence = _sentence_text(row)
+            tree = row.get("match_tree") or []
+            methods = list(row.get("filter_methods") or [])
+            grounding = row.get("direction_grounding") or row.get("localization_grounding")
+            for verdict_index, verdict in enumerate(verdicts):
+                if not isinstance(verdict, dict) or not retry_verdict(verdict):
+                    continue
+                index = verdict.get("index")
+                word = verdict.get("word")
+                if (
+                    not isinstance(index, int)
+                    or isinstance(index, bool)
+                    or not isinstance(word, str)
+                    or not word
+                ):
+                    unmappable += 1
+                    continue
+                tasks.append(
+                    (
+                        len(tasks),
+                        sentence,
+                        {"index": index, "word": word},
+                        tree,
+                        methods,
+                        grounding,
+                    )
+                )
+                slots.append((row_index, verdict_index))
+                retried_rows.add(row_index)
+
+        with self._stats_lock:
+            self._stats["targets"] += len(tasks)
+
+        results = self._resolve_tasks(tasks)
+        updated = 0
+        for (row_index, verdict_index), result in zip(slots, results):
+            verdicts = rows[row_index]["screening"]["verdicts"]
+            old = verdicts[verdict_index]
+            history = old.get("retry_history")
+            if not isinstance(history, list):
+                history = []
+            if result.get("source") == "llm":
+                new_verdict = {
+                    "index": old.get("index"),
+                    "word": old.get("word"),
+                    **result,
+                }
+                if history:
+                    new_verdict["retry_history"] = history
+                verdicts[verdict_index] = new_verdict
+                updated += 1
+            else:
+                # 重试再次失败时保留原来的目标错误 verdict，不把原错误身份
+                # 覆盖成 timeout/5xx，否则下一次补判就再也选不到这条记录。
+                history.append(
+                    {
+                        "source": result.get("source"),
+                        "reason": result.get("reason") or "",
+                        "extractable": result.get("extractable"),
+                        "grammatical": result.get("grammatical"),
+                        "spatial_coherent": result.get("spatial_coherent"),
+                    }
+                )
+                old["retry_history"] = history
+                new_verdict = old
+            with self._stats_lock:
+                if verdict_passes(new_verdict):
+                    self._stats["extractable"] += 1
+                elif verdict_status(new_verdict) == SCREENING_FALSE:
+                    self._stats["not_extractable"] += 1
+
+        for row_index in sorted(retried_rows):
+            self._finalize_record(
+                rows[row_index], rows[row_index]["screening"]["verdicts"]
+            )
+
+        return rows, {
+            "rows_rescreened": len(retried_rows),
+            "verdicts_retried": len(tasks),
+            "verdicts_updated": updated,
+            "unmappable_verdicts": unmappable,
+        }
 
     def stats(self) -> dict:
         with self._stats_lock:
             stats = dict(self._stats)
+            latency = self._latencies.summary()
+            started = self._wall_started
+            if started is None:
+                wall_seconds = 0.0
+            else:
+                finished = self._wall_finished if self._wall_finished is not None else time.perf_counter()
+                wall_seconds = max(0.0, finished - started)
+
+        requests = int(stats.get("requests", 0))
+        failed_requests = int(stats.get("failed_requests", 0))
+        invalid_batches = int(stats.get("invalid_batches", 0))
+        error_items = int(stats.get("error_items", 0))
+        items_sent = int(stats.get("items_sent", 0))
+        reported = int(stats.get("usage_reported_requests", 0))
+        missing = int(stats.get("usage_missing_requests", 0))
+        output_reported = int(stats.get("output_usage_reported_requests", 0))
+        output_missing = int(stats.get("output_usage_missing_requests", 0))
+        completion_tokens = int(stats.get("completion_tokens", 0))
+
+        stats["performance"] = {
+            "completed_requests": requests,
+            "failed_requests": failed_requests,
+            "invalid_batches": invalid_batches,
+            "error_items": error_items,
+            "request_wall_s": round(wall_seconds, 4),
+            "requests_per_s": round(requests / wall_seconds, 4) if wall_seconds > 0 else None,
+            "prompt_tokens": int(stats.get("prompt_tokens", 0)),
+            "output_tokens": completion_tokens,
+            "total_tokens": int(stats.get("total_tokens", 0)),
+            "output_tokens_per_s": (
+                round(completion_tokens / wall_seconds, 4)
+                if wall_seconds > 0 and output_reported > 0
+                else None
+            ),
+            "usage_reported_requests": reported,
+            "usage_missing_requests": missing,
+            "usage_coverage": round(reported / (reported + missing), 4) if reported + missing else None,
+            "output_usage_reported_requests": output_reported,
+            "output_usage_missing_requests": output_missing,
+            "output_usage_coverage": (
+                round(output_reported / (output_reported + output_missing), 4)
+                if output_reported + output_missing
+                else None
+            ),
+            "request_failure_rate": (
+                round((failed_requests + invalid_batches) / requests, 4) if requests else None
+            ),
+            "invalid_batch_rate": round(invalid_batches / requests, 4) if requests else None,
+            "item_error_rate": round(error_items / items_sent, 4) if items_sent else None,
+            "elapsed_s": latency,
+        }
         stats["enabled"] = self.enabled
         stats["workers"] = self.workers
         stats["batch_size"] = self.batch_size
@@ -998,6 +1308,7 @@ def build_screeners(
     model_key: str,
     llm: bool = True,
     workers: int | None = None,
+    batch_size: int | None = None,
     kind: str | None = None,
 ) -> dict[str, SentenceScreener]:
     """按规则族建筛选器；键用 family_name，与输出文件一一对应
@@ -1016,6 +1327,7 @@ def build_screeners(
             model_key=model_key,
             llm=llm,
             workers=workers,
+            batch_size=batch_size,
             kind=kind,
             budget=budget,
         )
