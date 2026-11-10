@@ -248,13 +248,16 @@ def iter_path_sentences(
 	output_paths=(),
 	workers: int | None = None,
 	stats: dict[str, Any] | None = None,
+	dedup_window: int | None = None,
 ):
 	"""目录（或单文件）下的 jsonl 逐文件流式产出句子
 
 	收集与遍历走 file_paths.iter_path_sentences（与 entry_in_linux 同一份）：
 	路径检查和目录扫描必须在打开输出文件前完成，那条约束两入口一致，不该各写一遍。
 	这里只带本平台自己的切句方式进来；workers 透传给切句线程池。
+	dedup_window 是跨文件句子去重窗口；None 取 config.SENTENCE_DEDUP_WINDOW，0 关闭。
 	"""
+	window = config.SENTENCE_DEDUP_WINDOW if dedup_window is None else int(dedup_window)
 	return file_paths.iter_path_sentences(
 		src_path,
 		# index 是文件在清单里的序号：Windows 入口不写"第几个文件"，忽略它
@@ -262,6 +265,8 @@ def iter_path_sentences(
 			str(file), vocabs=vocabs, workers=workers, stats=stats
 		),
 		output_paths=output_paths,
+		dedup_window=window,
+		stats=stats,
 	)
 
 
@@ -532,6 +537,7 @@ def run_windows_entry(
 	extract_workers: int | None = None,
 	filter_workers: int | None = None,
 	screen_kind: str | None = None,
+	sentence_dedup_window: int | None = None,
 ):
 	print("[运行模式] Windows: 流式处理（分批读取、筛选、落盘）")
 	filter_config_paths = _as_list(filter_config_paths)
@@ -543,7 +549,12 @@ def run_windows_entry(
 	# 输入清单与路径校验在打开任何输出之前完成（见 iter_path_sentences），
 	# 随后输出文件保持打开，命中按批直接写入，收尾不必再统一写盘。
 	sentences = iter_path_sentences(
-		src_path, vocabs, output_paths=paths, workers=extract_workers, stats=stats
+		src_path,
+		vocabs,
+		output_paths=paths,
+		workers=extract_workers,
+		stats=stats,
+		dedup_window=sentence_dedup_window,
 	)
 	# 抽取放到后台线程、与筛选重叠；队列有界（见 pipeline_utils.prefetch_iter）
 	sentences = prefetch_iter(sentences, config.EXTRACT_PREFETCH_ITEMS)
@@ -559,9 +570,13 @@ def run_windows_entry(
 			returned = filter_sentences_streaming(sentences, filter_config_paths, out_files)
 			if isinstance(returned, dict):
 				read_sentences = int(stats.get("read_sentences", 0))
+				duplicate_sentences = int(stats.get("duplicate_sentences", 0))
 				stats.update(returned)
-				# 旧形状下 streaming 自己新建统计，不知道抽取阶段的读入数；保留较大的那个
+				# 旧形状下 streaming 自己新建统计，不知道抽取阶段的读入数/去重数；保留较大的那个
 				stats["read_sentences"] = max(read_sentences, int(returned.get("read_sentences", 0)))
+				stats["duplicate_sentences"] = max(
+					duplicate_sentences, int(returned.get("duplicate_sentences", 0))
+				)
 		else:
 			filter_sentences_streaming(
 				sentences,

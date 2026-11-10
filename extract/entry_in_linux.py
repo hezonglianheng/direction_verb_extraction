@@ -260,6 +260,7 @@ def iter_path_sentences(
 	output_paths=(),
 	workers: int | None = None,
 	stats: dict[str, Any] | None = None,
+	dedup_window: int | None = None,
 ):
 	"""目录（或单文件）下的 jsonl 逐文件流式产出句子
 
@@ -267,13 +268,17 @@ def iter_path_sentences(
 	本入口多带一个 position=文件序号，产物里因此知道这句出自第几个输入文件；
 	workers 透传给单文件切句的线程池（0/None 取 config.EXTRACT_WORKERS）。
 	stats 是本轮漏斗统计（见 extraction_log）：在这里透传给切句层累加「读入总数」。
+	dedup_window 是跨文件句子去重窗口；None 取 config.SENTENCE_DEDUP_WINDOW，0 关闭。
 	"""
+	window = config.SENTENCE_DEDUP_WINDOW if dedup_window is None else int(dedup_window)
 	return file_paths.iter_path_sentences(
 		src_path,
 		lambda file, index: iter_jsonl_file_sentences(
 			str(file), position=index, vocabs=vocabs, workers=workers, stats=stats
 		),
 		output_paths=output_paths,
+		dedup_window=window,
+		stats=stats,
 	)
 
 
@@ -539,6 +544,7 @@ def run(
 	extract_workers: int | None = None,
 	filter_workers: int | None = None,
 	screen_kind: str | None = None,
+	sentence_dedup_window: int | None = None,
 ):
 	global _START_TIME
 	_START_TIME = time.time()
@@ -550,7 +556,12 @@ def run(
 
 	stats = extraction_log.new_stats()
 	sentences = iter_path_sentences(
-		src_path, vocabs=vocabs, output_paths=paths, workers=extract_workers, stats=stats
+		src_path,
+		vocabs=vocabs,
+		output_paths=paths,
+		workers=extract_workers,
+		stats=stats,
+		dedup_window=sentence_dedup_window,
 	)
 	# 抽取放到后台线程、与筛选重叠；队列有界（见 pipeline_utils.prefetch_iter），不会整份读入内存
 	sentences = prefetch_iter(sentences, config.EXTRACT_PREFETCH_ITEMS)
@@ -565,9 +576,13 @@ def run(
 			returned = filter_sentences_streaming(sentences, filter_config_paths, out_files)
 			if isinstance(returned, dict):
 				read_sentences = int(stats.get("read_sentences", 0))
+				duplicate_sentences = int(stats.get("duplicate_sentences", 0))
 				stats.update(returned)
-				# 旧形状下 streaming 自己新建统计，不知道抽取阶段的读入数；保留较大的那个
+				# 旧形状下 streaming 自己新建统计，不知道抽取阶段的读入数/去重数；保留较大的那个
 				stats["read_sentences"] = max(read_sentences, int(returned.get("read_sentences", 0)))
+				stats["duplicate_sentences"] = max(
+					duplicate_sentences, int(returned.get("duplicate_sentences", 0))
+				)
 		else:
 			filter_sentences_streaming(
 				sentences,
@@ -595,6 +610,7 @@ def run_linux_entry(
 	extract_workers: int | None = None,
 	filter_workers: int | None = None,
 	screen_kind: str | None = None,
+	sentence_dedup_window: int | None = None,
 ):
 	return run(
 		src_path,
@@ -605,4 +621,5 @@ def run_linux_entry(
 		extract_workers=extract_workers,
 		filter_workers=filter_workers,
 		screen_kind=screen_kind,
+		sentence_dedup_window=sentence_dedup_window,
 	)

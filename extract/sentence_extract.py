@@ -140,10 +140,12 @@ def main(
     *,
     screen_llm: bool = True,
     screen_model: str = config.SCREEN_MODEL,
-    screen_workers: int = config.SCREEN_WORKERS,
+    screen_workers: int | None = None,
+    screen_batch_size: int | None = None,
     screen_kind: str | None = None,
     extract_workers: int = config.EXTRACT_WORKERS,
     filter_workers: int = config.FILTER_WORKERS,
+    sentence_dedup_window: int | None = None,
     log_dir: str | None = None,
 ):
     """提取语料中包含指定语言现象的句子
@@ -156,11 +158,14 @@ def main(
         out_name (str | None): 输出文件名（多套规则时作为前缀）
         screen_llm (bool): 是否启用规则命中后的 LLM 筛选；提示语为空时自动跳过（不发请求）
         screen_model (str): LLM 筛选使用的模型配置名
-        screen_workers (int): LLM 筛选的并发线程数
+        screen_workers (int | None): LLM 筛选的并发线程数；None = 模型配置 screen_workers 或全局默认
+        screen_batch_size (int | None): 每次 LLM 请求的判定项数；None = 模型配置或全局默认
         screen_kind (str | None): 强制指定词类型（方位词/趋向动词）；None = 按规则配置名推断。
             只能用于单套规则——多套规则各有各的词类型，不能共用一个强制值
         extract_workers (int): 文本切句的并发线程数
         filter_workers (int): 规则筛选的进程数（0 = 自动，1 = 串行）
+        sentence_dedup_window (int | None): 跨文件句子去重窗口；None 取
+            config.SENTENCE_DEDUP_WINDOW，0 表示关闭
         log_dir (str | None): 筛选日志目录；None = 项目根下的 log/（不存在会自动创建）
     """
     filter_configs = _normalize_paths(filter_config_path) or ([DEFAULT_FILTER_CONFIG] if DEFAULT_FILTER_CONFIG else [])
@@ -180,6 +185,12 @@ def main(
             candidates = sorted(p.name for p in (Path(config._PROJECT_ROOT) / "config_files").glob("*.json5"))
             raise FileNotFoundError(f"找不到筛选配置文件 {path}；config_files 下有：{candidates}")
 
+    if sentence_dedup_window is None:
+        sentence_dedup_window = config.SENTENCE_DEDUP_WINDOW
+    sentence_dedup_window = int(sentence_dedup_window)
+    if sentence_dedup_window < 0:
+        raise ValueError("--sentence-dedup-window 不能为负数；0 表示关闭句子去重")
+
     generators = [sentenceFilters.FilterGenerator(path) for path in filter_configs]
     families = [generator.family_name for generator in generators]
     if len(set(families)) != len(families):
@@ -196,6 +207,7 @@ def main(
         model_key=screen_model,
         llm=screen_llm,
         workers=screen_workers,
+        batch_size=screen_batch_size,
         kind=screen_kind,
     )
     for family, screener in screeners.items():
@@ -217,6 +229,13 @@ def main(
             print(f"[筛选计划] 初筛词表 {len(vocabs)} 个词语，未通过初筛的句子不会送入 LTP")
         else:
             print("[筛选计划] 未使用初筛")
+        if sentence_dedup_window:
+            print(
+                f"[筛选计划] 句子去重窗口 {sentence_dedup_window}"
+                "（原句精确匹配，仅保留窗口内首次出现；0=关闭）"
+            )
+        else:
+            print("[筛选计划] 句子去重已关闭")
 
         started_at = time.time()
         if sys.platform.startswith("win"):
@@ -229,6 +248,7 @@ def main(
                 extract_workers=extract_workers,
                 filter_workers=filter_workers,
                 screen_kind=screen_kind,
+                sentence_dedup_window=sentence_dedup_window,
             )
         else:
             stats = run_linux_entry(
@@ -240,6 +260,7 @@ def main(
                 extract_workers=extract_workers,
                 filter_workers=filter_workers,
                 screen_kind=screen_kind,
+                sentence_dedup_window=sentence_dedup_window,
             )
 
         # 两个平台共用同一个成功出口：语料文件已原子替换后才写漏斗日志。
@@ -290,8 +311,16 @@ if __name__ == "__main__":
     parser.add_argument(
         "--screen-workers",
         type=int,
-        default=config.SCREEN_WORKERS,
-        help=f"LLM 筛选的并发线程数，默认 {config.SCREEN_WORKERS}（逐词判定是 IO 密集的）",
+        default=None,
+        help=f"LLM 筛选的并发线程数；不传时用模型配置 screen_workers，再回退到全局默认 "
+        f"{config.SCREEN_WORKERS}（逐词判定是 IO 密集的）",
+    )
+    parser.add_argument(
+        "--screen-batch-size",
+        type=int,
+        default=None,
+        help=f"每次 LLM 请求放入多少条判定项；不传时用模型配置 screen_batch_size，"
+        f"再回退到全局默认 {config.SCREEN_BATCH_SIZE}",
     )
     parser.add_argument(
         "--screen-kind",
@@ -313,6 +342,13 @@ if __name__ == "__main__":
         help=f"规则筛选的进程数，默认 {config.FILTER_WORKERS}（0 = 自动按 CPU 核数，1 = 串行）。"
         "多进程会各持一份 LTP 模型，单卡上通常 1 更快；需要时再调大",
     )
+    parser.add_argument(
+        "--sentence-dedup-window",
+        type=int,
+        default=config.SENTENCE_DEDUP_WINDOW,
+        help=f"跨文件句子去重窗口：只记住最近多少个词表初筛后的唯一句哈希，0=关闭。"
+        f"默认 {config.SENTENCE_DEDUP_WINDOW}，约 20–30MiB；窗口越大去重越彻底、内存越高",
+    )
     args = parser.parse_args()
     main(
         args.src_path,
@@ -323,7 +359,9 @@ if __name__ == "__main__":
         screen_llm=not args.no_llm_screen,
         screen_model=args.screen_model,
         screen_workers=args.screen_workers,
+        screen_batch_size=args.screen_batch_size,
         screen_kind=args.screen_kind,
         extract_workers=args.extract_workers,
         filter_workers=args.filter_workers,
+        sentence_dedup_window=args.sentence_dedup_window,
     )

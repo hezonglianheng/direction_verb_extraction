@@ -6,7 +6,9 @@ import contextlib
 import os
 import tempfile
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable
+
+from pipeline_utils import dedup_sentences
 
 
 def resolve_cache_path(
@@ -127,7 +129,14 @@ def atomic_output_path(path: str | Path):
         temp.unlink(missing_ok=True)
 
 
-def iter_path_sentences(src_path: str | Path, per_file: Callable[[Path, int], Iterable], *, output_paths=()):
+def iter_path_sentences(
+    src_path: str | Path,
+    per_file: Callable[[Path, int], Iterable],
+    *,
+    output_paths=(),
+    dedup_window: int = 0,
+    stats: dict[str, Any] | None = None,
+):
     """目录（或单文件）下 jsonl 的「收集 + 遍历」：**不能自身包含 yield**（E4）
 
     两个平台入口（entry_in_win / entry_in_linux）这一步原本各写一份，差别只在逐文件怎么切句；
@@ -139,13 +148,22 @@ def iter_path_sentences(src_path: str | Path, per_file: Callable[[Path, int], It
     **输出文件已经打开之后**——那时输出已经把目标截断了，报错也来不及。
     所以这里先算清文件清单，再返回一个惰性生成器表达式。
 
+    dedup_window > 0 时，在逐文件产出的句子流外面再包一层跨文件、有界的原句去重
+    （见 pipeline_utils.dedup_sentences）。它放在这里而不是单文件入口里，是为了让
+    两个平台、所有输入文件共用同一个窗口；放在这里也不会破坏上面的"先快照再迭代"。
+
     Args:
         src_path: 输入文件或目录
         per_file: 单文件迭代器工厂，形如 lambda file, index: iter_jsonl_file_sentences(...)
         output_paths: 本轮输出，用来把输出从输入清单里排除（见 collect_jsonl_inputs）
+        dedup_window: 去重窗口大小；0 表示关闭（默认，保持旧调用形状不变）
+        stats: 可选统计字典；去重命中时累加 duplicate_sentences
     """
     files = collect_jsonl_inputs(src_path, output_paths)
-    return (sentence for index, file in enumerate(files) for sentence in per_file(file, index))
+    sentences = (sentence for index, file in enumerate(files) for sentence in per_file(file, index))
+    if int(dedup_window) <= 0:
+        return sentences
+    return dedup_sentences(sentences, window_size=int(dedup_window), stats=stats)
 
 
 def validate_run_outputs(
