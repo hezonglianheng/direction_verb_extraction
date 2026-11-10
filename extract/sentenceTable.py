@@ -18,22 +18,88 @@ _infer_lock = threading.Lock()
 
 缓存字典自带的锁只保护字典本身，推理是**在锁外**做的（见 get_task_value），所以预填充没兜住的
 句子会由多个 worker 线程同时送进同一份模型：那不是数据竞争（结果一致），而是把一次前向拆成
-并发的多次、互相抢占显存与算力。这里给推理划一条明确的串行边界：并发的调用排队过这一把锁，
+并发的多次、互相抢占算力（GPU 模式下还包括显存）。这里给推理划一条明确的串行边界：并发的调用排队过这一把锁，
 于是"在途推理"恒为一组，与线程池里的在途候选数解耦。
 
 批量预填充（spatial_runner._prefill / spatial_tools.prefill_ltp）把整批句子按组分批送模型，
 走的也是 _infer_base 的同一把锁；这条边界同时兜住预填充未覆盖、按需单句推理的句子。"""
 
 
+def _resolve_ltp_device() -> str:
+    """把 ``config.LTP_DEVICE`` 解析成 LTP / ``torch.Tensor.to`` 接受的设备字符串。
+
+    只在首次加载 LTP 时调用。LTP 4 的公开写法是 ``ltp.to("cuda")`` / ``ltp.cpu()``：
+    ``LTP()`` 构造函数只按 ``map_location="cpu"`` 反序列化权重，真正决定 ``pipeline``
+    张量位置的是模型自身的 ``device`` 属性，因此必须在加载后调用 ``model.to(device)``。
+    ``BaseModule.to`` 会同步更新所有子模块的 ``_device``（见 ``ltp.module.BaseModule.to``），
+    ``ltp.nerual.LTP.pipeline`` 随后用 ``self.device`` 搬运 tokenized / word_index。
+
+    ``auto`` 保留改动前的行为；``gpu`` / ``cuda``（以及带索引的 ``gpu:N`` /
+    ``cuda:N``）在当前进程看不到 GPU 时立即报错，避免在更深的推理路径抛出难读的
+    CUDA 错误，也避免静默回退到 CPU。``gpu`` 是 ``cuda`` 的别名，返回给 LTP 的
+    仍是 ``cuda`` / ``cuda:N``。
+    """
+    device = str(config.LTP_DEVICE or "cpu").strip().lower()
+    if device == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cpu":
+        return device
+    if device in ("cuda", "gpu"):
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                f"config.LTP_DEVICE={config.LTP_DEVICE!r}，但当前进程看不到 CUDA 设备；"
+                "请将 config.LTP_DEVICE 改为 \"cpu\"，或检查 CUDA_VISIBLE_DEVICES / 驱动。"
+            )
+        return "cuda"
+    if device.startswith(("cuda:", "gpu:")):
+        index_text = device.split(":", 1)[1]
+        if not index_text.isdigit():
+            raise ValueError(
+                f"未知的 config.LTP_DEVICE={config.LTP_DEVICE!r}；"
+                "gpu:N / cuda:N 的 N 必须是非负整数"
+            )
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                f"config.LTP_DEVICE={config.LTP_DEVICE!r}，但当前进程看不到 CUDA 设备；"
+                "请将 config.LTP_DEVICE 改为 \"cpu\"，或检查 CUDA_VISIBLE_DEVICES / 驱动。"
+            )
+        index = int(index_text)
+        count = torch.cuda.device_count()
+        if index >= count:
+            raise ValueError(
+                f"config.LTP_DEVICE={config.LTP_DEVICE!r} 指向 {index} 号 GPU，"
+                f"但当前进程只能看到 {count} 张 GPU"
+            )
+        return f"cuda:{index}"
+    raise ValueError(
+        f"未知的 config.LTP_DEVICE={config.LTP_DEVICE!r}；"
+        "可选 cpu、gpu、gpu:N、cuda、cuda:N、auto"
+    )
+
+
 def _get_ltp() -> LTP:
-    """Lazy-init LTP in current process to avoid CUDA init before multiprocessing fork/spawn."""
+    """Lazy-init LTP in current process to avoid CUDA init before multiprocessing fork/spawn.
+
+    设备由 ``config.LTP_DEVICE`` 控制（默认 cpu，直接改该变量即可）。``LTP()`` 默认只在
+    CPU 上加载权重，所以即使机器有 GPU，不调用 ``model.to(...)`` 也不会自动上 GPU；
+    反过来，要离开 GPU 也必须显式 ``model.to("cpu")`` / 将 ``config.LTP_DEVICE`` 设为
+    ``"cpu"``，不能只改 ``LTP_MODEL_PATH``。
+    """
     global _ltp
     if _ltp is None:
         with _ltp_init_lock:
             if _ltp is None:
+                # 先解析设备再加载权重：配置写错时立刻失败，不必先花几秒把模型读进内存。
+                device = _resolve_ltp_device()
                 model = LTP(config.LTP_MODEL_PATH)
-                if torch.cuda.is_available():
-                    model.to("cuda")
+                if hasattr(model, "to"):
+                    model.to(device)
+                elif device != "cpu":
+                    raise RuntimeError(
+                        "当前加载的 LTP legacy 模型没有 .to(device) 接口，只能使用 CPU；"
+                        f"请将 config.LTP_DEVICE 改为 \"cpu\"（当前 {config.LTP_DEVICE!r}）"
+                    )
+                print(f"[LTP] 推理设备：{device}（config.LTP_DEVICE={config.LTP_DEVICE!r}）")
                 _ltp = model
     return _ltp
 
