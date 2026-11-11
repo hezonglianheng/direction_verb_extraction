@@ -95,7 +95,7 @@ ERROR_RULES: dict[str, ErrorRule] = {
 """内置错误类型。默认只用 insufficient_balance；新增类型只需在这里加一项。"""
 
 DEFAULT_ERROR_TYPES: tuple[str, ...] = ("insufficient_balance",)
-"""不传 --error-type 时保持旧 rescreen_402 的行为。"""
+"""不传 --error-type 时仅处理 402 / Insufficient Balance / 余额不足。"""
 
 
 @dataclass(frozen=True)

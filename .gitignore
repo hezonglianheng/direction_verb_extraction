@@ -19,6 +19,7 @@ model_config/api_keys.json
 # 本地待后续开发的测试、调试脚本和资料，不随最小运行版提交
 /tests/
 /extract/temp.py
+/extract/rescreen_402.py
 /filter_sentence/
 /filtered_sentences.csv
 /note.txt
