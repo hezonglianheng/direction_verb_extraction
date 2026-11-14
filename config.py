@@ -313,6 +313,13 @@ LOCAL_MODEL_SERVICE_STATUS_COMMAND = ("bash", "service.sh", "status")
 LOCAL_MODEL_SERVICE_HEALTH_PATH = "/health"
 """健康检查路径。会拼到 base_url 去掉末尾 /v1 后的地址上。"""
 
+LOCAL_MODEL_SERVICE_PID_FILE = ""
+"""本地服务 PID 文件；留空时默认 <service_dir>/run/server.pid。
+
+只用于在 stop 前确认“要停的还是本次启动的那个进程”。服务被人工或其他实例替换后，
+PID 不一致就跳过 stop，避免误停新服务；文件不存在时也按“对象已变化”处理。
+自定义服务没有 PID 文件时可在 local_service 里写 "pid_file": null。"""
+
 LOCAL_MODEL_SERVICE_START_TIMEOUT_SECONDS = 14400
 """启动命令的超时秒数（默认 4 小时，与 model_service/service.sh 的首次下载/加载窗口对齐）"""
 
