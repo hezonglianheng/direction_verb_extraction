@@ -36,13 +36,23 @@ def _iso(timestamp: float | None) -> str:
 def _render_limit_stats(stats: dict[str, Any]) -> list[str]:
     """限额抽样统计：模式/种子/候选数/逐词配额，便于复现和核对。"""
     lines = ["", "限额抽样:"]
+    if stats.get("mode") == "aligned" and stats.get("limit") is None:
+        lines.append("  limit: 全部")
     for key in (
         "version", "mode", "limit", "seed", "corpus_type", "scanned", "blank",
         "skipped_ineligible", "skipped_bad_record", "skipped_no_word",
         "candidates", "available", "selected", "stopped_early",
+        "reference_file", "reference_rows", "reference_blank", "reference_duplicates",
+        "reference_records", "matched_reference_records", "unmatched_reference_records",
+        "matched_source_records", "content_matches", "line_collisions", "limit_excluded",
     ):
         if key in stats and stats[key] is not None:
             lines.append(f"  {key}: {stats[key]}")
+    key_counts = stats.get("key_counts")
+    if isinstance(key_counts, dict) and key_counts:
+        lines.append("  对齐键统计:")
+        for key, value in key_counts.items():
+            lines.append(f"    {key}: {value}")
     line_nos = stats.get("selected_line_nos")
     if isinstance(line_nos, list) and line_nos:
         preview = "、".join(str(number) for number in line_nos)

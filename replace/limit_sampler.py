@@ -16,6 +16,12 @@ replace 仍会把一条原句展开成多个位置、多个替换句，本模块
    不占配额，因此这类记录存在时实际选中可能少于 X（真实语料实测为 0 条）。
    配额描述的是**选中记录按主关注词的分层**；replace 后续仍会展开句内其他合格位置，
    所以最终句对的逐词分布不直接等于这里的配额。
+4. ``aligned``：不按 X 随机抽，而是读一份“已筛选文件”（reference），把其中每条记录
+   按行号/内容对回同一份源语料，选出对应的源记录。``--limit`` 可省略（表示全部），
+   给了则只取源文件顺序中的前 X 条匹配记录。这是严格对齐：reference 中任何一条在源
+   语料里找不到、或一条 reference 对到多条内容不同的源记录，都会报错而不是静默跳过。
+   reference 可以是 word_sampler 产物、replace 句对、annotate 结果或同源子集；行号字段
+   （source_line_no / input_line_no / line_no，含 source 块）和句子内容都会参与校验。
 
 “可用记录”沿用 replace 的口径：非空行、合法 JSON 对象、不是句对、``sentence`` 为非空
 字符串列表，且 ``sentence_screening.screening_status`` 为 ``true``/``no_llm``（即
@@ -43,7 +49,8 @@ from annotate import spatial_tools as st
 SELECTION_VERSION = 1
 """抽样统计口径版本；算法变化时递增，便于日志里的旧结果对账。"""
 
-LIMIT_MODES = ("sequential", "random", "proportional")
+SAMPLE_MODES = ("sequential", "random", "proportional")
+LIMIT_MODES = (*SAMPLE_MODES, "aligned")
 DEFAULT_MODE = "sequential"
 DEFAULT_SEED = 0
 
@@ -63,7 +70,7 @@ class Selection:
     stats: dict
 
 
-def _base_stats(*, limit: int, mode: str, seed: int, corpus_type: str) -> dict:
+def _base_stats(*, limit: int | None, mode: str, seed: int, corpus_type: str) -> dict:
     return {
         "version": SELECTION_VERSION,
         "mode": mode,
@@ -315,6 +322,425 @@ def _iter_proportional(
         raise RuntimeError(f"{path} 在比例抽样的两遍读取之间发生变化；请固定语料后重跑")
 
 
+# --------------------------------------------------------------------------
+# aligned：用已筛选文件逐条对回同一份源语料
+# --------------------------------------------------------------------------
+
+_ALIGNED_LINE_KEYS = ("source_line_no", "input_line_no", "line_no")
+
+
+@dataclass
+class _ReferenceEntry:
+    """一条 reference 记录（已按身份去重）以及与源记录对齐所需的信息。"""
+
+    line_keys: dict[str, set[int]]
+    content_hash: str | None
+    document: str | None
+    sentence_id: str | None
+    row_no: int
+    allow_content_fallback: bool = False
+    matched: bool = False
+    match_count: int = 0
+    matched_by: str | None = None
+
+
+def _positive_line(value) -> int | None:
+    """把行号字段收成正整数；bool、0、负数、非数字一律不认。"""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, float) and value.is_integer() and value > 0:
+        return int(value)
+    if isinstance(value, str) and value.strip().isdigit():
+        number = int(value.strip())
+        return number if number > 0 else None
+    return None
+
+
+def _record_line_keys(record: dict) -> dict[str, set[int]]:
+    """一条记录里所有可用行号，按字段名分组（顶层与 source 块都看）。
+
+    不在这里决定“source_line_no 优先还是 line_no 优先”：两者可能分别指向祖先语料和
+    当前输入，究竟哪个能对回源文件取决于用户拿的是哪一份。全部保留，后续用句子内容
+    校验；只有内容一致的命中才算数，避免同号不同句的误对齐。
+    """
+    found: dict[str, set[int]] = {}
+    source = record.get("source")
+    containers = [("source", source), ("top", record)] if isinstance(source, dict) else [("top", record)]
+    for _, container in containers:
+        if not isinstance(container, dict):
+            continue
+        for key in _ALIGNED_LINE_KEYS:
+            value = _positive_line(container.get(key))
+            if value is not None:
+                found.setdefault(key, set()).add(value)
+    return found
+
+
+def _record_content_hash(record: dict) -> str | None:
+    """reference/source 的句子指纹：顶层 sentence，其次句对的 a 侧切片/句子。"""
+    tokens = record.get("sentence")
+    if isinstance(tokens, list) and tokens and all(isinstance(token, str) for token in tokens):
+        return st.content_hash(tokens)
+    if isinstance(tokens, str) and tokens.strip():
+        return st.content_hash(tokens)
+    pair = record.get("pair")
+    if isinstance(pair, dict):
+        side_a = pair.get("a")
+        if isinstance(side_a, dict):
+            tokens = side_a.get("slice")
+            if isinstance(tokens, list) and tokens and all(isinstance(token, str) for token in tokens):
+                return st.content_hash(tokens)
+            sentence = side_a.get("sentence")
+            if isinstance(sentence, str) and sentence.strip():
+                return st.content_hash(sentence)
+    explicit = record.get("content_hash")
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+    return None
+
+
+def _record_document(record: dict) -> str | None:
+    """来源文档：先看 source 块，再看顶层；与 spatial_tools.source_document_id 同源。"""
+    source = record.get("source")
+    if isinstance(source, dict):
+        document = st.source_document_id(source)
+        if document:
+            return document
+    return st.source_document_id(record)
+
+
+def _explicit_sentence_id(record: dict) -> str | None:
+    value = record.get("sentence_id")
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _looks_like_current_file_reference(record: dict) -> bool:
+    """这条 reference 的行号是否可能指向“当前 pairs 文件”而不是源语料。
+
+    annotate 结果（含 voting 派生）顶层 sentence 常为空，原句在 pair.a.slice；它的
+    line_no/input_line_no 是 pairs 文件行号。word_sampler 产物没有 pair/sentence_id，
+    顶层 sentence 非空，它的 line_no 就是源语料行号。两类记录都只有 line_no 时，
+    必须靠这个形状区分，否则 annotate 记录会被误当成源行号。
+    """
+    if "pair_schema_version" in record:
+        # 旧版 replace 句对可能没有 source_line_no；此时 line_no 仍是源语料行号，
+        # 不能把整份句对文件当成 annotate 的“当前文件行号”而放弃按行匹配。
+        return False
+    if isinstance(record.get("pair"), dict):
+        return True
+    if _explicit_sentence_id(record):
+        return True
+    tokens = record.get("sentence")
+    return not (isinstance(tokens, list) and tokens)
+
+
+def _parse_reference_row(line: str, row_no: int, path: Path) -> dict:
+    try:
+        row = json.loads(line)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"reference {path} 第 {row_no} 行不是合法 JSON：{exc}") from exc
+    if not isinstance(row, dict):
+        raise ValueError(f"reference {path} 第 {row_no} 行不是 JSON 对象")
+    return row
+
+
+def _reference_identity(entry: _ReferenceEntry) -> tuple | None:
+    """去重身份：显式 sentence_id 最稳，其次行号集合+内容，最后仅内容。"""
+    if entry.sentence_id:
+        return ("sentence_id", entry.sentence_id)
+    line_pairs = frozenset(
+        (label, value) for label, values in entry.line_keys.items() for value in values
+    )
+    if line_pairs:
+        return ("lines", entry.document, entry.content_hash, line_pairs)
+    if entry.content_hash:
+        return ("content", entry.document, entry.content_hash)
+    return None
+
+
+def _reference_entry_matches(
+    entry: _ReferenceEntry, source_hash: str | None, source_document: str | None, source_sid: str | None
+) -> bool:
+    """行号命中后还要过内容/来源/ID 校验；有内容的记录不能用同号不同句冒充。"""
+    if entry.content_hash and entry.content_hash != source_hash:
+        return False
+    if entry.document and entry.document != source_document:
+        return False
+    if entry.sentence_id and source_sid and entry.sentence_id != source_sid:
+        return False
+    return True
+
+
+def _describe_reference_entry(entry: _ReferenceEntry) -> str:
+    parts = []
+    for label, values in sorted(entry.line_keys.items()):
+        parts.append(f"{label}={sorted(values)}")
+    if entry.content_hash:
+        parts.append(f"hash={entry.content_hash}")
+    if entry.sentence_id:
+        parts.append(f"sentence_id={entry.sentence_id}")
+    return f"第 {entry.row_no} 行（{'，'.join(parts) or '无可用键'}）"
+
+
+def _load_reference(path: Path) -> tuple[list[_ReferenceEntry], dict]:
+    """读 reference，按身份去重；行号/内容/ID 都没有的记录直接报错。"""
+    entries: list[_ReferenceEntry] = []
+    identities: dict[tuple, int] = {}
+    stats = {"rows": 0, "blank": 0, "duplicates": 0}
+    with open(path, "r", encoding="utf-8") as reader:
+        for row_no, line in enumerate(reader, start=1):
+            if not line.strip():
+                stats["blank"] += 1
+                continue
+            row = _parse_reference_row(line, row_no, path)
+            stats["rows"] += 1
+            line_keys = _record_line_keys(row)
+            entry = _ReferenceEntry(
+                line_keys=line_keys,
+                content_hash=_record_content_hash(row),
+                document=_record_document(row),
+                sentence_id=_explicit_sentence_id(row),
+                row_no=row_no,
+                # source_line_no 是源语料的权威行号，不允许再靠内容猜；
+                # 只有“没有源行号”的 annotate/内容型 reference 才允许唯一内容兜底。
+                allow_content_fallback=(
+                    not line_keys
+                    or (
+                        not line_keys.get("source_line_no")
+                        and _looks_like_current_file_reference(row)
+                    )
+                ),
+            )
+            identity = _reference_identity(entry)
+            if identity is None:
+                raise ValueError(
+                    f"reference {path} 第 {row_no} 行没有任何可用于对齐的行号、句子内容或 sentence_id；"
+                    "无法确定它对应源语料的哪一条记录"
+                )
+            if identity in identities:
+                existing = entries[identities[identity]]
+                if existing.content_hash and entry.content_hash and existing.content_hash != entry.content_hash:
+                    raise ValueError(
+                        f"reference {path} 第 {row_no} 行与第 {existing.row_no} 行身份相同但句子不同；"
+                        "请检查 reference 是否混入了不同来源的记录"
+                    )
+                for label, values in entry.line_keys.items():
+                    existing.line_keys.setdefault(label, set()).update(values)
+                if existing.content_hash is None:
+                    existing.content_hash = entry.content_hash
+                if existing.document is None:
+                    existing.document = entry.document
+                existing.allow_content_fallback = (
+                    (existing.allow_content_fallback or entry.allow_content_fallback)
+                    and not existing.line_keys.get("source_line_no")
+                )
+                stats["duplicates"] += 1
+                continue
+            identities[identity] = len(entries)
+            entries.append(entry)
+    if not entries:
+        raise ValueError(f"reference {path} 没有可用记录（空文件或只有空行），无法做平行对齐")
+    return entries, stats
+
+
+def _reference_indexes(entries: list[_ReferenceEntry]) -> tuple[dict, dict, dict, dict]:
+    """行号按命名空间分开建索引，绝不把源行号和当前文件行号当成同一个整数。
+
+    - source_line_no：源语料（或祖先语料）行号，权威。
+    - input_line_no / line_no：当前输入文件行号；只有 reference 没有 source_line_no 时才用。
+    """
+    by_source_line: dict[int, set[int]] = {}
+    by_current_line: dict[int, set[int]] = {}
+    by_hash: dict[str, set[int]] = {}
+    by_sid: dict[str, set[int]] = {}
+    for index, entry in enumerate(entries):
+        for value in entry.line_keys.get("source_line_no", ()):
+            by_source_line.setdefault(value, set()).add(index)
+        # annotate/内容型 reference 的 line_no 是 pairs 文件行号，不是源行号；它只允许
+        # 走内容兜底，绝不能拿这个数字去源语料里“按行命中”，否则重复句会被静默误配。
+        if not entry.line_keys.get("source_line_no") and not entry.allow_content_fallback:
+            for label in ("input_line_no", "line_no"):
+                for value in entry.line_keys.get(label, ()):
+                    by_current_line.setdefault(value, set()).add(index)
+        if entry.content_hash:
+            by_hash.setdefault(entry.content_hash, set()).add(index)
+        if entry.sentence_id:
+            by_sid.setdefault(entry.sentence_id, set()).add(index)
+    return by_source_line, by_current_line, by_hash, by_sid
+
+
+def _iter_aligned(
+    path: Path, reference_path: Path, limit: int | None, stats: dict
+) -> Iterator[tuple[int, dict]]:
+    entries, reference_stats = _load_reference(reference_path)
+    stats["reference_file"] = str(reference_path)
+    stats["reference_rows"] = reference_stats["rows"]
+    stats["reference_blank"] = reference_stats["blank"]
+    stats["reference_duplicates"] = reference_stats["duplicates"]
+    stats["reference_records"] = len(entries)
+    stats["matched_reference_records"] = 0
+    stats["unmatched_reference_records"] = len(entries)
+    stats["matched_source_records"] = 0
+    stats["content_matches"] = 0
+    stats["line_collisions"] = 0
+    stats["limit_excluded"] = 0
+    stats["key_counts"] = {}
+
+    by_source_line, by_current_line, by_hash, by_sid = _reference_indexes(entries)
+    snapshot = _fingerprint(path)
+    selected = 0
+    for line_no, row in _iter_candidates(path, stats):
+        source_lines = _record_line_keys(row)
+        source_hash = _record_content_hash(row)
+        source_document = _record_document(row)
+        source_sid = _explicit_sentence_id(row)
+
+        source_namespace = set(source_lines.get("source_line_no", ()))
+        if not source_namespace:
+            # 源语料本身没有 source_line_no 时，物理行号就是它的源行号。
+            source_namespace = {line_no}
+        current_namespace = {line_no}
+        for label in ("input_line_no", "line_no"):
+            current_namespace.update(source_lines.get(label, ()))
+
+        source_hits: set[int] = set()
+        for value in source_namespace:
+            source_hits.update(by_source_line.get(value, set()))
+        current_hits: set[int] = set()
+        for value in current_namespace:
+            current_hits.update(by_current_line.get(value, set()))
+        sid_hits = by_sid.get(source_sid, set()) if source_sid else set()
+
+        matched: list[int] = []
+        matched_by: str | None = None
+        source_good: list[int] = []
+        current_good: list[int] = []
+        for index in source_hits:
+            entry = entries[index]
+            if _reference_entry_matches(entry, source_hash, source_document, source_sid):
+                source_good.append(index)
+            else:
+                stats["line_collisions"] += 1
+        for index in current_hits | sid_hits:
+            entry = entries[index]
+            if _reference_entry_matches(entry, source_hash, source_document, source_sid):
+                current_good.append(index)
+            else:
+                stats["line_collisions"] += 1
+
+        if source_good and current_good and set(source_good) != set(current_good):
+            examples = "；".join(
+                _describe_reference_entry(entries[index]) for index in sorted(set(source_good) | set(current_good))[:5]
+            )
+            raise ValueError(
+                f"源语料 {path} 第 {line_no} 行被 reference 的源行号与当前文件行号指向不同记录：{examples}"
+            )
+        if source_good:
+            matched = source_good
+            matched_by = "source_line"
+        elif current_good:
+            matched = current_good
+            matched_by = "sentence_id" if any(index in sid_hits for index in current_good) else "line"
+
+        # 内容兜底只用于 reference 自己标了“当前文件行号”或本来就没有行号的记录；
+        # 有 source_line_no 的权威记录行号对不上就保持未匹配，最终报错。
+        if not matched and source_hash:
+            for index in by_hash.get(source_hash, set()):
+                entry = entries[index]
+                if not entry.allow_content_fallback:
+                    continue
+                if entry.matched:
+                    if entry.matched_by == "content":
+                        raise ValueError(
+                            f"reference {reference_path} 的{_describe_reference_entry(entry)}"
+                            f"只能靠句子内容对齐，但源语料 {path} 里有多条同文记录；无法逐条对应"
+                        )
+                    continue
+                if _reference_entry_matches(entry, source_hash, source_document, source_sid):
+                    matched.append(index)
+            if matched:
+                matched_by = "content"
+                stats["content_matches"] += 1
+
+        if not matched:
+            continue
+
+        matched_entries = [entries[index] for index in matched]
+        if len(matched_entries) > 1:
+            examples = "；".join(_describe_reference_entry(entry) for entry in matched_entries[:5])
+            raise ValueError(
+                f"源语料 {path} 第 {line_no} 行同时对上多条 reference 记录，无法逐条一一对应：{examples}"
+            )
+
+        for entry in matched_entries:
+            if entry.match_count:
+                raise ValueError(
+                    f"reference {reference_path} 的{_describe_reference_entry(entry)}"
+                    f"对到了多条源记录（又遇到 {path} 第 {line_no} 行）；"
+                    "请给 reference 补上唯一行号，或确认源语料是否有重复行号"
+                )
+            entry.match_count += 1
+            if not entry.matched:
+                entry.matched = True
+                entry.matched_by = matched_by
+                stats["matched_reference_records"] += 1
+                stats["key_counts"][matched_by] = stats["key_counts"].get(matched_by, 0) + 1
+
+        stats["matched_source_records"] += 1
+        if limit is None or selected < limit:
+            selected += 1
+            _remember_selected(stats, line_no)
+            yield line_no, row
+        else:
+            stats["limit_excluded"] += 1
+
+    if _fingerprint(path) != snapshot:
+        raise RuntimeError(f"{path} 在按 reference 对齐的读取过程中发生变化；请固定语料后重跑")
+
+    stats["available"] = stats["matched_source_records"]
+    stats["candidates"] = stats["matched_source_records"]
+    unmatched = [entry for entry in entries if not entry.matched]
+    stats["unmatched_reference_records"] = len(unmatched)
+    if unmatched:
+        examples = "；".join(_describe_reference_entry(entry) for entry in unmatched[:5])
+        raise ValueError(
+            f"reference {reference_path} 有 {len(unmatched)} 条记录在源语料 {path} 中找不到唯一对应记录：{examples}"
+        )
+
+
+def select_aligned_records(
+    path: str | Path,
+    *,
+    reference_file: str | Path,
+    limit: int | None = None,
+    corpus_type: str = st.DEFAULT_CORPUS_TYPE,
+) -> Selection:
+    """按已筛选文件从源语料中逐条取回对应记录。
+
+    Args:
+        path: 未筛选的源语料 JSONL
+        reference_file: 已筛选文件 JSONL；支持 word_sampler 产物、replace 句对、annotate 结果或同源子集
+        limit: 可选上限；None 表示 reference 能对上的记录全部取出，否则只取源文件顺序中的前 X 条
+        corpus_type: 仅用于统计字段，不参与对齐
+
+    Returns:
+        Selection: 按源文件顺序产出匹配记录；reference 中任何一条对不上都会在消费完时报错
+
+    Raises:
+        ValueError: reference 为空/有坏行/无身份/与源语料无法一一对应
+    """
+    if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0):
+        raise ValueError(f"limit 必须是大于 0 的整数或 None，收到 {limit!r}")
+    reference = Path(reference_file)
+    if not reference.is_file():
+        raise FileNotFoundError(f"找不到 reference 文件 {reference}")
+    stats = _base_stats(limit=limit, mode="aligned", seed=DEFAULT_SEED, corpus_type=corpus_type)
+    records = _iter_aligned(Path(path), reference, limit, stats)
+    return Selection(records=records, stats=stats)
+
+
 def select_records(
     path: str | Path,
     *,
@@ -337,8 +763,11 @@ def select_records(
     """
     if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
         raise ValueError(f"limit 必须是大于 0 的整数，收到 {limit!r}")
-    if mode not in LIMIT_MODES:
-        raise ValueError(f"limit_mode 必须是 {LIMIT_MODES} 之一，收到 {mode!r}")
+    if mode not in SAMPLE_MODES:
+        raise ValueError(
+            f"limit_mode 必须是 {SAMPLE_MODES} 之一，收到 {mode!r}；"
+            "aligned 模式请用 select_aligned_records 并传入 reference_file"
+        )
     if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
         raise ValueError(f"seed 必须是大于等于 0 的整数，收到 {seed!r}")
 

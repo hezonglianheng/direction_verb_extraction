@@ -9,7 +9,9 @@
     python replace --corpus ... --limit 500                          # 按顺序取前 500 条
     python replace --corpus ... --limit 500 --limit-mode random --seed 0
     python replace --corpus ... --limit 500 --limit-mode proportional --seed 0
+    python replace --corpus ... --reference-file filtered.jsonl      # 按已筛选文件逐条对回
 random/proportional 只额外读一遍语料做计数，不把 GB 级语料读进内存；同一 seed 可复现。
+aligned（--reference-file）按行号/句子内容严格对回同一份源语料，找不到或一对多会报错。
 """
 
 import argparse
@@ -200,12 +202,19 @@ def parse_args(argv=None):
         help="--limit 的抽取方式：sequential=按文件顺序取前 X 条（默认）；"
              "random=从全部可用原句中随机抽 X 条；"
              "proportional=在带本类关注词的可用原句中按主关注词比例分配 X 条"
-             "（配额描述选中记录的分层，句内其他位置仍会展开）",
+             "（配额描述选中记录的分层，句内其他位置仍会展开）；"
+             "aligned=按 --reference-file 逐条对回源语料",
     )
     parser.add_argument(
         "--seed", type=_non_negative_int, default=None,
         help="random/proportional 的随机种子，默认 0；同一份语料与种子可复现同一批记录。"
-             "仅与 --limit 一起使用",
+             "仅与 --limit 一起使用；aligned 不使用随机种子",
+    )
+    parser.add_argument(
+        "--reference-file", default=None,
+        help="已筛选文件（JSONL）：按行号/句子内容把它逐条对回 --corpus。"
+             "给出后自动进入 aligned 模式；--limit 可省略（全部对齐），给了则只取源文件顺序的前 X 条。"
+             "reference 中任何一条找不到或一对多都会报错",
     )
     parser.add_argument(
         "--log-dir", default=None,
@@ -214,7 +223,16 @@ def parse_args(argv=None):
     parser.add_argument("--no-llm", action="store_true", help="不调用模型；未检查的句对不可进入标注")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args(argv)
-    if args.limit is None:
+    if args.reference_file is not None:
+        if args.limit_mode not in (None, "aligned"):
+            parser.error("--reference-file 不能与 --limit-mode sequential/random/proportional 同时使用")
+        if args.seed is not None:
+            parser.error("--reference-file 不对齐随机过程，不能与 --seed 同时使用")
+        args.limit_mode = "aligned"
+        args.seed = limit_sampler.DEFAULT_SEED
+    elif args.limit_mode == "aligned":
+        parser.error("--limit-mode aligned 必须同时给出 --reference-file")
+    elif args.limit is None:
         if args.limit_mode is not None or args.seed is not None:
             parser.error("--limit-mode 与 --seed 只能在给出 --limit 时使用")
         args.limit_mode = limit_sampler.DEFAULT_MODE
@@ -231,8 +249,9 @@ def main(argv=None):
     args = parse_args(argv)
     started_at = time.time()
     source = Path(args.corpus)
+    reference = Path(args.reference_file) if args.reference_file else None
     output = Path(args.out_file) if args.out_file else Path(config._PROJECT_ROOT) / "results" / cp.PAIR_CORPORA[args.corpus_type]
-    file_paths.validate_output_paths([source], [output])
+    file_paths.validate_output_paths([source, *([reference] if reference is not None else [])], [output])
     if output.exists() and not args.overwrite:
         raise FileExistsError(f"输出文件 {output} 已存在；请换路径或显式加 --overwrite")
     preparer = PairPreparer(corpus_type=args.corpus_type,
@@ -241,13 +260,21 @@ def main(argv=None):
                             batch_size=args.batch_size)
     # 抽样在消费 records 时才真正读文件；random/proportional 的第一遍计数也发生在
     # 这里，不改变 --chunk-size 的分批边界，因此同一 seed 的选中结果与批次大小无关。
-    selection = limit_sampler.select_records(
-        source,
-        limit=args.limit,
-        mode=args.limit_mode,
-        seed=args.seed,
-        corpus_type=args.corpus_type,
-    ) if args.limit is not None else None
+    if args.limit_mode == "aligned":
+        selection = limit_sampler.select_aligned_records(
+            source,
+            reference_file=args.reference_file,
+            limit=args.limit,
+            corpus_type=args.corpus_type,
+        )
+    else:
+        selection = limit_sampler.select_records(
+            source,
+            limit=args.limit,
+            mode=args.limit_mode,
+            seed=args.seed,
+            corpus_type=args.corpus_type,
+        ) if args.limit is not None else None
     # 本地小模型（api_keys.json 里该模型带 local_service 块）在启动时拉起服务，
     # 退出（含异常/Ctrl-C）时关闭；远程模型或 --no-llm 时是空上下文。
     with local_model_service.for_model(
@@ -276,17 +303,25 @@ def main(argv=None):
     print(f"句对输出：{output}；统计：{dict(preparer.counts)}")
     limit_stats = selection.stats if selection is not None else None
     if limit_stats is not None:
+        limit_text = "全部" if limit_stats["limit"] is None else limit_stats["limit"]
         print(
-            f"限制抽样：模式={limit_stats['mode']} 上限={limit_stats['limit']} "
+            f"限制抽样：模式={limit_stats['mode']} 上限={limit_text} "
             f"候选={limit_stats['candidates']} 选中={limit_stats['selected']} "
             f"种子={limit_stats['seed']}"
         )
+        if limit_stats.get("mode") == "aligned":
+            print(
+                f"参考文件：{limit_stats.get('reference_file')} "
+                f"reference 记录={limit_stats.get('reference_records')} "
+                f"已对齐={limit_stats.get('matched_reference_records')} "
+                f"源记录={limit_stats.get('matched_source_records')}"
+            )
         if limit_stats["skipped_no_word"]:
             print(
                 f"注意：{limit_stats['skipped_no_word']} 条可用记录取不到本类关注词，"
                 "未进入比例抽样池"
             )
-        if limit_stats["selected"] < limit_stats["limit"]:
+        if limit_stats["limit"] is not None and limit_stats["selected"] < limit_stats["limit"]:
             print(
                 f"注意：可用量不足，实际只选中 {limit_stats['selected']} 条"
                 f"（上限 {limit_stats['limit']} 条）"
