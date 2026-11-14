@@ -24,7 +24,7 @@ model_config/api_keys.json
 /filtered_sentences.csv
 /note.txt
 /项目审查与改进建议.md
-/analyze_tools/
+# /analyze_tools/
 /analyze_results/
 
 # 仅提交部署迁移说明，其余本地文档（含实施计划）不提交
