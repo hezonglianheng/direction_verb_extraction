@@ -1,19 +1,18 @@
 # encoding: utf8
 
-"""同义判断评测入口：读取 annotate/ 结果 → 逐模型重判 → 汇总报告。
+"""五档同义判断评测：以 annotate/ 既有标注为参考，逐模型独立报告。
 
-与 annotate 的区别：这里不再跑特征/图式/查表，只把「原句 + 改写句」交给待测
-模型，判断两句是否同义，再与输入文件里的既有标注比较。输入既可以是单模型
-annotate 输出，也可以是多模型投票输出（``voting_label``）。
+step 0：直接同义判断（默认）；1/2：一次完整标注，禁用/启用查表；
+3/4：特征、图式、判定分步标注，禁用/启用查表。默认语料类型为方位词，
+趋向动词须显式指定 --corpus-type direction，不从文件名推断。
 
 用法：
 
-    python evaluate --corpus results/direction_annotated.jsonl --models deepseek-flash
-    python evaluate --corpus results/direction_annotated.jsonl --models deepseek-flash qwen3.8-max --workers 8
-    python evaluate --corpus results/direction_annotated.jsonl --models deepseek-flash --print-prompt
-    python evaluate --corpus results/location_annotated.jsonl --models deepseek-flash --batch off
+    python evaluate --step 0 --corpus results/location_annotated.jsonl --models deepseek-flash
+    python evaluate --step 3 --corpus results/direction_annotated.jsonl --corpus-type direction --models deepseek-flash qwen3.8-max
+    python -m evaluate --step 4 --corpus results/location_annotated.jsonl --print-prompt
 
-每个模型独立写 ``results/evaluate/<模型名>_<YYYYMMDDTHHMMSSZ>.json``；
+每个模型独立写 ``results/evaluate/<模型名>_step<N>_<YYYYMMDDTHHMMSSZ>.json``；
 时间戳为 UTC（ISO 8601 基本格式，精确到秒），同一天可多次运行。默认另写同名
 ``.details.jsonl`` 逐条预测（``--no-details`` 可关）。模型之间并行、单模型内部
 按 ``--workers`` 并发；``--batch auto/native/off`` 与 annotate 同一套语义。
@@ -42,15 +41,11 @@ from typing import Iterable
 
 import config
 import file_paths
-from annotate.voting import safe_model_stem
 from evaluate import data, metrics
 from evaluate.inference import (
-    DEFAULT_PROMPT_DIR,
     ModelSpec,
-    Prompts,
-    load_prompts,
+    cache_sidecar_paths,
     redact_url,
-    render_messages,
     run_model,
     sanitize_exception,
     sanitize_text,
@@ -58,7 +53,7 @@ from evaluate.inference import (
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUT_DIR = _PROJECT_ROOT / "results" / "evaluate"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 REFERENCE_POLICY = (
     "单模型记录取 judgement.same_meaning（必须是真正的 bool）；"
     "多模型投票记录仅在 voting.status=accepted 时取顶层 voting_label 的 same/different；"
@@ -102,6 +97,16 @@ def _positive_int(value: str) -> int:
     if parsed < 1:
         raise argparse.ArgumentTypeError("必须 >= 1")
     return parsed
+
+
+def _corpus_type(value: str) -> str:
+    # 只在 argparse 返回后调用，--corpus-type 出现在 --help 前也不会加载标注/LTP 依赖。
+    from annotate.spatial_tools import normalize_corpus_type
+
+    try:
+        return normalize_corpus_type(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
 
 
 def add_batch_args(parser: argparse.ArgumentParser) -> None:
@@ -151,7 +156,7 @@ def add_batch_args(parser: argparse.ArgumentParser) -> None:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="同义判断评测：用 annotate/ 的既有标注作参考，评测一个或多个模型",
+        description="五档同义判断评测：用 annotate/ 的既有标注作参考，逐模型独立报告",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__.split("用法：")[-1],
     )
@@ -170,6 +175,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="模型",
         default=None,
         help="待测模型配置名（model_config/api_keys.json 里的键），可给多个分别评测",
+    )
+    parser.add_argument(
+        "--step", type=int, choices=(0, 1, 2, 3, 4), default=0,
+        help="0=直接同义判断（默认）；1/2=一次完整标注（禁用/启用查表）；"
+             "3/4=分步特征/图式/判定（禁用/启用查表）",
+    )
+    parser.add_argument(
+        "--corpus-type", default="方位词", metavar="类型",
+        help="默认方位词（localization/location/loc）；趋向动词须显式指定 "
+             "direction/dir/direction_verb；不按文件名推断",
     )
     parser.add_argument("--workers", type=_positive_int, default=config.EVALUATE_WORKERS,
                         help=f"单个模型内部的并发数（默认 {config.EVALUATE_WORKERS}）")
@@ -191,12 +206,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=True,
         help="是否另写同名 .details.jsonl 逐条预测（默认写；--no-details 关闭）",
     )
-    parser.add_argument("--prompt-dir", default=None,
-                        help=f"提示词目录（默认 {DEFAULT_PROMPT_DIR}）")
+    parser.add_argument("--prompt-dir", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--print-prompt", action="store_true",
-                        help="只渲染并打印一份 system/user 提示词，不调用模型、不写文件")
+                        help="离线打印本 step 的 agent 提示语与可渲染消息；"
+                             "下游动态依赖只作说明，不读模型配置、不调用模型、不写文件")
     add_batch_args(parser)
     args = parser.parse_args(argv)
+    if args.prompt_dir is not None:
+        parser.error("--prompt-dir 已停用：五档评测复用 annotate 的 agent 提示语/配置；"
+                     "请用 --step、--corpus-type 和 --print-prompt 检查，不再加载旧 evaluate 模板")
     if not args.print_prompt and not args.models:
         parser.error("--models 至少需要一个模型；只有 --print-prompt 时可以省略")
     if args.batch_resume and not args.batch_cache:
@@ -204,6 +222,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "--batch-resume 必须显式指定 --batch-cache 的旧缓存路径；"
             "每次运行生成新时间戳，不能用新默认缓存代替续跑"
         )
+    try:
+        args.corpus_type = _corpus_type(args.corpus_type)
+    except argparse.ArgumentTypeError as exc:
+        parser.error(str(exc))
     return args
 
 
@@ -285,6 +307,8 @@ def model_info(spec: ModelSpec, *, batch_mode: str) -> dict:
 
 
 def _build_plans(models: list[str], out_dir: Path, args: argparse.Namespace, run_timestamp: str) -> list[ModelPlan]:
+    from annotate.voting import safe_model_stem
+
     stems: dict[str, str] = {}
     plans = []
     multi_model = len(models) > 1
@@ -297,7 +321,7 @@ def _build_plans(models: list[str], out_dir: Path, args: argparse.Namespace, run
                 "会写同一个报告文件；请改用可区分的配置名"
             )
         stems[collision_key] = model
-        report_path = out_dir / f"{stem}_{run_timestamp}.json"
+        report_path = out_dir / f"{stem}_step{args.step}_{run_timestamp}.json"
         details_path = report_path.with_suffix(".details.jsonl") if args.details else None
         cache_path = None
         if args.batch != "off":
@@ -319,7 +343,8 @@ def _outputs(plans: list[ModelPlan]) -> tuple[list[Path], list[Path]]:
         if plan.details_path is not None:
             outputs.append(plan.details_path)
         if plan.cache_path is not None:
-            sidecars.extend(file_paths.sidecar_paths(plan.cache_path))
+            sidecars.extend(cache_sidecar_paths(plan.cache_path))
+            sidecars.append(Path(f"{plan.cache_path}.lock"))
     return outputs, sidecars
 
 
@@ -426,36 +451,45 @@ def _select(dataset: data.Dataset, offset: int, limit: int | None) -> tuple[list
 
 
 def _prediction_for(outcome, sample: data.EvalSample) -> dict:
-    if outcome is None:
+    def missing(message: str, kind: str) -> dict:
         return {
-            "same_meaning": None,
-            "label": None,
-            "reason": "",
-            "error": "模型未运行",
-            "error_kind": "model_error",
+            "same_meaning": None, "label": None, "reason": "", "source": "error",
+            "error": message, "error_kind": kind, "features": {}, "schema": {}, "history": [],
         }
+
+    if outcome is None:
+        return missing("模型未运行", "model_error")
     request = outcome.plan.sample_to_request.get(sample.key)
     if request is None:
-        return {
-            "same_meaning": None,
-            "label": None,
-            "reason": "",
-            "error": "没有为该样本生成请求",
-            "error_kind": "missing_result",
-        }
-    return outcome.predictions.get(request) or {
-        "same_meaning": None,
-        "label": None,
-        "reason": "",
-        "error": "没有收到该请求的结果",
-        "error_kind": "missing_result",
+        return missing("没有为该样本生成请求", "missing_result")
+    return outcome.predictions.get(request) or missing("没有收到该请求的结果", "missing_result")
+
+
+def _route_metadata(step: int, corpus_type: str, pipeline: dict | None) -> dict:
+    """优先报告实际执行元数据；启动失败时仍注明请求的档位，不伪造 provenance。"""
+    metadata = pipeline or {}
+    return {
+        "step": metadata.get("step", step),
+        "mode": metadata.get("graph", "synonym" if step == 0 else "all_in_one" if step < 3 else "pair"),
+        "allow_lookup": metadata.get("allow_lookup", step in (2, 4)),
+        "corpus_type": metadata.get("corpus_type", corpus_type),
     }
+
+
+def _sanitize_export(value, cfg: dict):
+    """入口错误、统计与逐条中间结果均按相同文本规则递归脱敏。"""
+    if isinstance(value, str):
+        return sanitize_text(value, cfg)
+    if isinstance(value, dict):
+        return {key: _sanitize_export(item, cfg) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_export(item, cfg) for item in value]
+    return value
 
 
 def _build_report(
     spec: ModelSpec,
     plan: ModelPlan,
-    prompts: Prompts,
     input_info: list[dict],
     dataset: data.Dataset,
     selected: list[data.EvalSample],
@@ -463,6 +497,8 @@ def _build_report(
     outcome,
     error: str | None,
     *,
+    step: int,
+    corpus_type: str,
     batch_mode: str,
     started_at: str,
     finished_at: str,
@@ -498,26 +534,19 @@ def _build_report(
     else:
         run_status = "failed"
 
-    batch_summary = None
-    if outcome is not None and outcome.batch:
-        batch_summary = dict(outcome.batch)
-        for key, value in list(batch_summary.items()):
-            if isinstance(value, str):
-                batch_summary[key] = sanitize_text(value, spec.cfg)
-        if batch_summary.get("endpoint"):
-            batch_summary["endpoint"] = redact_url(batch_summary["endpoint"])
+    pipeline = outcome.pipeline if outcome is not None else None
+    prediction_sources = Counter(item.get("source") or "unknown" for item in predictions.values())
 
-    return {
+    return _sanitize_export({
         "schema_version": SCHEMA_VERSION,
+        **_route_metadata(step, corpus_type, pipeline),
         "run_status": run_status,
         "model": model_info(spec, batch_mode=batch_mode),
         "input": input_info,
-        "prompts": {
-            "system": prompts.system_path,
-            "user": prompts.user_path,
-            "system_sha256": prompts.system_sha256,
-            "user_sha256": prompts.user_sha256,
-        },
+        "pipeline": pipeline,
+        "prompts": ((pipeline or {}).get("provenance") or {}).get("agents", {}),
+        "agent_stats": outcome.agent_stats if outcome is not None else {},
+        "prediction_sources": dict(prediction_sources.most_common()),
         "selection": selection,
         "counts": {
             "records_read": dataset.records_read,
@@ -537,7 +566,7 @@ def _build_report(
         },
         "metrics": metric_block,
         "failures_by_reason": dict(failure_reasons.most_common()),
-        "batch": batch_summary,
+        "batch": outcome.batch if outcome is not None else None,
         "batch_error": outcome.batch_error if outcome is not None else None,
         "sync_retries": outcome.sync_retries if outcome is not None else 0,
         "model_elapsed_seconds": outcome.elapsed_seconds if outcome is not None else None,
@@ -553,13 +582,14 @@ def _build_report(
         },
         "evaluation_note": EVALUATION_NOTE,
         "error": error,
-    }
+    }, spec.cfg)
 
 
-def _detail_record(sample: data.EvalSample, prediction: dict) -> dict:
+def _detail_record(sample: data.EvalSample, prediction: dict, *, route: dict) -> dict:
     label = prediction.get("label")
     correct = None if label is None else label == sample.reference_label
     return {
+        **route,
         "input_file": sample.input_file,
         "input_line_no": sample.input_line_no,
         "id": sample.record_id,
@@ -575,6 +605,11 @@ def _detail_record(sample: data.EvalSample, prediction: dict) -> dict:
         "annotation_status": sample.annotation_status,
         "voting_status": sample.voting_status,
         "prediction": label,
+        "same_meaning": prediction.get("same_meaning"),
+        "source": prediction.get("source") or "unknown",
+        "features": prediction.get("features") or {},
+        "schema": prediction.get("schema") or {},
+        "history": prediction.get("history") or [],
         "correct": correct,
         "status": "ok" if label else "error",
         "reason": prediction.get("reason") or "",
@@ -597,7 +632,6 @@ def _write_report(path: Path, report: dict) -> None:
 def _run_one(
     spec: ModelSpec,
     plan: ModelPlan,
-    prompts: Prompts,
     input_info: list[dict],
     dataset: data.Dataset,
     selected: list[data.EvalSample],
@@ -605,7 +639,7 @@ def _run_one(
     args: argparse.Namespace,
 ) -> RunResult:
     def log(message: str) -> None:
-        print(f"[{spec.key}] {message}", flush=True)
+        print(f"[{spec.key}] {sanitize_text(message, spec.cfg)}", flush=True)
 
     started_wall = time.time()
     started_at = datetime.now().astimezone().isoformat(timespec="seconds")
@@ -616,7 +650,8 @@ def _run_one(
         return run_model(
             spec,
             selected,
-            prompts,
+            step=args.step,
+            corpus_type=args.corpus_type,
             workers=args.workers,
             batch_mode=args.batch,
             cache_path=plan.cache_path,
@@ -643,17 +678,20 @@ def _run_one(
         log(f"失败：{error[:300]}")
 
     finished_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    pipeline = outcome.pipeline if outcome is not None else None
+    route = _route_metadata(args.step, args.corpus_type, pipeline)
     try:
         report = _build_report(
             spec,
             plan,
-            prompts,
             input_info,
             dataset,
             selected,
             selection,
             outcome,
             error,
+            step=args.step,
+            corpus_type=args.corpus_type,
             batch_mode=args.batch,
             started_at=started_at,
             finished_at=finished_at,
@@ -663,31 +701,30 @@ def _run_one(
         error = error or sanitize_exception(exc, spec.cfg)
         report = {
             "schema_version": SCHEMA_VERSION,
+            **route,
             "run_status": "error",
             "model": {"config_key": spec.key},
             "input": input_info,
-            "prompts": {
-                "system": prompts.system_path,
-                "user": prompts.user_path,
-                "system_sha256": prompts.system_sha256,
-                "user_sha256": prompts.user_sha256,
-            },
+            "pipeline": pipeline,
+            "prompts": ((pipeline or {}).get("provenance") or {}).get("agents", {}),
+            "agent_stats": outcome.agent_stats if outcome is not None else {},
+            "prediction_sources": {},
             "selection": selection,
             "counts": {"selected": len(selected)},
             "metrics": None,
             "outputs": {
                 "report": str(plan.report_path),
-                "details": None,
+                "details": str(plan.details_path) if plan.details_path is not None else None,
                 "batch_cache": str(plan.cache_path) if plan.cache_path is not None else None,
             },
             "evaluation_note": EVALUATION_NOTE,
             "error": error,
         }
 
-    if outcome is not None and plan.details_path is not None:
+    if plan.details_path is not None:
         try:
             records = [
-                _detail_record(sample, _prediction_for(outcome, sample))
+                _sanitize_export(_detail_record(sample, _prediction_for(outcome, sample), route=route), spec.cfg)
                 for sample in selected
             ]
             _write_details(plan.details_path, records)
@@ -699,6 +736,7 @@ def _run_one(
             log(f"明细写出失败：{report['error'][:300]}")
 
     try:
+        report = _sanitize_export(report, spec.cfg)
         _write_report(plan.report_path, report)
     except Exception as exc:  # noqa: BLE001
         error = sanitize_exception(exc, spec.cfg)
@@ -713,9 +751,44 @@ def print_numbered(title: str, text: str) -> None:
         print(f"{index:>4}| {line}")
 
 
+def _print_prompt(args: argparse.Namespace, sample: data.EvalSample) -> None:
+    from evaluate.annotation import build_pipeline
+
+    pipeline = build_pipeline(
+        args.step, (args.models or ["preview"])[0], args.corpus_type, llm=False)
+    state = pipeline.initial_state(sample)
+    print_numbered("pipeline metadata（离线预览，不执行标注）",
+                   json.dumps(pipeline.metadata(), ensure_ascii=False, indent=2))
+    for name, agent in pipeline.agents.items():
+        print_numbered(f"{name} system prompt", agent.system_prompt)
+        print_numbered(f"{name} 提示语/配置路径", json.dumps({
+            "templates": agent.prompt_paths,
+            "config": getattr(agent, "table_paths", None) or getattr(agent, "table_path", ""),
+        }, ensure_ascii=False, indent=2))
+        if name in ("synonym", "all_in_one"):
+            content = agent._content(
+                state["sentence_a"], state["sentence_b"], state["focus_word"], state["focus_word_b"])
+            print_numbered(f"{name} user message（输入第 {sample.input_line_no} 行）", content)
+        elif name == "feature":
+            for side, focus_key in (("a", "focus_word"), ("b", "focus_word_b")):
+                print_numbered(f"feature user message（{side} 侧）",
+                               agent._content(state[f"sentence_{side}"], state[focus_key]))
+        elif name == "schema":
+            print_numbered("schema 动态依赖",
+                           "两侧 user message 依赖本次 feature 生成的真实语义特征；"
+                           "按本侧关注词选择示例和图式候选。离线预览不构造上游输出，不渲染此消息。"
+                           + ("启用查表，命中时不调用模型。" if pipeline.allow_lookup
+                              else "禁用特征匹配查表，采用模型结论并校验。"))
+        elif name == "judge":
+            print_numbered("judge 动态依赖",
+                           "user message 依赖两侧真实 feature/schema 结果，示例按生成的图式对动态选择。"
+                           "离线预览不构造上游输出，不渲染此消息。"
+                           + ("启用判定查表，命中时不调用模型。" if pipeline.allow_lookup
+                              else "禁用判定查表，采用模型结论并校验。"))
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    prompts = load_prompts(args.prompt_dir)
 
     if args.print_prompt:
         input_files = file_paths.collect_jsonl_inputs(args.corpus)
@@ -723,10 +796,7 @@ def main(argv: list[str] | None = None) -> int:
         selected, _ = _select(dataset, args.offset, args.limit)
         if not selected:
             raise ValueError("没有可评测样本（参考标签、句对或筛选条件不满足），无法预览提示词")
-        sample = selected[0]
-        system, user = render_messages(sample, prompts)
-        print_numbered("system prompt", system)
-        print_numbered(f"user message（输入第 {sample.input_line_no} 行）", user)
+        _print_prompt(args, selected[0])
         return 0
 
     models = _dedupe(args.models or [])
@@ -762,12 +832,12 @@ def main(argv: list[str] | None = None) -> int:
     results: list[RunResult] = []
     if model_workers <= 1:
         for spec, plan in zip(specs, plans):
-            results.append(_run_one(spec, plan, prompts, input_info, dataset, selected, selection, args))
+            results.append(_run_one(spec, plan, input_info, dataset, selected, selection, args))
     else:
         with ThreadPoolExecutor(max_workers=model_workers) as pool:
             futures = {
                 pool.submit(
-                    _run_one, spec, plan, prompts, input_info, dataset, selected, selection, args
+                    _run_one, spec, plan, input_info, dataset, selected, selection, args
                 ): (spec, plan)
                 for spec, plan in zip(specs, plans)
             }

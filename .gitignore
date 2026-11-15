@@ -10,6 +10,9 @@ results/
 log/
 nohup.out
 
+# 重写前 evaluate 的本地只读备份；新 evaluate/ 仍由 Git 管理
+/evaluate_legacy/
+
 # 敏感文件
 model_config/api_keys.json
 
