@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 # encoding: utf8
 
-"""对比多个方位词筛选结果，输出两两 CSV 与总体一致性矩阵。
+"""对比 extract 模块的方位词筛选结果，输出两两 CSV 与总体一致性矩阵。
+
+只支持 extract 原句；replace 句对请使用
+``analyze_tools/replace/compare_replace_pairs.py``，本脚本会拒绝句对 JSONL。
 
 比较对象是 ``results/extract_result`` 下同名的
 ``location_corpus_with_locative_split_*.screening_verdicts.csv``（或原始 ``.jsonl``）。
@@ -31,19 +34,19 @@
 用法::
 
     # 不传参数：自动发现 results/extract_result 下全部筛选 CSV
-    .venv/bin/python analyze_tools/compare_screening_verdicts.py
+    .venv/bin/python analyze_tools/extract/compare_extract_verdicts.py
 
     # 只比较最新两份 CSV
-    .venv/bin/python analyze_tools/compare_screening_verdicts.py --latest 2
+    .venv/bin/python analyze_tools/extract/compare_extract_verdicts.py --latest 2
 
     # 显式指定多个 CSV / JSONL
-    .venv/bin/python analyze_tools/compare_screening_verdicts.py \
+    .venv/bin/python analyze_tools/extract/compare_extract_verdicts.py \
         results/extract_result/location_corpus_with_locative_split_20261029.screening_verdicts.csv \
         results/extract_result/location_corpus_with_locative_split_20261031.screening_verdicts.csv \
         results/extract_result/location_corpus_with_locative_split_20261103.screening_verdicts.csv
 
     # 指定输出目录（必须尚不存在）
-    .venv/bin/python analyze_tools/compare_screening_verdicts.py \
+    .venv/bin/python analyze_tools/extract/compare_extract_verdicts.py \
         --output-dir /tmp/verdict_comparison
 """
 
@@ -64,7 +67,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
-ROOT_DIR = Path(__file__).resolve().parents[1]
+ROOT_DIR = Path(__file__).resolve().parents[2]
 RESULTS_DIR = ROOT_DIR / "results" / "extract_result"
 ANALYZE_RESULTS_DIR = ROOT_DIR / "analyze_results"
 CSV_GLOB = "location_corpus_with_locative_split_*.screening_verdicts.csv"
@@ -568,6 +571,11 @@ def read_csv_rows(
 def _jsonl_verdict_rows(
     record: dict[str, Any], line_no: int, source: Path
 ) -> Iterator[VerdictRow]:
+    if "pair_schema_version" in record or "pair_screening" in record:
+        raise ValueError(
+            f"{source} 第 {line_no} 行是 replace 句对，不能按 extract 原句比较；"
+            "请使用 analyze_tools/replace/compare_replace_pairs.py"
+        )
     screening = record.get("screening")
     if not isinstance(screening, dict):
         return
@@ -1181,7 +1189,7 @@ def format_overall_markdown(
     files: Sequence[LoadedFile], summaries: Sequence[PairSummary]
 ) -> str:
     lines = [
-        "# 方位词筛选结果总体对比",
+        "# extract 方位词筛选结果总体对比",
         "",
         "## 输入文件",
         "",
@@ -1350,7 +1358,7 @@ def load_rows(
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="对比多个方位词筛选结果，输出两两 CSV 和总体一致性矩阵",
+        description="对比 extract 原句的筛选判定，输出两两 CSV 和一致性矩阵（不支持 replace）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__.split("用法:")[-1],
     )

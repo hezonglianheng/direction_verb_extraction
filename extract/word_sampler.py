@@ -70,8 +70,8 @@ CORPUS_SPECS: dict[str, tuple[str, tuple[str, ...] | None]] = {
     # 方位词语料的三条规则各自用 _vocab_file 指向 localization_vocab.json5，取顶层规则自己的词表即可。
     # 趋向动词语料则要挑出 direction_verb_ 前缀的那些键：accompany_/cause_/manner_ 三类顶层规则的
     # 词表是搭配动词（搬/带/插/凑…），混进来就会把搭配动词当成目标词。
-    "direction_corpus.jsonl": ("config_files/direction_expressions.json5", ("direction_verb_",)),
-    "location_corpus.jsonl": ("config_files/localization_expressions.json5", None),
+    "direction_corpus.jsonl": ("config_files/direction/direction_expressions.json5", ("direction_verb_",)),
+    "location_corpus.jsonl": ("config_files/localization/localization_expressions.json5", None),
 }
 """已知语料与其目标词表的来源。命中不了时要在命令行显式给 --vocab，不做猜测。"""
 

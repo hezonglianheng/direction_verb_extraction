@@ -54,7 +54,7 @@ from annotate import spatial_tools, spatial_runner, all_in_one
 
 本次另追加取消跟踪提交，排除非运行必需内容：`extract/temp.py`、`.docs/plans/2026-11-02-stage-layout.md`、`tests/`、`filter_sentence/`、`filtered_sentences.csv`、`note.txt` 和 `项目审查与改进建议.md`。本地副本保留供后续开发，并通过定向忽略规则防止再次被批量加入；服务器更新后不能依赖这些文件。
 
-运行所需的三个阶段包、共享基础模块、`annotate/prompt_examples.py`、`replace/corpus_pairs.py`、`replace/sentence_replace.py`、`system_prompt/judgement_criteria.txt` 和四个示例 JSON5 均继续跟踪。不要把运行时提示示例误当作本地语料样例删除，也不要忽略所有 CSV，配置目录中的判定表仍是运行依赖。
+运行所需的三个阶段包、共享基础模块、`annotate/prompt_examples.py`、`replace/corpus_pairs.py`、`replace/sentence_replace.py`、`system_prompt/extract/judgement_criteria.txt` 和六个示例 JSON5 均继续跟踪。不要把运行时提示示例误当作本地语料样例删除，也不要忽略所有 CSV，配置目录中的判定表仍是运行依赖。
 
 这是追加删除提交，不改写已有历史，因此上述文件仍可能出现在先前提交中。忽略文件不受 Git 跟踪，也不会进入 `git stash -u`；后续开发前应另行备份或有选择地提交到开发分支，勿用 `git clean -fdx` 清理它们。
 
@@ -62,10 +62,10 @@ from annotate import spatial_tools, spatial_runner, all_in_one
 
 当前可随运行代码发布的维护索引是 [`system_prompt/README.md`](../system_prompt/README.md)。三条正式链路只读取合格句对，不在标注中重新筛选：
 
-- pair 的主提示词为 `system_prompt/annotate_pair_feature_flat.txt`（默认）、`annotate_pair_feature_deep.txt`（可选 deep）、`annotate_pair_feature_unfilled.txt`（类别表未填）、`annotate_pair_schema.txt` 与 `annotate_pair_judgement.txt`。
-- synonym 独立读取 `system_prompt/annotate_synonym_judgement.txt`，不读特征、图式或判定表。
-- all_in_one 读取 `system_prompt/annotate_all_in_one.txt`，单次完成特征、图式及同义判断，后置查表仍优先；不再注入筛选判据。
-- `annotate_shared_feature_class.txt`、`annotate_shared_feature_usage_deep.txt`、`annotate_shared_feature_usage_flat.txt` 是共享类别片段；single 诊断复用 pair 的特征和图式资源。四个 `system_prompt/examples/*.json5` 仍按步骤/词性共享，不按链路复制。
+- pair 的主提示词为 `system_prompt/annotate/pair/annotate_pair_feature_flat.txt`（默认）、`annotate_pair_feature_deep.txt`（可选 deep）、`annotate_pair_feature_unfilled.txt`（类别表未填）、`annotate_pair_schema.txt` 与 `annotate_pair_judgement.txt`。
+- synonym 独立读取 `system_prompt/annotate/synonym/annotate_synonym_judgement.txt`，不读特征、图式或判定表。
+- all_in_one 读取 `system_prompt/annotate/all_in_one/annotate_all_in_one.txt`，单次完成特征、图式及同义判断，后置查表仍优先；不再注入筛选判据。
+- `annotate_shared_feature_class.txt`、`annotate_shared_feature_usage_deep.txt`、`annotate_shared_feature_usage_flat.txt` 是共享类别片段；single 诊断复用 pair 的特征和图式资源。四个 `system_prompt/annotate/examples/*.json5` 仍按步骤/词性共享，不按链路复制。
 
 部署时必须同步十项资源重命名、代码引用和旧名删除，不能把新旧提示词双份保留。筛选用的 `screen_*.txt`、`judgement_criteria.txt`、`semantic.txt` 及 `config_files/<词性目录>/reality.txt` 不在此次重命名范围。纯文件名变化不改变 agent 名和渲染消息，因此不应主动清空已有内容缓存。
 
@@ -74,11 +74,12 @@ from annotate import spatial_tools, spatial_runner, all_in_one
 ## 单阶段调用
 
 ```sh
-python extract raw.jsonl -f config_files/localization_expressions.json5 -t results -o location_corpus
+python extract raw.jsonl -f config_files/localization/localization_expressions.json5 -t results -o location_corpus
 python replace --corpus results/location_corpus.jsonl --corpus-type 方位词 --out-file results/location_pairs.jsonl
 python annotate --graph pair --corpus results/location_pairs.jsonl --corpus-type 方位词 --out-file results/location_annotated.jsonl --limit 100
 python annotate --graph synonym --corpus results/location_pairs.jsonl --corpus-type 方位词 --out-file results/location_synonym.jsonl --limit 100
 python annotate --graph all_in_one --corpus results/location_pairs.jsonl --corpus-type 方位词 --out-file results/location_all_in_one.jsonl --limit 1
+python annotate --graph pair --corpus results/location_pairs.jsonl --corpus-type 方位词 --reference-file results/location_annotated.jsonl --out-file results/location_rerun.jsonl
 ```
 
 独立提取入口仍要求 `-t` 目录已存在，且保留原有允许重写提取结果的行为。替换和标注默认拒绝覆盖已有结果，需要 `--overwrite`。正式标注只读取两侧检查均合格的句对，不在标注时补做替换/检查。`--no-llm` 不会把未经检查的句对变成合格数据。
@@ -94,7 +95,7 @@ python annotate --graph all_in_one --corpus results/location_pairs.jsonl --corpu
 | 显式覆盖补发 | `--allow-retry` / `--no-allow-retry` | 同左 | 同左 |
 | 传输重试/超时/退避 | 按模型配置 | 按模型配置 | 按模型配置 |
 
-共同参数还包括 `--model` / `--models`、`--workers` / `--model-workers`、`--offset`、`--max-requests` / `--batch-max-requests`、`--batch auto|native|off`（默认 auto）、`--batch-cache` / `--batch-resume`、`--no-pairs-csv`、`--overwrite`。all_in_one 现支持 `--models`；投票沿用完整代表记录，不跨模型拼接特征或图式，平票/缺票转复核。同步 `requests` 为逻辑调用，`actual_requests` 为观测到的同步模型开始，原生 Batch 项数/批次数另计，旧 `pair_llm_calls` 不代表真实请求数。
+共同参数还包括 `--model` / `--models`、`--workers` / `--model-workers`、`--offset`、`--limit-mode sequential|random|proportional|aligned`、`--seed`、`--reference-file`、`--max-requests` / `--batch-max-requests`、`--batch auto|native|off`（默认 auto）、`--batch-cache` / `--batch-resume`、`--no-pairs-csv`、`--overwrite`。`random`/`proportional` 需要显式 `--limit` 与 `--seed` 才可复现；`proportional` 按无向关注词对分层（`上-下` 与 `下-上` 同层）；`aligned` 用 `--reference-file` 读取一份 annotate 结果文件中的全部句对，省略 `--limit` 时不受图默认值截断。三种抽样模式流式读取，`aligned` 只为 reference 句对身份保留索引。all_in_one 现支持 `--models`；投票沿用完整代表记录，不跨模型拼接特征或图式，平票/缺票转复核。同步 `requests` 为逻辑调用，`actual_requests` 为观测到的同步模型开始，原生 Batch 项数/批次数另计，旧 `pair_llm_calls` 不代表真实请求数。
 
 `python -m annotate` 与目录命令等价；旧 `--engine staged`（默认 pair）、`--engine all-in-one` 及 `python -m annotate.all_in_one` 仍有效，all-in-one 旧入口只是共同 runner 的转发层。显式冲突的 engine/graph 及重复的不同 graph/engine 选择会报错，重复相同值允许。`--feature-deep` 仅用于 pair/single，在 all_in_one 报错；正式标注拒绝 `--alter-rules`，应传给 replace。旧 `--all-candidates`、`--no-syntax`、正式图中的 `--batch-inference` 只兼容并提示，不再展开候选或准备句法。
 
@@ -136,7 +137,7 @@ python pipeline.py --from-stage annotate --to-stage annotate --pairs results/loc
 python pipeline.py --source raw.jsonl --corpus-type 方位词 --dry-run
 ```
 
-默认：方位词使用 `results/location_corpus.jsonl`、`location_pairs.jsonl`、`location_annotated.jsonl`；趋向动词使用相应 `direction_*` 文件，规则也自动选 `config_files/direction_expressions.json5`。传 `--filter-config` 可覆盖提取规则；请确保其研究词性与 `--corpus-type` 一致，程序不猜测自定义规则的词性。
+默认：方位词使用 `results/location_corpus.jsonl`、`location_pairs.jsonl`、`location_annotated.jsonl`；趋向动词使用相应 `direction_*` 文件，规则也自动选 `config_files/direction/direction_expressions.json5`。传 `--filter-config` 可覆盖提取规则；请确保其研究词性与 `--corpus-type` 一致，程序不猜测自定义规则的词性。
 
 使用 `--extracted`、`--pairs`、`--output` 指定各阶段 JSONL 路径。路径按调用时的当前目录解析，内部资源始终按项目根解析。驱动在预检通过后创建提取输出目录，其余目录由原阶段创建。文件名须以小写 `.jsonl` 结尾（不接受 `.JSONL`，避免旧提取器再次追加后缀）。
 

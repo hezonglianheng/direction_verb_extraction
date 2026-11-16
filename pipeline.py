@@ -3,6 +3,7 @@
 import argparse
 import json
 import math
+import re
 import shlex
 import subprocess
 import sys
@@ -11,6 +12,7 @@ from pathlib import Path
 from file_paths import collect_jsonl_inputs, validate_output_paths, resolve_cache_path, same_file_path, sidecar_paths
 from annotate.cli_args import ConsistentSelection, resolve_graph_selection
 from annotate.voting import model_output_paths
+from filter_funcs import LIMIT_MODES
 
 
 ROOT = Path(__file__).resolve().parent
@@ -75,6 +77,9 @@ ANNOTATE_FIELDS = {
     "max_requests": {"kind": "extra_value", "type": "int"},
     "batch_max_requests": {"kind": "extra_value", "type": "int"},
     "limit": {"kind": "extra_value", "type": "int"},
+    "limit_mode": {"kind": "extra_value", "type": "choice", "choices": LIMIT_MODES},
+    "seed": {"kind": "extra_value", "type": "int"},
+    "reference_file": {"kind": "extra_value", "type": "path", "input": True},
     "offset": {"kind": "extra_value", "type": "int"},
     "model": {"kind": "extra_value", "type": "model"},
     "models": {"kind": "extra_nargs", "type": "models"},
@@ -143,7 +148,10 @@ def _extra_args(value: str, stage: str) -> list[str]:
     }
     # Legacy CLIs accept long-option abbreviations. Any option used by path
     # planning must be spelled in full here, or the child could bypass preflight.
-    planned = {"--batch-cache", "--batch", "--models", "--model", "--no-llm", "--no-pairs-csv", "--batch-resume", "--graph"}
+    planned = {
+        "--batch-cache", "--batch", "--models", "--model", "--no-llm", "--no-pairs-csv",
+        "--batch-resume", "--graph", "--reference-file",
+    }
     for token in tokens:
         option = token.split("=", 1)[0]
         if option in reserved or (stage == "extract" and token.startswith(("-t", "-o", "-f")) and not token.startswith("--")):
@@ -157,6 +165,49 @@ def _uses_option(token: str, target: str) -> bool:
     """判断透传 token 是否指向 target，兼容 --opt=value 与 argparse 前缀缩写。"""
     option = token.split("=", 1)[0]
     return option == target or (len(option) > 2 and target.startswith(option))
+
+
+def _option_value(tokens: list[str], target: str) -> str | None:
+    """从透传 token 里取最终生效的 --opt value / --opt=value 值；没给返回 None。
+
+    argparse 对重复的单值参数取**最后一次**；只取首次会把被覆盖的旧值当成
+    实际输入，预检与子命令看到的内容就不一致。缺值时返回 None，交给子命令
+    自己报参数错误；``--opt --next-option`` 中的 ``--next-option`` 视为缺值，
+    不能被当成路径。
+    """
+    value = None
+    for index, token in enumerate(tokens):
+        if token == target:
+            following = tokens[index + 1] if index + 1 < len(tokens) else None
+            value = None if following is None or _looks_like_option(following) else following
+        elif token.startswith(target + "="):
+            value = token.split("=", 1)[1]
+    return value
+
+
+_NEGATIVE_NUMBER = re.compile(r"^-\d+$|^-\d*\.\d+$")
+"""与 argparse ``_negative_number_matcher`` 同口径；两个子命令都没有负数选项。"""
+
+
+def _looks_like_option(token: str) -> bool:
+    """透传 token 是否会被 argparse 当成选项，而不是一个待读取的值。
+
+    argparse 允许没有“负数选项”的解析器把 ``-1`` / ``-1.5`` 当作普通值；
+    预检必须沿用同一规则，否则名为 ``-1`` 的 reference 会被漏掉。
+    """
+    if not token.startswith("-") or token == "-":
+        return False
+    return not _NEGATIVE_NUMBER.fullmatch(token)
+
+
+def _reference_input_path(value: str) -> Path:
+    """透传 --reference-file 的预检路径：与子命令的 ``Path(value)`` 同口径。
+
+    子命令（replace / annotate）只做 ``Path(value)``，不会 ``expanduser()``；
+    预检若自行展开 ``~``，就会检查用户主目录里的文件，而子命令实际读取当前
+    目录下的同名相对路径，留下“预检保护 A、子命令读 B”的覆盖缺口。
+    """
+    return Path(value).resolve()
 
 
 def _load_pipeline_config(value: str) -> tuple[Path, dict]:
@@ -337,6 +388,40 @@ def _convert_stage_config(stage: str, section: dict, config_path: Path, base: Pa
                 f"配置文件 {config_path} 的 annotate.all_candidates/no_syntax 只支持正式图 {FORMAL_GRAPHS}；"
                 f"当前图是 {graph}"
             )
+        if graph not in FORMAL_GRAPHS and any(
+            section.get(key) is not None for key in ("limit_mode", "seed", "reference_file")
+        ):
+            raise ValueError(
+                f"配置文件 {config_path} 的 annotate.limit_mode/seed/reference_file 只支持正式图 {FORMAL_GRAPHS}；"
+                f"当前图是 {graph}"
+            )
+        limit_mode = section.get("limit_mode")
+        if section.get("reference_file") is not None:
+            if limit_mode not in (None, "aligned"):
+                raise ValueError(
+                    f"配置文件 {config_path} 的 annotate.reference_file 只能配合 limit_mode=aligned；"
+                    f"当前是 {limit_mode!r}"
+                )
+            if section.get("seed") is not None:
+                raise ValueError(
+                    f"配置文件 {config_path} 的 annotate.reference_file 不对齐随机过程，不能与 seed 同时设置"
+                )
+        elif limit_mode == "aligned":
+            raise ValueError(
+                f"配置文件 {config_path} 的 annotate.limit_mode=aligned 必须同时设置 reference_file"
+            )
+        limit_value = section.get("limit")
+        if isinstance(limit_value, int) and not isinstance(limit_value, bool) and limit_value <= 0:
+            raise ValueError(f"配置文件 {config_path} 的 annotate.limit 必须是大于 0 的整数")
+        offset_value = section.get("offset")
+        if isinstance(offset_value, int) and not isinstance(offset_value, bool) and offset_value < 0:
+            raise ValueError(f"配置文件 {config_path} 的 annotate.offset 必须是大于等于 0 的整数")
+        if limit_mode in ("sequential", "random", "proportional") and limit_value is None:
+            raise ValueError(
+                f"配置文件 {config_path} 的 annotate.limit_mode={limit_mode} 需要同时设置 limit（X>0）"
+            )
+        if section.get("seed") is not None and limit_value is None:
+            raise ValueError(f"配置文件 {config_path} 的 annotate.seed 只能在设置 limit 时使用")
     return values, extras, inputs
 
 
@@ -485,7 +570,9 @@ def build_commands(args) -> list[tuple[str, list[str]]]:
         inputs = collect_jsonl_inputs(source)
         if not inputs:
             raise ValueError(f"输入目录没有 JSONL 文件：{source}")
-        filter_config = Path(args.filter_config or ROOT / "config_files" / f"{suffix}_expressions.json5").resolve()
+        filter_config = Path(
+            args.filter_config or ROOT / "config_files" / suffix / f"{suffix}_expressions.json5"
+        ).resolve()
         if not filter_config.is_file():
             raise ValueError(f"找不到提取规则文件：{filter_config}")
         inputs.append(filter_config)
@@ -496,6 +583,13 @@ def build_commands(args) -> list[tuple[str, list[str]]]:
         inputs = [first_input]
     # 配置文件本身，以及配置里显式声明的词表/替换规则，都是只读输入。
     inputs.extend(getattr(args, "_config_inputs", []))
+    # --replace-args / --annotate-args 里的 --reference-file 都是只读输入，必须参加
+    # 输出别名检查；否则后续阶段可能把前一阶段读过的 reference 覆盖掉。
+    for stage in ("replace", "annotate"):
+        if stage in selected:
+            reference = _option_value(extras[stage], "--reference-file")
+            if reference:
+                inputs.append(_reference_input_path(reference))
 
     outputs = [paths[stage] for stage in selected]
     sidecars = []

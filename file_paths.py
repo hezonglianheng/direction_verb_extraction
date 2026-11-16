@@ -173,6 +173,7 @@ def validate_run_outputs(
     *,
     overwrite: bool = False,
     extra_outputs: Iterable[str | Path] = (),
+    extra_inputs: Iterable[str | Path] = (),
 ) -> None:
     """跑批入口的输出路径总检查：在任何写入之前一次查完（E1）
 
@@ -199,6 +200,8 @@ def validate_run_outputs(
         csv_path: 成对信息 csv 路径；本次不导出时给 None
         overwrite: 是否显式允许覆盖已有输出
         extra_outputs: 本轮会写的附属文件；只查别名，不查是否已存在
+        extra_inputs: 本轮额外读取的输入（如 annotate 的 --reference-file）；
+            同样参加输入/输出别名检查，防止 --out-file 指到它上面
     """
     out_path = Path(out_path)
     main_outputs: list[Path] = [out_path]
@@ -206,7 +209,8 @@ def validate_run_outputs(
         main_outputs.append(Path(csv_path))
     main_outputs.append(out_path.with_suffix(".summary.json"))
     outputs = main_outputs + [Path(path) for path in extra_outputs]
-    validate_output_paths([corpus_path], outputs)
+    inputs = [corpus_path, *extra_inputs]
+    validate_output_paths(inputs, outputs)
     if not overwrite:
         for output in main_outputs:
             if output.exists():

@@ -12,10 +12,10 @@
     方位词（上/里/旁/东…）要看的是「是不是在说一处位置、是不是方位短语/处所成分」；
     趋向动词（上/下/进/出来…）要看的是「是不是真的表示位移方向，还是时体/结果/引申用法」。
     两类判据不同，所以正文分别放在
-        system_prompt/screen_localization.txt   （方位词）
-        system_prompt/screen_direction.txt      （趋向动词）
+        system_prompt/extract/screen_localization.txt   （方位词）
+        system_prompt/extract/screen_direction.txt      （趋向动词）
     里，由用户填写。两份模板都用两个共享判据占位符拼装：
-        {{judgement_criteria}}  ← system_prompt/judgement_criteria.txt（语法 + 空间自洽）
+        {{judgement_criteria}}  ← system_prompt/extract/judgement_criteria.txt（语法 + 空间自洽）
         {{spatial_criteria}}    ← config_files/<类型>/reality.txt（本类语料的空间判据片段）
     all_in_one 注入的是同两个文件，因此筛选、agent 与一次性调用不会各写一套判据。文件为空时本模块**不建模型、不发请求**，记录原样通过——这样默认行为
     与加筛选之前完全一致，填好提示语后自动生效。
@@ -67,14 +67,9 @@ from pydantic import BaseModel, Field
 
 import config
 import utils
+from corpus_metadata import SCREEN_PROMPT_FILES
 from extract import screening_metrics
 from pipeline_utils import prune_tree
-
-SCREEN_PROMPT_FILES: dict[str, str] = {
-    "方位词": "screen_localization",
-    "趋向动词": "screen_direction",
-}
-"""词类型 -> system_prompt/ 下的提示语文件名（不含 .txt）。"""
 
 SCREENING_TRUE = "true"
 """LLM 明确判为可提取"""
@@ -242,7 +237,11 @@ _CONFIG_DIRS = {"方位词": "localization", "趋向动词": "direction"}
 
 
 def prompt_path(kind: str) -> Path:
-    """该类语料的筛选/判定提示语路径（agent 的 a 侧回退也读这一份）"""
+    """该类语料的筛选/判定提示语路径（agent 的 a 侧回退也读这一份）
+
+    ``prompt_name`` 自带模块子目录（extract/，见 corpus_metadata.SCREEN_PROMPT_FILES），
+    所以直接交给 utils.prompt_path 拼接即可。
+    """
     return utils.prompt_path(prompt_name(kind))
 
 
@@ -262,7 +261,7 @@ def load_system_prompt(kind: str) -> str:
     """读该类语料的共享提示语并渲染两个判据占位符；空文件返回空串
 
     占位符：
-        ``{{judgement_criteria}}``  语法 + 空间自洽（system_prompt/judgement_criteria.txt）
+        ``{{judgement_criteria}}``  语法 + 空间自洽（system_prompt/extract/judgement_criteria.txt）
         ``{{spatial_criteria}}``    本类语料的空间判据片段（config_files/<类型>/reality.txt）
     两个占位符是“同一份正文只写一次”的落点：语料筛选与诊断回退读取同一份筛选模板。
     """
@@ -272,7 +271,7 @@ def load_system_prompt(kind: str) -> str:
     return utils.render_prompt(
         template,
         {
-            "judgement_criteria": utils.read_prompt("judgement_criteria"),
+            "judgement_criteria": utils.read_prompt("extract/judgement_criteria"),
             "spatial_criteria": utils.read_prompt_path(spatial_criteria_path(kind)),
         },
         source=f"{prompt_name(kind)}.txt",

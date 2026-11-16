@@ -45,29 +45,29 @@ from typing import Iterator
 
 from extract import sentence_screening as ss
 from annotate import spatial_tools as st
+from filter_funcs import (
+    DEFAULT_MODE,
+    DEFAULT_SEED,
+    LIMIT_MODES,
+    SAMPLE_MODES,
+    SELECTION_VERSION,
+    Selection,
+    allocate_quotas,
+    explicit_sentence_id,
+    fingerprint,
+    positive_line,
+    record_content_hash,
+    record_line_keys,
+    remember_selected,
+)
 
-SELECTION_VERSION = 1
-"""抽样统计口径版本；算法变化时递增，便于日志里的旧结果对账。"""
-
-SAMPLE_MODES = ("sequential", "random", "proportional")
-LIMIT_MODES = (*SAMPLE_MODES, "aligned")
-DEFAULT_MODE = "sequential"
-DEFAULT_SEED = 0
-
-PREVIEW_SIZE = 20
-"""日志里最多保留多少个选中行号，避免 X 很大时日志本身变成大文件。"""
-
-
-@dataclass
-class Selection:
-    """一次限额抽样的结果。
-
-    ``records`` 是惰性迭代器：真正读取发生在调用方消费时（random/proportional 会先做
-    第一遍计数）。``stats`` 也在消费过程中补齐，全部消费完后再写日志。
-    """
-
-    records: Iterator[tuple[int, dict]]
-    stats: dict
+# 旧调用名保持不变：本模块（及外部脚本）仍可用私有名，行为与 filter_funcs 的实现一致。
+_fingerprint = fingerprint
+_positive_line = positive_line
+_record_line_keys = record_line_keys
+_record_content_hash = record_content_hash
+_explicit_sentence_id = explicit_sentence_id
+_remember_selected = remember_selected
 
 
 def _base_stats(*, limit: int | None, mode: str, seed: int, corpus_type: str) -> dict:
@@ -135,12 +135,6 @@ def _iter_candidates(path: Path, stats: dict | None) -> Iterator[tuple[int, dict
             yield line_no, row
 
 
-def _remember_selected(stats: dict, line_no: int) -> None:
-    stats["selected"] += 1
-    if len(stats["selected_line_nos"]) < PREVIEW_SIZE:
-        stats["selected_line_nos"].append(line_no)
-
-
 _CANDIDATE_STAT_KEYS = (
     "scanned",
     "blank",
@@ -179,12 +173,6 @@ def _iter_sequential(path: Path, limit: int, stats: dict) -> Iterator[tuple[int,
     finally:
         for key, value in snapshot.items():
             stats[key] = value
-
-
-def _fingerprint(path: Path) -> tuple[int, int, int]:
-    """语料快照的大小/mtime/inode；两遍读取前后一致才允许采用抽样结果。"""
-    stat = path.stat()
-    return stat.st_size, stat.st_mtime_ns, stat.st_ino
 
 
 def _iter_random(path: Path, limit: int, seed: int, stats: dict) -> Iterator[tuple[int, dict]]:
@@ -233,34 +221,6 @@ def _layer_word(row: dict, corpus_type: str, vocab: dict[str, set[str]] | None =
         if entry.get("kind") == corpus_type and isinstance(entry.get("word"), str):
             return entry["word"]
     return None
-
-
-def allocate_quotas(counts: dict[str, int], total_quota: int) -> dict[str, int]:
-    """按最大余数法把 total_quota 个名额分给各词，返回每个词的名额（含 0）。
-
-    约束：0 <= quota[word] <= counts[word]，sum(quota.values()) == min(total_quota, sum(counts))。
-    余数并列时按词形字典序破平局，保证不同机器/不同进程下配额完全一致。
-    """
-    if not counts:
-        return {}
-    available = sum(counts.values())
-    quota = {word: 0 for word in counts}
-    if available <= 0 or total_quota <= 0:
-        return quota
-    if total_quota >= available:
-        return {word: int(count) for word, count in counts.items()}
-
-    remainders: list[tuple[int, str]] = []
-    for word, count in counts.items():
-        # 整数除法取商与余数：余数越大越该补 1，全程精确、无浮点误差。
-        base, remainder = divmod(count * total_quota, available)
-        quota[word] = base
-        remainders.append((remainder, word))
-
-    left = total_quota - sum(quota.values())
-    for _, word in sorted(remainders, key=lambda item: (-item[0], item[1]))[:left]:
-        quota[word] += 1
-    return quota
 
 
 def _iter_proportional(
@@ -326,9 +286,6 @@ def _iter_proportional(
 # aligned：用已筛选文件逐条对回同一份源语料
 # --------------------------------------------------------------------------
 
-_ALIGNED_LINE_KEYS = ("source_line_no", "input_line_no", "line_no")
-
-
 @dataclass
 class _ReferenceEntry:
     """一条 reference 记录（已按身份去重）以及与源记录对齐所需的信息。"""
@@ -344,63 +301,6 @@ class _ReferenceEntry:
     matched_by: str | None = None
 
 
-def _positive_line(value) -> int | None:
-    """把行号字段收成正整数；bool、0、负数、非数字一律不认。"""
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value if value > 0 else None
-    if isinstance(value, float) and value.is_integer() and value > 0:
-        return int(value)
-    if isinstance(value, str) and value.strip().isdigit():
-        number = int(value.strip())
-        return number if number > 0 else None
-    return None
-
-
-def _record_line_keys(record: dict) -> dict[str, set[int]]:
-    """一条记录里所有可用行号，按字段名分组（顶层与 source 块都看）。
-
-    不在这里决定“source_line_no 优先还是 line_no 优先”：两者可能分别指向祖先语料和
-    当前输入，究竟哪个能对回源文件取决于用户拿的是哪一份。全部保留，后续用句子内容
-    校验；只有内容一致的命中才算数，避免同号不同句的误对齐。
-    """
-    found: dict[str, set[int]] = {}
-    source = record.get("source")
-    containers = [("source", source), ("top", record)] if isinstance(source, dict) else [("top", record)]
-    for _, container in containers:
-        if not isinstance(container, dict):
-            continue
-        for key in _ALIGNED_LINE_KEYS:
-            value = _positive_line(container.get(key))
-            if value is not None:
-                found.setdefault(key, set()).add(value)
-    return found
-
-
-def _record_content_hash(record: dict) -> str | None:
-    """reference/source 的句子指纹：顶层 sentence，其次句对的 a 侧切片/句子。"""
-    tokens = record.get("sentence")
-    if isinstance(tokens, list) and tokens and all(isinstance(token, str) for token in tokens):
-        return st.content_hash(tokens)
-    if isinstance(tokens, str) and tokens.strip():
-        return st.content_hash(tokens)
-    pair = record.get("pair")
-    if isinstance(pair, dict):
-        side_a = pair.get("a")
-        if isinstance(side_a, dict):
-            tokens = side_a.get("slice")
-            if isinstance(tokens, list) and tokens and all(isinstance(token, str) for token in tokens):
-                return st.content_hash(tokens)
-            sentence = side_a.get("sentence")
-            if isinstance(sentence, str) and sentence.strip():
-                return st.content_hash(sentence)
-    explicit = record.get("content_hash")
-    if isinstance(explicit, str) and explicit.strip():
-        return explicit.strip()
-    return None
-
-
 def _record_document(record: dict) -> str | None:
     """来源文档：先看 source 块，再看顶层；与 spatial_tools.source_document_id 同源。"""
     source = record.get("source")
@@ -409,11 +309,6 @@ def _record_document(record: dict) -> str | None:
         if document:
             return document
     return st.source_document_id(record)
-
-
-def _explicit_sentence_id(record: dict) -> str | None:
-    value = record.get("sentence_id")
-    return value.strip() if isinstance(value, str) and value.strip() else None
 
 
 def _looks_like_current_file_reference(record: dict) -> bool:

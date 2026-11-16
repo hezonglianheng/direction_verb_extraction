@@ -44,8 +44,10 @@ import file_paths
 from evaluate import data, metrics
 from evaluate.inference import (
     ModelSpec,
+    actual_mode,
     cache_sidecar_paths,
-    redact_url,
+    public_model_info,
+    public_reproducibility,
     run_model,
     sanitize_exception,
     sanitize_text,
@@ -53,7 +55,7 @@ from evaluate.inference import (
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUT_DIR = _PROJECT_ROOT / "results" / "evaluate"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 REFERENCE_POLICY = (
     "单模型记录取 judgement.same_meaning（必须是真正的 bool）；"
     "多模型投票记录仅在 voting.status=accepted 时取顶层 voting_label 的 same/different；"
@@ -258,9 +260,17 @@ def _file_info(path: str | Path) -> dict:
 
 def build_spec(model: str, *, batch_mode: str) -> ModelSpec:
     """读取一个模型的配置/重试策略/批处理能力；配置错误在花钱前抛出。"""
-    from agents import load_model_config, proxy_policy, request_policy
+    from agents import (
+        disable_thinking_kwargs, load_model_config, proxy_policy, request_policy,
+    )
 
     cfg = load_model_config(model)
+    try:
+        # 生成参数在创建报告占位和调用模型之前校验。畸形 disable_thinking
+        # 若拖到报告阶段才报，会留下 0 字节报告并中止后续模型。
+        disable_thinking_kwargs(cfg)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"模型 {model!r} 的生成参数配置非法：{exc}") from None
     policy = request_policy(model)
     proxy_mode, _ = proxy_policy(cfg, model)
     profile = None
@@ -273,37 +283,70 @@ def build_spec(model: str, *, batch_mode: str) -> ModelSpec:
     return ModelSpec(key=model, cfg=cfg, policy=policy, proxy_mode=proxy_mode, batch=profile)
 
 
-def model_info(spec: ModelSpec, *, batch_mode: str) -> dict:
-    """报告里的模型信息白名单：绝不包含 api_key。"""
-    cfg = spec.cfg
-    policy = spec.policy
-    info = {
+def model_info(spec: ModelSpec, *, batch_mode: str, actual_mode: str | None = None) -> dict:
+    """报告里的模型信息固定白名单：只给复现所需，不复制配置字典。"""
+    return public_model_info(spec, batch_mode=batch_mode, actual_mode=actual_mode)
+
+
+def _fallback_model_info(spec: ModelSpec, error: str) -> dict:
+    """模型元数据无法生成时仍保留固定白名单结构，不重试失败的配置辅助函数。"""
+    return {
         "config_key": spec.key,
-        "provider": cfg.get("model_provider") or cfg.get("provider"),
-        "model": cfg.get("model") or cfg.get("model_name"),
-        "base_url": redact_url(cfg.get("base_url")),
-        "temperature": cfg.get("temperature", 0),
-        "timeout_seconds": policy.get("timeout"),
-        "max_retries": policy.get("max_retries"),
-        "retry_backoff_seconds": policy.get("backoff_seconds"),
-        "retry_backoff_max_seconds": policy.get("backoff_max_seconds"),
-        "retry_jitter_seconds": policy.get("jitter_seconds"),
+        "provider": None,
+        "model_name": None,
+        "endpoint": None,
+        "temperature": None,
         "proxy_mode": spec.proxy_mode,
+        "request": {},
+        "batch": {"enabled": False, "protocol": None, "endpoint": None, "disabled_reason": ""},
+        "summary_error": error,
     }
-    if batch_mode == "off":
-        info["batch"] = {"mode": "off", "enabled": False}
-    elif spec.batch is not None:
-        endpoint = redact_url(spec.batch.base_url).rstrip("/")
-        info["batch"] = {
-            "mode": batch_mode,
-            "enabled": bool(spec.batch.enabled),
-            "protocol": spec.batch.protocol,
-            "endpoint": f"{endpoint}/batches" if endpoint else "",
-            "disabled_reason": sanitize_text(spec.batch.disabled_reason, spec.cfg),
+
+
+def _safe_model_info(spec: ModelSpec, *, batch_mode: str, actual_mode: str | None = None) -> dict:
+    """构造模型信息；失败时降级为最小白名单，绝不阻止错误报告落盘。"""
+    try:
+        return model_info(spec, batch_mode=batch_mode, actual_mode=actual_mode)
+    except Exception as exc:  # noqa: BLE001 —— 元数据失败不能吞掉整份报告
+        return _fallback_model_info(spec, sanitize_exception(exc, spec.cfg))
+
+
+def _safe_reproducibility(
+    spec: ModelSpec, pipeline: dict | None, *, batch_mode: str, workers: int,
+    poll_seconds: float, timeout_seconds: float, chunk_size: int, outcome,
+) -> dict:
+    """构造复现信息；配置畸形或序列化失败时保留最小执行账，不阻塞报告。"""
+    try:
+        return public_reproducibility(
+            spec, pipeline, batch_mode=batch_mode, workers=workers,
+            poll_seconds=poll_seconds, timeout_seconds=timeout_seconds,
+            chunk_size=chunk_size, outcome=outcome,
+        )
+    except Exception as exc:  # noqa: BLE001 —— 同 _safe_model_info
+        error = sanitize_exception(exc, spec.cfg)
+        try:
+            actual = actual_mode(batch_mode, outcome)
+        except Exception:  # noqa: BLE001 —— 只影响诊断字段
+            actual = None
+        return {
+            "execution": {
+                "requested_batch_mode": batch_mode,
+                "actual_mode": actual,
+                "fallback_reason": None,
+                "workers": workers,
+                "batch_poll_seconds": poll_seconds,
+                "batch_timeout_seconds": timeout_seconds,
+                "batch_chunk_size": chunk_size,
+                "summary_error": error,
+            },
+            "invocation": {},
+            "generation": {
+                "thinking_policy_source": "unknown",
+                "has_unpublished_parameters": True,
+                "error": error,
+            },
+            "configuration_fingerprint": None,
         }
-    else:
-        info["batch"] = {"mode": batch_mode, "enabled": False}
-    return info
 
 
 def _build_plans(models: list[str], out_dir: Path, args: argparse.Namespace, run_timestamp: str) -> list[ModelPlan]:
@@ -487,6 +530,20 @@ def _sanitize_export(value, cfg: dict):
     return value
 
 
+_BATCH_EXECUTION_KEYS = (
+    "mode", "waves", "items_collected", "items_completed", "items_failed",
+    "fallback_items", "cache_hits", "batches", "cache_file", "jobs_file",
+    "identity_file", "resume_blocked",
+)
+
+
+def _batch_execution(batch: dict | None) -> dict | None:
+    """顶层只保留执行计数；模型 provider/端点等配置已由 model.batch 表示。"""
+    if batch is None:
+        return None
+    return {key: batch.get(key) for key in _BATCH_EXECUTION_KEYS if key in batch}
+
+
 def _build_report(
     spec: ModelSpec,
     plan: ModelPlan,
@@ -499,7 +556,8 @@ def _build_report(
     *,
     step: int,
     corpus_type: str,
-    batch_mode: str,
+    model: dict,
+    reproducibility: dict,
     started_at: str,
     finished_at: str,
     elapsed_seconds: float,
@@ -541,10 +599,10 @@ def _build_report(
         "schema_version": SCHEMA_VERSION,
         **_route_metadata(step, corpus_type, pipeline),
         "run_status": run_status,
-        "model": model_info(spec, batch_mode=batch_mode),
+        "model": model,
         "input": input_info,
         "pipeline": pipeline,
-        "prompts": ((pipeline or {}).get("provenance") or {}).get("agents", {}),
+        "reproducibility": reproducibility,
         "agent_stats": outcome.agent_stats if outcome is not None else {},
         "prediction_sources": dict(prediction_sources.most_common()),
         "selection": selection,
@@ -566,7 +624,7 @@ def _build_report(
         },
         "metrics": metric_block,
         "failures_by_reason": dict(failure_reasons.most_common()),
-        "batch": outcome.batch if outcome is not None else None,
+        "batch": _batch_execution(outcome.batch if outcome is not None else None),
         "batch_error": outcome.batch_error if outcome is not None else None,
         "sync_retries": outcome.sync_retries if outcome is not None else 0,
         "model_elapsed_seconds": outcome.elapsed_seconds if outcome is not None else None,
@@ -679,7 +737,26 @@ def _run_one(
 
     finished_at = datetime.now().astimezone().isoformat(timespec="seconds")
     pipeline = outcome.pipeline if outcome is not None else None
-    route = _route_metadata(args.step, args.corpus_type, pipeline)
+    try:
+        route = _route_metadata(args.step, args.corpus_type, pipeline)
+    except Exception as exc:  # noqa: BLE001 —— 路由诊断失败仍要保留错误报告
+        error = error or sanitize_exception(exc, spec.cfg)
+        route = {
+            "step": args.step,
+            "mode": "unknown",
+            "allow_lookup": args.step in (2, 4),
+            "corpus_type": args.corpus_type,
+        }
+    try:
+        run_mode = actual_mode(args.batch, outcome)
+    except Exception:  # noqa: BLE001 —— actual_mode 只用于诊断字段
+        run_mode = None
+    model_block = _safe_model_info(spec, batch_mode=args.batch, actual_mode=run_mode)
+    reproducibility = _safe_reproducibility(
+        spec, pipeline, batch_mode=args.batch, workers=args.workers,
+        poll_seconds=args.batch_poll_seconds, timeout_seconds=args.batch_timeout_seconds,
+        chunk_size=args.batch_chunk_size, outcome=outcome,
+    )
     try:
         report = _build_report(
             spec,
@@ -692,7 +769,8 @@ def _run_one(
             error,
             step=args.step,
             corpus_type=args.corpus_type,
-            batch_mode=args.batch,
+            model=model_block,
+            reproducibility=reproducibility,
             started_at=started_at,
             finished_at=finished_at,
             elapsed_seconds=round(time.time() - started_wall, 3),
@@ -703,10 +781,10 @@ def _run_one(
             "schema_version": SCHEMA_VERSION,
             **route,
             "run_status": "error",
-            "model": {"config_key": spec.key},
+            "model": model_block,
             "input": input_info,
             "pipeline": pipeline,
-            "prompts": ((pipeline or {}).get("provenance") or {}).get("agents", {}),
+            "reproducibility": reproducibility,
             "agent_stats": outcome.agent_stats if outcome is not None else {},
             "prediction_sources": {},
             "selection": selection,

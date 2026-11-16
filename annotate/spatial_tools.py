@@ -13,7 +13,7 @@
    哪一组文件缺了或内容为空都按空表跑，对应环节退化为 LLM 兜底或原样返回，并在结果记录的
    source 字段里如实标记来源；跑批入口启动时会逐张打印实际路径与内容摘要，绝不静默降级。
    这两组目录下还各有一份空间判据片段（reality.txt，见 CONFIG_PROMPT_FILES），由
-   system_prompt/screen_<词类型>.txt 注入；reality/semantic 诊断 agent 与语料筛选共用这一份。
+   system_prompt/extract/screen_<词类型>.txt 注入；reality/semantic 诊断 agent 与语料筛选共用这一份。
    正式三条标注链路不重筛或注入此片段。路径与读法见 config_prompt_path / utils.read_prompt_path。
 2. 纯规则工具：切片改写 alter_sentence（一个原句按命中的规则组产出多个待选句）、词组定位
    find_word_groups、schema 查表 lookup_schema（先按关注词收窄、再按语义特征匹配）、
@@ -42,10 +42,8 @@ b 侧会收窄回原词那一组，判定表就永远只在自己那一组里打
 """
 
 import csv
-import hashlib
 import json
 import threading
-import unicodedata
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
@@ -55,6 +53,13 @@ import json5
 from langchain.tools import tool
 
 import config
+import filter_funcs
+from corpus_metadata import (
+    CORPUS_TYPE_ALIASES,
+    CORPUS_TYPE_DIRS,
+    DEFAULT_CORPUS_TYPE,
+    normalize_corpus_type,
+)
 from extract import sentence_screening
 from extract import word_sampler
 from extract.sentenceTable import SentenceTaskCache
@@ -72,28 +77,6 @@ TABLE_FILES: dict[str, str] = {
 }
 """本流水线读的四张表；值同时是各子目录里的文件名（单一真源）"""
 
-CORPUS_TYPE_DIRS: dict[str, str] = {
-    # 语料类型（中文名，与 FOCUS_VOCAB_SPECS、记录里的 kind 同一套字符串）-> 配置子目录名
-    # 别名只是命令行入口，见 CORPUS_TYPE_ALIASES；类型枚举的真源是这里与 FOCUS_VOCAB_SPECS
-    "方位词": "localization",
-    "趋向动词": "direction",
-}
-"""语料类型 -> config_files/ 下的配置子目录"""
-
-CORPUS_TYPE_ALIASES: dict[str, str] = {
-    # 别名（大小写不敏感）-> 中文类型名
-    "localization": "方位词",
-    "location": "方位词",
-    "loc": "方位词",
-    "direction": "趋向动词",
-    "dir": "趋向动词",
-    "direction_verb": "趋向动词",
-}
-"""命令行上可用的类型别名"""
-
-DEFAULT_CORPUS_TYPE = "方位词"
-"""缺省语料类型：与默认语料 results/location_corpus.jsonl 同一口径"""
-
 CORPUS_TYPE_CORPORA: dict[str, str] = {
     # 类型 -> 该类型的默认语料文件名（results/ 下）；键与 word_sampler.CORPUS_SPECS 同名
     "方位词": "location_corpus.jsonl",
@@ -104,12 +87,12 @@ CORPUS_TYPE_CORPORA: dict[str, str] = {
 FOCUS_VOCAB_SPECS: dict[str, tuple[str | Path, tuple[str, ...] | None]] = {
     # 类别 -> (筛选配置, 只取哪些键的词表；None 表示取各顶层规则自己的词表)
     # 与 word_sampler.CORPUS_SPECS 同一口径，别在这里另立一套词表（词表只有一处真源）
-    "方位词": (CONFIG_DIR / "localization_expressions.json5", None),
-    "趋向动词": (CONFIG_DIR / "direction_expressions.json5", ("direction_verb_",)),
+    "方位词": (CONFIG_DIR / "localization" / "localization_expressions.json5", None),
+    "趋向动词": (CONFIG_DIR / "direction" / "direction_expressions.json5", ("direction_verb_",)),
 }
 """关注词的两份词表：判一个词属方位词还是趋向动词，就按它落在哪张表里定
 
-刻意不用 config_files/localization_vocab.json5：那是初筛用的超集（会做子串最小化，
+刻意不用 config_files/localization/localization_vocab.json5：那是初筛用的超集（会做子串最小化，
 出来/上来/过去 会被吞成 出/上/过），且它在 sentenceFilters 自测里是回归基线，不是目标词表。
 """
 
@@ -124,33 +107,6 @@ assert set(CORPUS_TYPE_CORPORA) == set(CORPUS_TYPE_DIRS), (
 assert set(CORPUS_TYPE_CORPORA.values()) <= set(word_sampler.CORPUS_SPECS), (
     "CORPUS_TYPE_CORPORA 里的语料名不在 word_sampler.CORPUS_SPECS 里（文件名写错了？）"
 )
-
-
-def normalize_corpus_type(value: str | None) -> str:
-    """语料类型规范化：别名（大小写不敏感）-> 中文类型名；None/空串 -> DEFAULT_CORPUS_TYPE
-
-    认不出来时抛 ValueError，**绝不当成默认类型静默跑**——那会让人以为跑的是 X、
-    实际读的是方位词的四张表，与「绝不静默降级」相违。
-
-    Args:
-        value (str | None): 中文类型名或 CORPUS_TYPE_ALIASES 里的别名
-
-    Returns:
-        str: 中文类型名（CORPUS_TYPE_DIRS 的键之一）
-    """
-    if value is None or not str(value).strip():
-        return DEFAULT_CORPUS_TYPE
-    text = str(value).strip()
-    if text in CORPUS_TYPE_DIRS:
-        return text
-    alias = CORPUS_TYPE_ALIASES.get(text.lower())
-    if alias:
-        return alias
-    available = "、".join(
-        f"{kind}（{'/'.join(sorted(a for a, k in CORPUS_TYPE_ALIASES.items() if k == kind))}）"
-        for kind in CORPUS_TYPE_DIRS
-    )
-    raise ValueError(f"认不出语料类型 {value!r}；可用：{available}")
 
 
 def config_path(table: str, corpus_type: str | None = None) -> Path:
@@ -174,7 +130,7 @@ CONFIG_PROMPT_FILES: dict[str, str] = {
 }
 """与四张表同放在 config_files/<语料类型>/ 下的**提示语**（目前只有 reality_agent 这一份）
 
-为什么不进 system_prompt/（其余五份提示语都在那儿）：判据随词类不同——方位词要挡的是
+为什么不进 system_prompt/annotate/（其余标注提示语都在那儿）：判据随词类不同——方位词要挡的是
 「会上/意义上/三天内」这类引申与时间用法，趋向动词要挡的是「笑起来/看出来/走出困境」
 这类时体、结果与比喻用法，两类词的判据不是一回事。与四张表同一个目录、同一套按类型分组的
 口径，改一类的标准碰不到另一类。读与报错见 utils.read_prompt_path。
@@ -609,24 +565,7 @@ def read_corpus(
                 eligible_seen += 1
                 if eligible_seen <= offset:
                     continue
-            # 记录里已带行号（抽样产物写的是源行号）就先把它留成 source_line_no，
-            # 别用本次的物理行号顶掉它
-            source_line_no = record.get("source_line_no")
-            if source_line_no is None:
-                source_line_no = record.get("line_no")
-            record["source_line_no"] = source_line_no
-            record["input_line_no"] = line_no
-            record["line_no"] = line_no
-            # 来源文档编号按本次输入里的首次出现顺序给；上游残留的旧编号一律重算，
-            # 否则两份语料拼在一起时会出现同一编号指两篇文档
-            document = source_document_id(record)
-            if document is None:
-                record.pop("source_document_no", None)
-            else:
-                if document not in document_numbers:
-                    document_numbers[document] = len(document_numbers) + 1
-                record["source_document_no"] = document_numbers[document]
-            records.append(record)
+            records.append(prepare_corpus_record(record, line_no, document_numbers))
             if limit is not None and len(records) >= limit:
                 break
     return records
@@ -652,6 +591,40 @@ def source_document_id(record: dict) -> str | None:
     return None
 
 
+def prepare_corpus_record(record: dict, line_no: int, document_numbers: dict[str, int]) -> dict:
+    """给一条已读入的语料补三级行号与来源文档编号（read_corpus 与限额抽样共用）。
+
+    read_corpus 边读边补；限额抽样先选出记录、再按**选中的顺序**补，两者口径必须一致：
+    记录里已带行号（抽样产物写的是源行号）就先留成 source_line_no，不用本次物理行号顶掉。
+    document_numbers 由调用方持有，按首次出现顺序写 source_document_no；上游残留的旧编号
+    一律重算，否则两份语料拼在一起时会出现同一编号指两篇文档。
+    """
+    source_line_no = record.get("source_line_no")
+    if source_line_no is None:
+        source_line_no = record.get("line_no")
+    record["source_line_no"] = source_line_no
+    record["input_line_no"] = line_no
+    record["line_no"] = line_no
+    document = source_document_id(record)
+    if document is None:
+        record.pop("source_document_no", None)
+    else:
+        if document not in document_numbers:
+            document_numbers[document] = len(document_numbers) + 1
+        record["source_document_no"] = document_numbers[document]
+    return record
+
+
+def prepare_selected_records(rows: Iterable[tuple[int, dict]]) -> list[dict]:
+    """把限额抽样选出的 (物理行号, 记录) 补成 read_corpus 同口径的记录列表。
+
+    抽样模块为省内存只逐行产出被选中的记录；这里统一补行号与来源文档编号，避免 annotate
+    入口为“抽样”与“不抽样”维护两套记录形状。
+    """
+    document_numbers: dict[str, int] = {}
+    return [prepare_corpus_record(record, line_no, document_numbers) for line_no, record in rows]
+
+
 def content_hash(text: str | Iterable[str]) -> str:
     """句子文本的指纹（查重用）：先按 normalize 规整，再取 sha1 的前 12 位
 
@@ -659,8 +632,7 @@ def content_hash(text: str | Iterable[str]) -> str:
     是不是一样」**，不含来源信息：同一句出现在两篇文章里哈希相同，那正是它的用途
     ——查重。要与来源区分时另看 source_document_id。
     """
-    body = join_slice(text) if not isinstance(text, str) else text
-    return hashlib.sha1(normalize(body).encode("utf-8")).hexdigest()[:12]
+    return filter_funcs.content_hash(text)
 
 
 def record_document_no(record: dict) -> int | None:
@@ -781,7 +753,7 @@ def normalize(text: str) -> str:
 
     统一全角/半角、去掉所有空白，这样 "软件上 说" 与 "软件上说" 会落到同一个键上。
     """
-    return "".join(unicodedata.normalize("NFKC", text).split())
+    return filter_funcs.normalize(text)
 
 
 def collect_span(node: dict) -> list[int]:
@@ -1545,7 +1517,7 @@ def render_schema_candidates(candidates: dict[str, dict]) -> str:
             condition = " ／ ".join(format_match(group) for group in groups)
         parts = [f"  {name}：{entry.get('description') or '（未写说明）'}"]
         parts.append(f"      命中条件：{condition}")
-        # 示例单独由 system_prompt/examples 按关注词选择，不夹带表内旧例句。
+        # 示例单独由 system_prompt/annotate/examples 按关注词选择，不夹带表内旧例句。
         lines.append("\n".join(parts))
     return "\n".join(lines)
 

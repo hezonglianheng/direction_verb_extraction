@@ -2,9 +2,9 @@
 """提取/替换与标注之间的句对契约，不依赖模型。"""
 
 from extract import sentence_screening as screening
+from corpus_metadata import PAIR_CORPORA
 
 PAIR_SCHEMA_VERSION = "1.0"
-PAIR_CORPORA = {"方位词": "location_pairs.jsonl", "趋向动词": "direction_pairs.jsonl"}
 
 
 def pair_status(a: dict, b: dict) -> str:

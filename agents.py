@@ -189,6 +189,24 @@ def _openrouter_client_kwargs(model_cfg: dict, model_name: str, policy: dict) ->
     return {"timeout": timeout_ms, "client": client}
 
 
+def structured_output_mode(model_cfg: dict, model_name: str = "") -> str:
+    """同步工厂实际采用的 ToolStrategy 处理方式：``provider`` 或 ``tool``。
+
+    评测报告也使用这一份规则，避免只按 Batch 模式猜策略。native Batch 不经过
+    这里，它固定使用 ``batch_inference.TOOL_NAME`` 的工具 schema。
+    """
+    override = model_cfg.get("structured_output")
+    if override is None:
+        provider = _model_provider(model_cfg)
+        return "provider" if provider in _NATIVE_STRUCTURED_OUTPUT_PROVIDERS else "tool"
+    if isinstance(override, str) and override.strip().lower() in {"provider", "tool"}:
+        return override.strip().lower()
+    raise ValueError(
+        f"模型 {model_name or '<unknown>'!r} 的 structured_output 必须是 \"provider\" 或 \"tool\"，"
+        f"收到 {override!r}"
+    )
+
+
 def _structured_output_for(model_name: str, response_format):
     """按模型能力把 ToolStrategy 换成 ProviderStrategy
 
@@ -203,20 +221,7 @@ def _structured_output_for(model_name: str, response_format):
     if not isinstance(response_format, ToolStrategy):
         return response_format
     model_cfg = load_model_config(model_name)
-    override = model_cfg.get("structured_output")
-    if override is None:
-        mode = (
-            "provider"
-            if _model_provider(model_cfg) in _NATIVE_STRUCTURED_OUTPUT_PROVIDERS
-            else "tool"
-        )
-    elif isinstance(override, str) and override.strip().lower() in {"provider", "tool"}:
-        mode = override.strip().lower()
-    else:
-        raise ValueError(
-            f"模型 {model_name!r} 的 structured_output 必须是 \"provider\" 或 \"tool\"，"
-            f"收到 {override!r}"
-        )
+    mode = structured_output_mode(model_cfg, model_name)
     return ProviderStrategy(response_format.schema) if mode == "provider" else response_format
 
 
@@ -380,7 +385,13 @@ def disable_thinking_kwargs(model_cfg: dict) -> dict:
     configured = model_cfg.get("disable_thinking")
     if configured is not None:
         # 显式配置优先，包括空字典（明确表示不补参数）；不能因为它是 falsy
-        # 就退回到 provider 默认值。
+        # 就退回到 provider 默认值。这里必须先校验类型：False/字符串等会被
+        # dict(...) 抛成难读的 TypeError，且可能晚到报告构造阶段才暴露。
+        if not isinstance(configured, dict):
+            raise ValueError(
+                "disable_thinking 必须是对象（空对象表示显式不补参数），"
+                f"收到 {type(configured).__name__}"
+            )
         return dict(configured)
     provider = _model_provider(model_cfg)
     return dict(_DISABLE_THINKING_DEFAULTS.get(provider) or {})

@@ -40,7 +40,7 @@ LOCATIVE_SPLIT_ENABLED = True
 nl 一项。旧注释写「默认关闭」「n/nl」，会让人按「没开切分」或「n 也能切」去理解
 已有产物的下标口径，故改正。）"""
 
-LOCATIVE_SPLIT_VOCAB_FILE = "config_files/localization_vocab.json5"
+LOCATIVE_SPLIT_VOCAB_FILE = "config_files/localization/localization_vocab.json5"
 """后缀词表。相对路径按 _PROJECT_ROOT 解析，保证 spawn 出的子进程读到同一份文件。"""
 
 LOCATIVE_SPLIT_ALLOWED_POS = frozenset({"nl"})
@@ -246,7 +246,7 @@ SENTENCE_DEDUP_WINDOW = 200_000
 SCREEN_MODEL = "deepseek-flash"
 """LLM 筛选默认使用的模型配置名（model_config/api_keys.json 里的键）
 
-只有 system_prompt/screen_*.txt 填了正文时才会真正读这份配置、建模型；提示语为空时
+只有 system_prompt/extract/screen_*.txt 填了正文时才会真正读这份配置、建模型；提示语为空时
 筛选器直接跳过，不要求本机存在该模型配置。"""
 
 SCREEN_WORKERS = 8

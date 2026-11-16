@@ -2,7 +2,8 @@
 
 """提示语的读取与渲染。
 
-提示语正文绝大多数放在项目根目录的 system_prompt/ 下，正式标注按链路/步骤命名，
+提示语正文绝大多数放在项目根目录的 system_prompt/ 下，按模块分子目录（extract/、annotate/、
+evaluate/；replace 目前没有独占提示语），正式标注再按链路/步骤命名，
 共享片段只保留一份，维护索引见 system_prompt/README.md。
 目录用 __file__ 解析成绝对路径，与运行时 cwd 无关（与 config.py / spatial_tools.py 同一做法）。
 agent 在构造期调用 read_prompt / render_prompt 把正文读进来，见 spatial_agents.BaseAgent。
@@ -21,10 +22,11 @@ _PROJECT_ROOT = Path(__file__).resolve().parent
 """项目根目录（本模块所在目录）"""
 
 PROMPT_DIR = _PROJECT_ROOT / "system_prompt"
-"""提示语目录。注意各调用方要经 read_prompt / prompt_path 取用，不要另存一份引用"""
+"""提示语根目录。模块子目录（extract/annotate/evaluate）由调用方给出的 name 自带，
+各调用方要经 read_prompt / prompt_path 取用，不要另存一份引用"""
 
 PROMPT_SUFFIX = ".txt"
-"""提示语文件后缀，调用方只传名字（如 "semantic"）"""
+"""提示语文件后缀，调用方只传名字（如 "extract/judgement_criteria" 或 "annotate/synonym/annotate_synonym_judgement"）"""
 
 _PLACEHOLDER = re.compile(r"\{\{(\w+)\}\}")
 """占位符写作 {{名字}}。
@@ -47,7 +49,7 @@ def read_sys_prompt_from_file(file_path: str | Path, encoding: str = "utf-8-sig"
 
 
 def prompt_path(name: str) -> Path:
-    """提示语文件的绝对路径（name 不含后缀）"""
+    """提示语文件的绝对路径（name 不含后缀，可带模块/链路子目录，如 "annotate/all_in_one/annotate_all_in_one"）"""
     return PROMPT_DIR / f"{name}{PROMPT_SUFFIX}"
 
 
@@ -69,7 +71,7 @@ def read_prompt_path(path: str | Path) -> str:
 
 
 def read_prompt(name: str) -> str:
-    """按名字读 system_prompt/<name>.txt（读不到时的报错见 read_prompt_path）"""
+    """按名字读 system_prompt/<模块>/<name>.txt（name 自带模块子目录；读不到时的报错见 read_prompt_path）"""
     return read_prompt_path(prompt_path(name))
 
 

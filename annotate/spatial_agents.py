@@ -22,7 +22,7 @@
     judge_agent     输入两个句子及其 schema，先查判定表（CSV 矩阵）；表里直接给了结论（√/×）
                     就用它，标了 ○、格子留空非法、或这一对没收录进表（未命中）才交 LLM 判断。
     synonym_agent   输入两个句子与两侧各自的关注词，直接由独立 LLM 判断是否同义；
-                    不抽特征、不查 schema 或判定表。system_prompt/annotate_synonym_judgement.txt 由用户填写，
+                    不抽特征、不查 schema 或判定表。system_prompt/annotate/synonym/annotate_synonym_judgement.txt 由用户填写，
                     正文未填写时不调模型，返回 same_meaning=None、source=unfilled_prompt。
     all_in_one      输入已筛选的句对，一次输出两侧特征、图式与同义关系，再用本地表覆盖。
 
@@ -58,10 +58,10 @@ agent 据此选目录；同一条信息也会写进 user message（见 head_bloc
 
 依赖关系：spatial_runner → spatial_graphs → spatial_agents → spatial_tools / agents。
 
-每个 agent 的 system_prompt 正文外置在 system_prompt/ 下，按链路和步骤命名（维护索引见
-system_prompt/README.md），构造 agent 时读取（见 utils.read_prompt；
+每个 agent 的 system_prompt 正文外置在 system_prompt/<模块>/ 下（标注链路在 system_prompt/annotate/），
+按链路和步骤命名（维护索引见 system_prompt/README.md），构造 agent 时读取（见 utils.read_prompt；
 含 {{占位符}} 的模板由 utils.render_prompt 渲染）。reality / semantic 两步的判据与语料筛选共用
-system_prompt/screen_<词类型>.txt（见 sentence_screening）；新语料直接读记录里的 screening 判定，
+system_prompt/extract/screen_<词类型>.txt（见 sentence_screening）；新语料直接读记录里的 screening 判定，
 不重复调用模型。config_files/<类型目录>/reality.txt 是 spatial 判据片段，由 screen_<类型>.txt
 由筛选步骤注入；正式 pair/all-in-one 不再运行 reality/semantic，仅诊断图保留这些 agent。
 
@@ -390,13 +390,17 @@ class FreeFeatures(BaseModel):
 # --------------------------------------------------------------------------
 # 二、提示语
 #
-# 正文全部外置在 system_prompt/ 下（按链路/步骤命名，共享片段只保留一份，见该目录 README.md），
+# 正文全部外置在 system_prompt/<模块>/ 下（标注链路在 system_prompt/annotate/；按链路/步骤命名，
+# 共享片段只保留一份，见该目录 README.md），
 # 由 BaseAgent 在构造期读入，见 utils.read_prompt / utils.render_prompt。
 # 含变动的提示语用 {{占位符}} 标注——不是 {}：正文里有 JSON 花括号，str.format() 会炸。
 # --------------------------------------------------------------------------
 
 PROMPT_SOURCE_SYSTEM = "system"
-"""提示语在 system_prompt/ 下（默认，见 BaseAgent.PROMPT_SOURCE）"""
+"""提示语在 system_prompt/<模块>/ 下（默认，见 BaseAgent.PROMPT_SOURCE）
+
+模块目录与代码目录一一对应：extract/、annotate/、evaluate/；replace 目前没有独占提示语。
+标注链路只读 annotate/。"""
 PROMPT_SOURCE_CONFIG = "config"
 """提示语与配置表同目录：config_files/<语料类型>/ 下（唯一一份 reality_agent 的提示语）
 
@@ -406,30 +410,30 @@ PROMPT_SOURCE_CONFIG = "config"
 
 REALITY_PROMPT_FILE = "reality"
 """reality_agent 的提示语（放 config_files/<语料类型>/ 下，见 PROMPT_SOURCE_CONFIG）"""
-FEATURE_PROMPT_FILE = "annotate_pair_feature_deep"
+FEATURE_PROMPT_FILE = "annotate/pair/annotate_pair_feature_deep"
 """feature_agent deep 模式（每类一个 subagent）的主提示语（含 {{n}} 与 {{roster}}）"""
-FEATURE_FLAT_PROMPT_FILE = "annotate_pair_feature_flat"
+FEATURE_FLAT_PROMPT_FILE = "annotate/pair/annotate_pair_feature_flat"
 """feature_agent 默认（单次调用）的主提示语（含 {{n}} 与 {{classes}}）"""
-FEATURE_UNFILLED_PROMPT_FILE = "annotate_pair_feature_unfilled"
+FEATURE_UNFILLED_PROMPT_FILE = "annotate/pair/annotate_pair_feature_unfilled"
 """feature_agent 类别表为空时的兜底提示语"""
-FEATURE_CLASS_PROMPT_FILE = "annotate_shared_feature_class"
+FEATURE_CLASS_PROMPT_FILE = "annotate/annotate_shared_feature_class"
 """每类特征的提示语模板（含 {{name}}/{{description}}/{{values}}/{{examples}}/{{usage}}）
 
 {{usage}} 是两种模式的分岔处：deep 那套（句子、关注词和选中示例由主 agent 转述）见
 annotate_shared_feature_usage_deep.txt，flat 那套（直接读取句子、关注词和选中示例）见
 annotate_shared_feature_usage_flat.txt——判据与逐字照抄规则留在本模板一份，两种模式共用。
 """
-FEATURE_CLASS_USAGE_FILE = "annotate_shared_feature_usage_deep"
+FEATURE_CLASS_USAGE_FILE = "annotate/annotate_shared_feature_usage_deep"
 """deep 模式下共享类别模板里 {{usage}} 的取值（subagent 的工作方式与输出格式）"""
-FEATURE_CLASS_USAGE_FLAT_FILE = "annotate_shared_feature_usage_flat"
+FEATURE_CLASS_USAGE_FLAT_FILE = "annotate/annotate_shared_feature_usage_flat"
 """flat/all_in_one 模式下共享类别模板里 {{usage}} 的取值（各类的工作方式与输出说明）"""
-SCHEMA_PROMPT_FILE = "annotate_pair_schema"
+SCHEMA_PROMPT_FILE = "annotate/pair/annotate_pair_schema"
 """pair 的 schema 查表未命中时使用的主提示语（single 诊断图复用）"""
-JUDGE_PROMPT_FILE = "annotate_pair_judgement"
+JUDGE_PROMPT_FILE = "annotate/pair/annotate_pair_judgement"
 """pair 的判定表没有直接结论时使用的主提示语"""
-SYNONYM_PROMPT_FILE = "annotate_synonym_judgement"
+SYNONYM_PROMPT_FILE = "annotate/synonym/annotate_synonym_judgement"
 """synonym 独立同义判断的主提示语，不查特征、图式或判定表"""
-ALL_IN_ONE_PROMPT_FILE = "annotate_all_in_one"
+ALL_IN_ONE_PROMPT_FILE = "annotate/all_in_one/annotate_all_in_one"
 """all_in_one 单次完整标注的主提示语，与 pair 共享类别片段"""
 
 
@@ -707,7 +711,7 @@ def pair_head_block(
 
 
 def _class_prompt(template: str, feature_class: dict, *, usage: str) -> str:
-    """按模板给某一类语义特征写一段提示语（模板见 system_prompt/annotate_shared_feature_class.txt）
+    """按模板给某一类语义特征写一段提示语（模板见 system_prompt/annotate/annotate_shared_feature_class.txt）
 
     usage 是模板里 {{usage}} 的取值；两种模式都直接依据句意判断，示例在运行时按关注词选择。
     """
@@ -722,7 +726,7 @@ def _class_prompt(template: str, feature_class: dict, *, usage: str) -> str:
             # 「示例：」这段有没有取决于有没有示例，末尾那个换行也得跟着一起消失，所以整段
             # （含标签与结尾换行）当**一个**占位符传进去，空时给空串。别把它拆成「模板里写死
             # 『示例：\n』+ 只替换行列表」——那样空示例时会多出一行「示例：」，而模板里看不出问题。
-            "examples": "",  # 示例只从 system_prompt/examples 按本侧关注词选取
+            "examples": "",  # 示例只从 system_prompt/annotate/examples 按本侧关注词选取
         },
         source=f"{FEATURE_CLASS_PROMPT_FILE}.txt",
     )
@@ -988,7 +992,7 @@ class BaseAgent:
     （FeatureAgent）在 __init__ 里覆盖 self.system_prompt——渲染要等它自己的配置表读完。
     """
     PROMPT_SOURCE: str = PROMPT_SOURCE_SYSTEM
-    """提示语在哪儿：system = system_prompt/（默认）；config = config_files/<语料类型>/
+    """提示语在哪儿：system = system_prompt/<模块>/（默认）；config = config_files/<语料类型>/
 
     按语料类型分两份的提示语走 config（目前只有 reality_agent）：它的判据随词类不同，
     与四张表同一个目录、同一套分组口径（见 spatial_tools.CONFIG_PROMPT_FILES）。
@@ -1125,7 +1129,7 @@ class BaseAgent:
         raise NotImplementedError
 
     def _prompt_path(self, name: str) -> Path:
-        """这份提示语的实际路径：默认在 system_prompt/ 下，config 来源的按语料类型取
+        """这份提示语的实际路径：默认在 system_prompt/annotate/（模块目录）下，config 来源的按语料类型取
 
         路径在这里算一次、绕给 utils.read_prompt_path：读法与报错文案两种来源完全一致，
         变的只是路径怎么来（见 PROMPT_SOURCE）。路径本身也留着（self.prompt_paths），
@@ -1532,7 +1536,7 @@ class RealityAgent(BaseAgent):
 
     **判据与语料筛选完全同一份实现**：新语料直接读 ``focus_word["screening"]``（由
     ``sentence_screening`` 写进记录，见 ``spatial_tools.pick_focus_words``），不发请求；只有旧语料
-    没有 screening 时，才用同一份 ``system_prompt/screen_<类型>.txt`` 与
+    没有 screening 时，才用同一份 ``system_prompt/extract/screen_<类型>.txt`` 与
     ``sentence_screening.build_item_content`` 回退问一次。筛选提示语缺失时本 agent 不另起一套
     判据，直接按 no_llm 放行；``config_files/<类型>/reality.txt`` 仍由筛选模板注入，
     正式 all_in_one 不读取这份筛选判据。
@@ -1553,7 +1557,7 @@ class RealityAgent(BaseAgent):
     INPUTS = ("sentence", "focus_word")
     OUTPUTS = ("is_spatial_scene", "reason", "source")
     CONFIG_NOTE = (
-        "system_prompt/screen_<词类型>.txt（与语料筛选共用）；"
+        "system_prompt/extract/screen_<词类型>.txt（与语料筛选共用）；"
         "config_files/<语料类型>/reality.txt 是空间判据片段（由 screen_*.txt 注入，正式标注不重筛）"
     )
     PROMPT_FILES = (REALITY_PROMPT_FILE,)
@@ -1915,7 +1919,7 @@ class SemanticAgent(BaseAgent):
 
     **判据与语料筛选完全同一份实现**：新语料直接读 ``focus_word["screening"]`` 的
     ``grammatical`` / ``spatial_coherent``，不发请求；旧语料没有 screening 时，才用同一份
-    ``system_prompt/screen_<类型>.txt`` 与 ``sentence_screening.build_item_content`` 回退问一次。
+    ``system_prompt/extract/screen_<类型>.txt`` 与 ``sentence_screening.build_item_content`` 回退问一次。
     b 侧（改写句）没有语料筛选结果，走同一份提示语的 LLM 回退；消息里会说明下标属于原句。
 
     落盘与返回形状由 semantic_verdict_result / semantic_blank 一处合成；正式 pair、synonym、
@@ -1933,8 +1937,8 @@ class SemanticAgent(BaseAgent):
         "spatial_reason",
         "source",
     )
-    CONFIG_NOTE = "system_prompt/screen_<词类型>.txt（与语料筛选共用；semantic.txt 已并入该文件）"
-    PROMPT_FILES = ("screen_localization", "screen_direction")
+    CONFIG_NOTE = "system_prompt/extract/screen_<词类型>.txt（与语料筛选共用；semantic.txt 已并入该文件）"
+    PROMPT_FILES = ("extract/screen_localization", "extract/screen_direction")
     """两份都校验一遍，实际用哪份由 corpus_type 决定（见 __init__）；--list 也据此显示路径。"""
     VERDICT_MODEL = sentence_screening.ExtractionVerdict
     CACHEABLE_SOURCES = ("llm",)
@@ -2392,7 +2396,7 @@ class SchemaAgent(BaseAgent):
 class SynonymAgent(BaseAgent):
     """直接比较两句是否同义，不依赖特征抽取、图式或判定表。
 
-    提示语只从 system_prompt/annotate_synonym_judgement.txt 读取，正文留给用户填写。读取空文件沿用
+    提示语只从 system_prompt/annotate/synonym/annotate_synonym_judgement.txt 读取，正文留给用户填写。读取空文件沿用
     utils.read_prompt_path 的规则（返回空字符串）；空提示语下 run() 不调用模型，
     warm() 不预热，返回 same_meaning=None、source=unfilled_prompt。
 
@@ -2476,6 +2480,7 @@ class JudgeAgent(BaseAgent):
     所以判定表里 上12 × 里1 这样的格子才对得上——两侧若共用一个关注词，b 侧会退回收窄回原词
     那一组，判定就只在同一组内自比了。
 
+    交 LLM 前按两侧图式名双向检索本语料类型的 judge 示例，仅注入命中组的句对及分析。
     不传句法证据，不绑工具。刻意不进按 message 的缓存：b 侧句子
     逐候选不同，消息也就条条不同，去重收益为零（CACHEABLE_SOURCES 留空）。
     """
@@ -2496,8 +2501,11 @@ class JudgeAgent(BaseAgent):
     PROMPT_FILES = (JUDGE_PROMPT_FILE,)
     VERDICT_MODEL = JudgeVerdict
 
-    def __init__(self, *, table: dict | None = None, **kwargs):
+    def __init__(self, *, table: dict | None = None, examples_root: str | Path | None = None, **kwargs):
         super().__init__(**kwargs)
+        self.example_groups = pe.load_examples(
+            "judge", self.corpus_type or st.DEFAULT_CORPUS_TYPE, root=examples_root
+        )
         if table is not None:
             self.table = table
             self.table_path = "调用方注入的判定表，无路径"
@@ -2526,6 +2534,8 @@ class JudgeAgent(BaseAgent):
         if local["source"] == "table" or not self.llm:
             return local
         situation = tables.judgement_situation(self.table, schema_a, schema_b)
+        examples = pe.judge_example_block(self.example_groups, schema_a.get("name"), schema_b.get("name"))
+        example_section = f"{examples}\n\n" if examples else ""
 
         content = (
             f"{pair_head_block(focus_word, focus_word_b, corpus_type=self.corpus_type)}\n"
@@ -2536,6 +2546,7 @@ class JudgeAgent(BaseAgent):
             f"改写句 schema：{schema_b.get('name')}（来源 {schema_b.get('source')}）\n"
             f"改写句语义特征：{json.dumps(features_b or {}, ensure_ascii=False)}\n"
             f"判定表情况：{situation}。\n"
+            f"{example_section}"
             "请判断这两句话的意义是否相同。"
         )
         try:
@@ -2902,7 +2913,7 @@ def _describe_prompt_files(cls: type[BaseAgent]) -> str:
     prefix = ""
     if getattr(cls, "USES_SCREENING_PROMPT", False):
         prefix = (
-            "system_prompt/screen_localization.txt、system_prompt/screen_direction.txt"
+            "system_prompt/extract/screen_localization.txt、system_prompt/extract/screen_direction.txt"
             "（与语料筛选共用；按 --corpus-type 选一份）；"
         )
     if cls.PROMPT_SOURCE == PROMPT_SOURCE_CONFIG:

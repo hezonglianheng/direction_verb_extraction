@@ -18,8 +18,8 @@
     // 原始文章 JSONL 文件或目录（extract 被选中时必填）。
     src_path: "../data/raw.jsonl",
 
-    // 提取规则；只支持单个文件。省略/null 时按 --corpus-type 使用 config_files/*_expressions.json5。
-    filter_config_path: "../config_files/localization_expressions.json5",
+    // 提取规则；只支持单个文件。省略/null 时按 --corpus-type 使用 config_files/<词类>/<词类>_expressions.json5。
+    filter_config_path: "../config_files/localization/localization_expressions.json5",
 
     // 初筛词表；可写一个字符串，也可写字符串数组（等价于重复传 -v）。null = 从规则自动推导。
     vocab_config_path: null,

@@ -6,25 +6,19 @@ from typing import Any
 import sys
 import time
 
+if __name__ == "__main__":
+    # 直接运行实现模块时也先走轻量 CLI，--help 不会触发下面的 LTP/torch 导入。
+    from extract import cli
+    raise SystemExit(cli.main())
+
 import config
 from extract import extraction_log
 from extract import local_model_service
 from extract import sentenceFilters
 from extract import sentence_screening
+from extract.cli_constants import DEFAULT_FILTER_CONFIG, LEGACY_OUTPUT_NAME
 from extract.entry_in_linux import run_linux_entry
 from extract.entry_in_win import run_windows_entry
-
-
-DEFAULT_FILTER_CONFIG = ""
-"""筛选配置文件默认路径
-
-刻意**不再**指向一个不存在的文件：旧默认值 filter_config.json5 在仓库里根本没有，按默认跑
-必然 FileNotFoundError，而报错只说「找不到文件」，看不出该选哪一个。实际的规则文件是
-config_files/*_expressions.json5（方位词与趋向动词各一份）——选哪套是研究口径，不由程序替
-用户猜，所以默认留空并在 main 里报出可选项（E2）。"""
-
-LEGACY_OUTPUT_NAME = "filtered_sentences.jsonl"
-"""只运行一套规则、且未指定 -o 时的输出文件名（与历史行为一致）"""
 
 
 def _normalize_paths(value: Any) -> list[str]:
@@ -174,7 +168,10 @@ def main(
     if not filter_configs:
         # 默认值为空是刻意的（见 DEFAULT_FILTER_CONFIG）：这里把可选项直接列出来，
         # 免得「按默认跑」变成一次必然失败、却看不出该选哪个的 FileNotFoundError（E2）
-        candidates = sorted(p.name for p in (Path(config._PROJECT_ROOT) / "config_files").glob("*_expressions.json5"))
+        candidates = sorted(
+            p.relative_to(Path(config._PROJECT_ROOT) / "config_files").as_posix()
+            for p in (Path(config._PROJECT_ROOT) / "config_files").glob("*/*_expressions.json5")
+        )
         raise ValueError(
             "必须用 -f/--filter_config_path 指定筛选配置（方位词与趋向动词是两套不同的规则）："
             f"config_files 下有 {'、'.join(candidates) or '（无）'}"
@@ -182,7 +179,10 @@ def main(
 
     for path in filter_configs:
         if not Path(path).is_file():
-            candidates = sorted(p.name for p in (Path(config._PROJECT_ROOT) / "config_files").glob("*.json5"))
+            candidates = sorted(
+                p.relative_to(Path(config._PROJECT_ROOT) / "config_files").as_posix()
+                for p in (Path(config._PROJECT_ROOT) / "config_files").glob("*/*.json5")
+            )
             raise FileNotFoundError(f"找不到筛选配置文件 {path}；config_files 下有：{candidates}")
 
     if sentence_dedup_window is None:
@@ -277,91 +277,3 @@ def main(
             finished_at=time.time(),
         )
 
-
-if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="句子过滤器，过滤包含动趋式、方位词等语言现象的句子")
-    parser.add_argument("src_path", type=str, help="输入文件或目录路径")
-    parser.add_argument(
-        "-f", "--filter_config_path", action="append", type=str, default=None,
-        help="筛选配置文件路径，可重复传入（也可用逗号分隔）以同时运行多套规则；"
-        "**必须显式指定**（两套规则的研究口径不同，不默认替你选）："
-        "config_files/direction_expressions.json5（趋向动词）或 localization_expressions.json5（方位词）",
-    )
-    parser.add_argument(
-        "-v", "--vocab_config_path", action="append", type=str, default=None,
-        help="初筛词表配置文件路径，可重复传入（取并集），默认为 None（从筛选配置自动推导）",
-    )
-    parser.add_argument("-t", "--tgt_path", type=str, default=".", help="输出目录路径，默认为当前目录（需已存在）")
-    parser.add_argument(
-        "-o", "--out_name", type=str, default=None,
-        help="输出文件名；只传一个 -f 时即该文件名，传多个 -f 时作为前缀（如 -o out 得到 out_规则名.jsonl）",
-    )
-    parser.add_argument(
-        "--no-llm-screen",
-        action="store_true",
-        help="关闭规则命中后的 LLM 筛选。默认开启，但只有 system_prompt/screen_localization.txt "
-        "或 screen_direction.txt 填了正文时才真正调模型；提示语为空时自动跳过、记录原样输出",
-    )
-    parser.add_argument(
-        "--screen-model",
-        default=config.SCREEN_MODEL,
-        help=f"LLM 筛选使用的模型配置名（model_config/api_keys.json 里的键），默认 {config.SCREEN_MODEL}",
-    )
-    parser.add_argument(
-        "--screen-workers",
-        type=int,
-        default=None,
-        help=f"LLM 筛选的并发线程数；不传时用模型配置 screen_workers，再回退到全局默认 "
-        f"{config.SCREEN_WORKERS}（逐词判定是 IO 密集的）",
-    )
-    parser.add_argument(
-        "--screen-batch-size",
-        type=int,
-        default=None,
-        help=f"每次 LLM 请求放入多少条判定项；不传时用模型配置 screen_batch_size，"
-        f"再回退到全局默认 {config.SCREEN_BATCH_SIZE}",
-    )
-    parser.add_argument(
-        "--screen-kind",
-        choices=sorted(sentence_screening.SCREEN_PROMPT_FILES),
-        default=None,
-        help="强制指定筛选提示语的词类型。默认按规则配置文件名推断（localization→方位词，"
-        "direction→趋向动词）；只能用于单套规则",
-    )
-    parser.add_argument(
-        "--extract-workers",
-        type=int,
-        default=config.EXTRACT_WORKERS,
-        help=f"文本切句的并发线程数，默认 {config.EXTRACT_WORKERS}（0 = 自动）",
-    )
-    parser.add_argument(
-        "--filter-workers",
-        type=int,
-        default=config.FILTER_WORKERS,
-        help=f"规则筛选的进程数，默认 {config.FILTER_WORKERS}（0 = 自动按 CPU 核数，1 = 串行）。"
-        "多进程会各持一份 LTP 模型，单卡上通常 1 更快；需要时再调大",
-    )
-    parser.add_argument(
-        "--sentence-dedup-window",
-        type=int,
-        default=config.SENTENCE_DEDUP_WINDOW,
-        help=f"跨文件句子去重窗口：只记住最近多少个词表初筛后的唯一句哈希，0=关闭。"
-        f"默认 {config.SENTENCE_DEDUP_WINDOW}，约 20–30MiB；窗口越大去重越彻底、内存越高",
-    )
-    args = parser.parse_args()
-    main(
-        args.src_path,
-        args.tgt_path,
-        args.filter_config_path,
-        args.vocab_config_path,
-        args.out_name,
-        screen_llm=not args.no_llm_screen,
-        screen_model=args.screen_model,
-        screen_workers=args.screen_workers,
-        screen_batch_size=args.screen_batch_size,
-        screen_kind=args.screen_kind,
-        extract_workers=args.extract_workers,
-        filter_workers=args.filter_workers,
-        sentence_dedup_window=args.sentence_dedup_window,
-    )

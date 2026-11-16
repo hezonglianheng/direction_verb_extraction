@@ -1,20 +1,14 @@
 # encoding: utf8
-"""语料替换阶段：原句及三元组 → 机械替换 → 检查替换句 → 一行一个句对。
+"""语料替换阶段的实现：机械替换 → 检查替换句 → 一行一个句对。
 
-示例：python replace --corpus results/location_corpus.jsonl
-                    --corpus-type 方位词 --out-file results/location_pairs.jsonl
-旧语料缺少完整原句判定时先补筛；标注阶段不再负责替换或语法/空间义检查。
-
-限额抽样（X 为送入替换的可用原句数）：
-    python replace --corpus ... --limit 500                          # 按顺序取前 500 条
-    python replace --corpus ... --limit 500 --limit-mode random --seed 0
-    python replace --corpus ... --limit 500 --limit-mode proportional --seed 0
-    python replace --corpus ... --reference-file filtered.jsonl      # 按已筛选文件逐条对回
-random/proportional 只额外读一遍语料做计数，不把 GB 级语料读进内存；同一 seed 可复现。
-aligned（--reference-file）按行号/句子内容严格对回同一份源语料，找不到或一对多会报错。
+命令行参数、帮助文案与抽样说明见 replace.cli；本模块不再重复维护一份。
 """
 
-import argparse
+if __name__ == "__main__":
+    # 直接运行实现模块时也先走轻量 CLI，--help 不会触发下面的模型依赖导入。
+    from replace import cli
+    raise SystemExit(cli.main())
+
 import copy
 import json
 import time
@@ -25,6 +19,7 @@ import config
 from replace import corpus_pairs as cp
 from replace import limit_sampler
 from replace import replacement_log
+from replace.cli import parse_args
 import file_paths
 from extract import local_model_service
 from extract import sentence_screening as ss
@@ -143,26 +138,6 @@ class PairPreparer:
         return pairs
 
 
-def _positive_int(value: str) -> int:
-    try:
-        number = int(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(f"必须是大于 0 的整数，收到 {value!r}") from exc
-    if number <= 0:
-        raise argparse.ArgumentTypeError(f"必须是大于 0 的整数，收到 {value!r}")
-    return number
-
-
-def _non_negative_int(value: str) -> int:
-    try:
-        number = int(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(f"必须是大于等于 0 的整数，收到 {value!r}") from exc
-    if number < 0:
-        raise argparse.ArgumentTypeError(f"必须是大于等于 0 的整数，收到 {value!r}")
-    return number
-
-
 def _iter_source_rows(path: Path):
     """不限额时的读法：保持原行为，只跳过空行、拒绝句对输入。"""
     with path.open(encoding="utf-8") as reader:
@@ -175,78 +150,7 @@ def _iter_source_rows(path: Path):
             yield line_no, row
 
 
-def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--corpus", required=True, help="提取阶段的原句 JSONL")
-    parser.add_argument("--corpus-type", default=st.DEFAULT_CORPUS_TYPE, type=st.normalize_corpus_type)
-    parser.add_argument("--out-file", default=None, help="句对 JSONL，默认 results/<类型>_pairs.jsonl")
-    parser.add_argument("--alter-rules", default=None, help="覆盖本词性的机械替换规则表")
-    parser.add_argument("--model", default=config.SCREEN_MODEL, help="语法、空间义检查的模型配置名")
-    parser.add_argument(
-        "--workers", type=int, default=None,
-        help=f"并发检查数；不传时用模型配置 screen_workers，再回退到全局默认 {config.SCREEN_WORKERS}",
-    )
-    parser.add_argument(
-        "--batch-size", type=int, default=None,
-        help=f"每次 LLM 请求放入多少条判定项；不传时用模型配置 screen_batch_size，"
-        f"再回退到全局默认 {config.SCREEN_BATCH_SIZE}",
-    )
-    parser.add_argument("--chunk-size", type=int, default=100, help="每批读入多少条原句")
-    parser.add_argument(
-        "--limit", type=_positive_int, default=None,
-        help="只把最多 X 条可用原句送入替换（X>0）；不传则处理全部语料。"
-             "可用原句指 true/no_llm 且句子形状合法的记录，坏记录与不可判定记录不占名额",
-    )
-    parser.add_argument(
-        "--limit-mode", choices=limit_sampler.LIMIT_MODES, default=None,
-        help="--limit 的抽取方式：sequential=按文件顺序取前 X 条（默认）；"
-             "random=从全部可用原句中随机抽 X 条；"
-             "proportional=在带本类关注词的可用原句中按主关注词比例分配 X 条"
-             "（配额描述选中记录的分层，句内其他位置仍会展开）；"
-             "aligned=按 --reference-file 逐条对回源语料",
-    )
-    parser.add_argument(
-        "--seed", type=_non_negative_int, default=None,
-        help="random/proportional 的随机种子，默认 0；同一份语料与种子可复现同一批记录。"
-             "仅与 --limit 一起使用；aligned 不使用随机种子",
-    )
-    parser.add_argument(
-        "--reference-file", default=None,
-        help="已筛选文件（JSONL）：按行号/句子内容把它逐条对回 --corpus。"
-             "给出后自动进入 aligned 模式；--limit 可省略（全部对齐），给了则只取源文件顺序的前 X 条。"
-             "reference 中任何一条找不到或一对多都会报错",
-    )
-    parser.add_argument(
-        "--log-dir", default=None,
-        help="替换日志目录；默认项目根目录下的 log/（不存在会自动创建）",
-    )
-    parser.add_argument("--no-llm", action="store_true", help="不调用模型；未检查的句对不可进入标注")
-    parser.add_argument("--overwrite", action="store_true")
-    args = parser.parse_args(argv)
-    if args.reference_file is not None:
-        if args.limit_mode not in (None, "aligned"):
-            parser.error("--reference-file 不能与 --limit-mode sequential/random/proportional 同时使用")
-        if args.seed is not None:
-            parser.error("--reference-file 不对齐随机过程，不能与 --seed 同时使用")
-        args.limit_mode = "aligned"
-        args.seed = limit_sampler.DEFAULT_SEED
-    elif args.limit_mode == "aligned":
-        parser.error("--limit-mode aligned 必须同时给出 --reference-file")
-    elif args.limit is None:
-        if args.limit_mode is not None or args.seed is not None:
-            parser.error("--limit-mode 与 --seed 只能在给出 --limit 时使用")
-        args.limit_mode = limit_sampler.DEFAULT_MODE
-        args.seed = limit_sampler.DEFAULT_SEED
-    else:
-        if args.limit_mode is None:
-            args.limit_mode = limit_sampler.DEFAULT_MODE
-        if args.seed is None:
-            args.seed = limit_sampler.DEFAULT_SEED
-    return args
-
-
-def main(argv=None):
-    args = parse_args(argv)
+def run(args):
     started_at = time.time()
     source = Path(args.corpus)
     reference = Path(args.reference_file) if args.reference_file else None
@@ -343,5 +247,7 @@ def main(argv=None):
     )
 
 
-if __name__ == "__main__":
-    main()
+def main(argv=None):
+    """兼容旧调用：解析参数后执行替换；实现主体见 run(args)。"""
+    return run(parse_args(argv))
+

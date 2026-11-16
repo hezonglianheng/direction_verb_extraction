@@ -891,8 +891,8 @@ if __name__ == "__main__":
     # 自测：python -m extract.sentenceFilters（需要 LTP 模型，秒级）
     # 注意：路径基于 __file__ 解析，与运行时 cwd 无关（旧写法用 Windows 反斜杠，在 Linux 下必然失败）
     config_dir = Path(config._PROJECT_ROOT) / "config_files"
-    direction_config = config_dir / "direction_expressions.json5"
-    locality_config = config_dir / "localization_expressions.json5"
+    direction_config = config_dir / "direction" / "direction_expressions.json5"
+    locality_config = config_dir / "localization" / "localization_expressions.json5"
     failures: list[str] = []
 
     def check(desc: str, condition: bool) -> None:
@@ -924,7 +924,7 @@ if __name__ == "__main__":
     # ---- 2. 初筛词表自动派生：必须与手写词表一致 ----
     print("初筛词表派生：")
     derived, unscreenable = direction_generator.collect_screen_vocab()
-    manual = set(json5.load(open(config_dir / "direction_vocab.json5", encoding="utf-8")))
+    manual = set(json5.load(open(config_dir / "direction" / "direction_vocab.json5", encoding="utf-8")))
     check("无推导不出初筛的规则", not unscreenable)
     check(f"派生词表 {sorted(derived or [])} == 手写词表 {sorted(manual)}", derived == manual)
 

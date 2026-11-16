@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # encoding: utf8
 
-"""把方位词筛选结果中的逐词 true/false 判定导出为 CSV。
+"""把 extract 模块的方位词筛选结果导出为逐词 true/false CSV。
 
-输入是 ``all_in_one.py`` / ``entry_in_linux.py`` 落盘的 JSONL。模型的逐词判定在
+输入是 ``python extract`` / ``pipeline.py`` 落盘的原句 JSONL。模型的逐词判定在
 ``screening.verdicts[]`` 里，``extractable`` 为 ``True``/``False`` 的条目才是模型
 真正判定过的方位词；``None`` 表示未送模型（limit/error/no_llm），不导出。
 
@@ -14,12 +14,15 @@
 一行对应一个方位词判定，因此同一句可能有多行。输出为 UTF-8 BOM 的 CSV，方便 Excel
 直接打开；不按句子或词形去重，保持输入顺序。
 
+只支持 extract 原句；replace 句对请使用
+``analyze_tools/replace/export_replace_pairs_csv.py``，本脚本会拒绝句对输入。
+
 用法（不传输入时自动选 results/extract_result 下最新的
 ``location_corpus_with_locative_split_*.jsonl``）：
-    .venv/bin/python analyze_tools/export_screening_verdicts_csv.py
-    .venv/bin/python analyze_tools/export_screening_verdicts_csv.py \
+    .venv/bin/python analyze_tools/extract/export_extract_verdicts_csv.py
+    .venv/bin/python analyze_tools/extract/export_extract_verdicts_csv.py \
         results/extract_result/location_corpus_with_locative_split_20261031.jsonl
-    ./analyze_tools/export_screening_verdicts_csv.py
+    ./analyze_tools/extract/export_extract_verdicts_csv.py
 
 默认输出到输入文件旁：
     results/extract_result/location_corpus_with_locative_split_20261031.screening_verdicts.csv
@@ -37,7 +40,7 @@ import sys
 import tempfile
 from typing import Any, Iterator
 
-ROOT_DIR = Path(__file__).resolve().parents[1]
+ROOT_DIR = Path(__file__).resolve().parents[2]
 RESULTS_DIR = ROOT_DIR / "results" / "extract_result"
 CORPUS_GLOB = "location_corpus_with_locative_split_*.jsonl"
 
@@ -210,6 +213,11 @@ def export_jsonl_to_csv(
                         raise ValueError(f"{source} 第 {line_no} 行不是合法 JSON：{exc}") from exc
                     if not isinstance(record, dict):
                         raise ValueError(f"{source} 第 {line_no} 行不是 JSON 对象")
+                    if "pair_schema_version" in record or "pair_screening" in record:
+                        raise ValueError(
+                            f"{source} 第 {line_no} 行是 replace 句对，不能按 extract 原句导出；"
+                            "请使用 analyze_tools/replace/export_replace_pairs_csv.py"
+                        )
                     stats["records"] += 1
 
                     screening = record.get("screening")
@@ -263,7 +271,7 @@ def export_jsonl_to_csv(
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="把方位词筛选结果里的逐词 true/false 判定导出为 CSV",
+        description="导出 extract 原句的逐词 true/false 判定（不支持 replace 句对）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__.split("用法：")[-1],
     )

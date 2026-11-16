@@ -9,7 +9,7 @@ LTP 偶尔把「名词+方位词」并成一个 token 并标成 n/nl（实测如
 本模块只负责「把这种 token 按后缀切开」这一件事：不依赖 LTP，也不依赖
 sentenceTable / sentenceFilters（后者会与 sentenceTable 形成循环导入），因此可以离线单测。
 
-后缀词表与筛选规则共用同一份 config_files/localization_vocab.json5，并按
+后缀词表与筛选规则共用同一份 config_files/localization/localization_vocab.json5，并按
 config.LOCATIVE_SPLIT_SUFFIX_EXCLUDE 剔除高风险单字后缀——这样「筛选用的方位词」
 与「切分用的后缀」不会各读一份文件而悄悄漂移。
 """

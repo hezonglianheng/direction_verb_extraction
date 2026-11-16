@@ -4,17 +4,26 @@
 
 语料提取见 extract/sentence_extract.py，机械替换及两侧检查见 replace/sentence_replace.py。
 正式 pair/synonym/all_in_one 图只消费替换阶段的句对，不展开候选、不重新筛选、不准备句法证据。
-原句和替换句各用自己的关注词与三元组，特征/图式示例从 system_prompt/examples 按词选择。
+原句和替换句各用自己的关注词与三元组，特征/图式示例从 system_prompt/annotate/examples 按词选择。
 single/alter_check 保留为显式诊断图，不是正式句对标注入口。
 
 默认输入：results/location_pairs.jsonl（方位词）、results/direction_pairs.jsonl（趋向动词）。
 --limit/--offset 按通过两侧检查的句对计数。结果为 JSONL、同名 CSV（可关闭）及 summary.json，
 收尾按 (line_no, candidate.index) 排序，可与 all_in_one.py 对账。模型执行日志见 log/。
 
+--limit 的抽取方式由 --limit-mode 决定（与 replace 的四种模式平行）：
+sequential（默认，按文件顺序）、random（随机 X 条，需 --seed）、proportional
+（按无向关注词对的比例分层，上-下 与 下-上 同层，需 --seed）、aligned（用
+--reference-file 指定一份 annotate 结果文件，读取其中全部句对并逐条对回当前 pairs）。三种抽样模式
+流式读取，不把整份语料放进内存；aligned 只为 reference 的句对身份保留一份索引。
+
 用法：
     python annotate --corpus results/location_pairs.jsonl --limit 5
     python annotate --corpus results/direction_pairs.jsonl --corpus-type 趋向动词 --limit 20
     python annotate --workers 4 --limit 200
+    python annotate --limit 200 --limit-mode random --seed 0
+    python annotate --limit 200 --limit-mode proportional --seed 0
+    python annotate --reference-file results/location_annotated.jsonl
     python annotate --no-llm --batch off --limit 5
     python annotate --models model-a model-b --workers 4
     python annotate --batch native --batch-resume --batch-cache results/run.batch-cache.jsonl
@@ -45,6 +54,7 @@ import batch_inference as bi
 import config
 from replace import corpus_pairs as cp
 import file_paths
+from annotate import limit_sampler as ls
 from annotate import spatial_agents as sa
 from annotate import spatial_graphs as sg
 from annotate import spatial_tools as st
@@ -281,6 +291,16 @@ class ResultWriter:
 # --------------------------------------------------------------------------
 
 
+def _non_negative_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"必须是大于等于 0 的整数，收到 {value!r}") from exc
+    if number < 0:
+        raise argparse.ArgumentTypeError(f"必须是大于等于 0 的整数，收到 {value!r}")
+    return number
+
+
 def _corpus_type_arg(value: str) -> str:
     """argparse 的 type：把类型规范化，认不出时报参数错（退出码 2）
 
@@ -357,7 +377,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="类型",
         type=_corpus_type_arg,
         help="语料类型：方位词（别名 localization/location/loc）或 趋向动词（别名 direction/dir/direction_verb）。"
-        "决定读取该词性的特征、图式与判定配置，以及 system_prompt/examples 下的示例。"
+        "决定读取该词性的特征、图式与判定配置，以及 system_prompt/annotate/examples 下的示例。"
         "默认方位词；**刻意不按语料文件名推断**——推断猜错时是静默读错一整组表，"
         "宁可要你显式说一句（语料名像另一类时会提醒一句，但不会替你改）。"
         "正式标注前请先运行 python replace 生成该类型的句对",
@@ -399,9 +419,39 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=None,
         help="最多处理多少条两侧已通过检查的句对（过滤后计数）；"
-        "可用数量不足时会报告。未指定时按图默认：pair/synonym=100，all_in_one=1",
+        "可用数量不足时会报告。未指定时按图默认：pair/synonym=100，all_in_one=1；"
+        "aligned 模式可省略（表示 reference 中全部句对）",
     )
-    parser.add_argument("--offset", type=int, default=0, help="跳过前多少条可用判定语料（过滤后计数）")
+    parser.add_argument(
+        "--limit-mode",
+        choices=ls.LIMIT_MODES,
+        default=None,
+        help="--limit 的抽取方式：sequential=按文件顺序取前 X 条（默认）；"
+        "random=从全部合格句对中随机抽 X 条；"
+        "proportional=按无向关注词对（上-下 与 下-上 同层）的比例分配 X 条；"
+        "aligned=按 --reference-file 的 annotate 结果逐条对回当前句对。"
+        "后三种与 replace 的同名模式口径一致",
+    )
+    parser.add_argument(
+        "--seed",
+        type=_non_negative_int,
+        default=None,
+        help="random/proportional 的随机种子，默认 0；同一份语料与种子可复现同一批句对。"
+        "仅与 --limit 一起使用；aligned 不使用随机种子",
+    )
+    parser.add_argument(
+        "--reference-file",
+        default=None,
+        help="annotate 结果 JSONL：读取其中所有句对，按 candidate_key 逐条对回 --corpus。"
+        "给出后自动进入 aligned 模式；--limit 可省略（全部对齐），给了则只取源文件顺序的前 X 条。"
+        "reference 中任何一条句对找不到或一对多都会报错；不能与 --seed 或"
+        "非 aligned 的 --limit-mode 同时使用",
+    )
+    parser.add_argument(
+        "--offset", type=int, default=0,
+        help="跳过前多少条可用判定语料（过滤后计数）；"
+        "三种抽样模式下先跳过再抽样，aligned 按匹配到的源记录顺序跳过",
+    )
     model_group = parser.add_mutually_exclusive_group()
     model_group.add_argument("--model", default=DEFAULT_MODEL, help="model_config/api_keys.json 里的配置名（单模型模式）")
     model_group.add_argument(
@@ -464,7 +514,37 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.graph = resolve_graph_selection(args.graph, args.engine)
     except ValueError as exc:
         parser.error(str(exc))
-    if args.limit is None:
+    if args.graph in FORMAL_GRAPHS:
+        # 正式图沿用“X>0”的新口径；诊断图保留旧的 limit<=0 返回空列表兼容行为。
+        if args.limit is not None and args.limit <= 0:
+            parser.error("--limit 必须是大于 0 的整数")
+        if args.offset < 0:
+            parser.error("--offset 必须是大于等于 0 的整数")
+    if args.graph not in FORMAL_GRAPHS and (
+        args.reference_file is not None or args.limit_mode is not None or args.seed is not None
+    ):
+        parser.error("--limit-mode / --seed / --reference-file 只支持正式图 pair/synonym/all_in_one")
+    if args.reference_file is not None:
+        if args.limit_mode not in (None, "aligned"):
+            parser.error("--reference-file 不能与 --limit-mode sequential/random/proportional 同时使用")
+        if args.seed is not None:
+            parser.error("--reference-file 不对齐随机过程，不能与 --seed 同时使用")
+        args.limit_mode = "aligned"
+        args.seed = ls.DEFAULT_SEED
+    elif args.limit_mode == "aligned":
+        parser.error("--limit-mode aligned 必须同时给出 --reference-file")
+    elif args.limit is None:
+        if args.limit_mode is not None or args.seed is not None:
+            parser.error("--limit-mode 与 --seed 只能在给出 --limit 时使用；aligned 请改用 --reference-file")
+        args.limit_mode = ls.DEFAULT_MODE
+        args.seed = ls.DEFAULT_SEED
+    else:
+        if args.limit_mode is None:
+            args.limit_mode = ls.DEFAULT_MODE
+        if args.seed is None:
+            args.seed = ls.DEFAULT_SEED
+    # aligned 未显式给 X 时保留 None（用 reference 中全部句对），不能被图的默认 limit 截断。
+    if args.limit is None and args.limit_mode != "aligned":
         args.limit = sg.get_graph(args.graph).default_limit
     if args.graph in FORMAL_GRAPHS and args.alter_rules:
         parser.error("正式标注不再替换句子；请将 --alter-rules 传给 python replace")
@@ -503,6 +583,39 @@ def _warn_corpus_type_mismatch(corpus_path: Path, corpus_type: str) -> None:
             f"警告：语料文件名 {corpus_path.name} 像是{other_kind}语料，但本次类型是{corpus_type}"
             f"（只由 --corpus-type 决定，不按文件名推断）；若确实是{other_kind}语料，"
             f"请加 --corpus-type {other_kind}"
+        )
+
+
+def _print_selection(stats: dict) -> None:
+    """打印本轮限额筛选的实际口径（在 records 消费完之后调用，统计才完整）。"""
+    limit_text = "全部" if stats.get("limit") is None else stats["limit"]
+    offset_text = f" 跳过={stats['offset']}" if stats.get("offset") else ""
+    print(
+        f"限额筛选：模式={stats['mode']} 上限={limit_text} 候选={stats['candidates']} "
+        f"选中={stats['selected']} 种子={stats['seed']}{offset_text}"
+    )
+    if stats["mode"] == "proportional":
+        layers = stats.get("pair_totals") or {}
+        print(
+            f"  分层：{len(layers)} 个词对；配额合计 {sum((stats.get('pair_quotas') or {}).values())} 条"
+            "（上-下 与 下-上 视为同一层）"
+        )
+    if stats["mode"] == "aligned":
+        print(
+            f"  参考文件：{stats.get('reference_file')} "
+            f"reference 句对={stats.get('reference_records')} "
+            f"已对齐={stats.get('matched_reference_records')} "
+            f"源记录={stats.get('matched_source_records')} "
+            f"非句对记录={stats.get('reference_non_pairs')}"
+        )
+    if stats.get("skipped_no_word"):
+        print(f"注意：{stats['skipped_no_word']} 条合格句对缺一侧关注词，未进入比例分层")
+    if stats.get("skipped_ineligible"):
+        print(f"注意：{stats['skipped_ineligible']} 条记录不是合格句对，未参与本轮筛选")
+    if stats.get("limit") is not None and stats["selected"] < stats["limit"]:
+        print(
+            f"注意：可用量不足，实际只选中 {stats['selected']} 条"
+            f"（上限 {stats['limit']} 条）"
         )
 
 
@@ -729,6 +842,7 @@ def _validate_run_outputs(
     csv_columns: tuple[tuple[str, str], ...] = (),
     overwrite: bool = False,
     extra_outputs: tuple[str | Path, ...] = (),
+    extra_inputs: tuple[str | Path, ...] = (),
 ) -> None:
     """在**首次写入之前**把这次跑批要写的几个路径一起查一遍（E1）
 
@@ -750,7 +864,14 @@ def _validate_run_outputs(
         st.pairs_csv_path(out_path) if csv_columns else None,
         overwrite=overwrite,
         extra_outputs=extra_outputs,
+        extra_inputs=extra_inputs,
     )
+
+
+def _reference_inputs(args) -> tuple[Path, ...]:
+    """本轮额外读取的输入路径（目前只有 aligned 的 --reference-file）。"""
+    value = getattr(args, "reference_file", None)
+    return (Path(value),) if value else ()
 
 
 def _build_overrides(args, spec: sg.GraphSpec) -> dict[str, dict]:
@@ -852,7 +973,7 @@ def _validate_multi_model_outputs(args, spec, corpus_path, out_path: Path, model
     if not args.no_llm and getattr(args, "batch", "off") != "off":
         for name, path in raw_paths.items():
             sidecars.extend(bi.sidecar_paths(_batch_cache_path(args, path, name)))
-    file_paths.validate_output_paths([corpus_path], main_outputs + sidecars)
+    file_paths.validate_output_paths([corpus_path, *_reference_inputs(args)], main_outputs + sidecars)
     for path in main_outputs + sidecars:
         if path.exists() and not path.is_file():
             raise ValueError(f"输出路径不是文件：{path}")
@@ -913,6 +1034,9 @@ def _execute_run(
         writer.extra_summary["structured_retry"] = {
             name: agent.allow_structured_retry for name, agent in agents.items()
         }
+        # 限额筛选口径进汇总：事后拿到结果能直接看出这轮是顺序/随机/比例/对齐、种子多少。
+        if getattr(args, "filter_stats", None):
+            writer.extra_summary["selection"] = dict(args.filter_stats)
         # 实际生效的请求策略（超时/重试/退避）写进汇总：事后看到某轮特别慢，
         # 能直接判断是模型慢还是重试多，不必翻 config.py 与模型配置去猜
         first_agent = next(iter(agents.values()), None)
@@ -1107,6 +1231,7 @@ def _run_single_model(args, spec, corpus_type, corpus_path, records, out_path: P
         csv_columns=csv_columns,
         overwrite=args.overwrite,
         extra_outputs=sidecars,
+        extra_inputs=_reference_inputs(args),
     )
     overrides = _build_overrides(args, spec)
     agents = _build_model_agents(args, spec, corpus_type, model_key, overrides)
@@ -1221,6 +1346,7 @@ def _model_summary_entry(
             "reality_prefill": writer.reality_prefill,
             "request_policy": writer.extra_summary.get("request_policy"),
             "structured_retry": writer.extra_summary.get("structured_retry"),
+            "selection": writer.extra_summary.get("selection"),
             **({"all_in_one_calls": writer.extra_summary["all_in_one_calls"]}
                if "all_in_one_calls" in writer.extra_summary else {}),
             "batch": writer.extra_summary.get("batch"),
@@ -1233,6 +1359,31 @@ def _model_summary_entry(
         "status": "failed",
         "error": repr(exc) if exc is not None else "未运行",
         "count": len(model_records.get(name) or []),
+    }
+
+
+def _voting_extra_summary(
+    args, spec, weights, final_records, model_names, results, failed, model_records, log, raw_paths
+) -> dict:
+    """最终投票 writer 的汇总块；独立成函数，便于核对它与各模型 summary 的口径一致。"""
+    return {
+        **({"annotation_mode": spec.name} if spec.name in FORMAL_GRAPHS else {}),
+        "voting": voting.summarize_voting(final_records),
+        "model_names": list(model_names),
+        "voting_weights": dict(weights),
+        **({"selection": dict(args.filter_stats)} if getattr(args, "filter_stats", None) else {}),
+        **({"failed_models": {name: repr(exc) for name, exc in failed.items()}} if failed else {}),
+        **(
+            {"agent_log_file": str(log.path), "agent_log_jsonl": str(log.jsonl_path)}
+            if log.path is not None and log.jsonl_path is not None
+            else {}
+        ),
+        # 失败模型也留一条（status=failed + error）：事后看汇总能直接分辨
+        # “这个模型没票”是设计如此，还是它那一轮炸了
+        "models": [
+            _model_summary_entry(name, weights, raw_paths, results, failed, model_records)
+            for name in model_names
+        ],
     }
 
 
@@ -1418,24 +1569,10 @@ def _run_multi_model_impl(
         expanded_states=len(first_states),
         progress_prefix="[voting] ",
     )
-    voting_writer.extra_summary = {
-        **({"annotation_mode": spec.name} if spec.name in FORMAL_GRAPHS else {}),
-        "voting": voting.summarize_voting(final_records),
-        "model_names": list(model_names),
-        "voting_weights": dict(weights),
-        **({"failed_models": {name: repr(exc) for name, exc in failed.items()}} if failed else {}),
-        **(
-            {"agent_log_file": str(log.path), "agent_log_jsonl": str(log.jsonl_path)}
-            if log.path is not None and log.jsonl_path is not None
-            else {}
-        ),
-        # 失败模型也留一条（status=failed + error）：事后看汇总能直接分辨
-        # “这个模型没票”是设计如此，还是它那一轮炸了
-        "models": [
-            _model_summary_entry(name, weights, raw_paths, results, failed, model_records)
-            for name in model_names
-        ],
-    }
+    voting_writer.extra_summary = _voting_extra_summary(
+        args, spec, weights, final_records, model_names,
+        results, failed, model_records, log, raw_paths,
+    )
     for record in final_records:
         voting_writer.write(record)
     summary = voting_writer.finish()
@@ -1522,17 +1659,29 @@ def main(argv: list[str] | None = None) -> None:
             print("提示：--all-candidates 为旧命令兼容参数；现在一行一个合格句对，不再展开候选。")
         if args.no_syntax or args.batch_inference:
             print("提示：正式标注不准备句法；--no-syntax / --batch-inference 不改变本次输入或执行。")
-        records = cp.read_prepared_pairs(corpus_path, limit=args.limit, offset=args.offset)
-        if any(record.get("corpus_type") != corpus_type for record in records):
-            raise ValueError("句对的 corpus_type 与 --corpus-type 不一致，不能使用另一词性的标注配置")
+        reference = Path(args.reference_file) if args.reference_file else None
+        if reference is not None and not reference.is_file():
+            raise FileNotFoundError(f"找不到 reference 文件 {reference}")
+        selection = ls.select_pairs(
+            corpus_path,
+            limit=args.limit,
+            mode=args.limit_mode,
+            seed=args.seed,
+            corpus_type=corpus_type,
+            offset=args.offset,
+            reference_file=reference,
+        )
+        records = st.prepare_selected_records(selection.records)
+        args.filter_stats = selection.stats
+        _print_selection(selection.stats)
     else:
         records = st.read_corpus(corpus_path, limit=args.limit, offset=args.offset, judge_only=True)
-    if args.limit is not None and len(records) < args.limit:
-        print(
-            f"警告：可用判定语料只有 {len(records)} 条，少于计数限制 {args.limit} 条；"
-            "已按实际数量运行"
-            + (f"（已跳过 offset={args.offset} 条可用语料）" if args.offset else "")
-        )
+        if args.limit is not None and len(records) < args.limit:
+            print(
+                f"警告：可用判定语料只有 {len(records)} 条，少于计数限制 {args.limit} 条；"
+                "已按实际数量运行"
+                + (f"（已跳过 offset={args.offset} 条可用语料）" if args.offset else "")
+            )
     if not records:
         print(f"没有从 {corpus_path} 读到可用于判定的记录")
         return

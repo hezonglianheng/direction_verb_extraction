@@ -13,7 +13,7 @@ LLM，输出是“原有结果 + 后续补充结果”的**总集**：输入有�
 用法：:
 
     python extract/rescreen.py 输入.jsonl \
-        -f config_files/localization_expressions.json5 \
+        -f config_files/localization/localization_expressions.json5 \
         -o 输入.rescreened.jsonl \
         --screen-model deepseek-flash \
         --screen-workers 8 --screen-batch-size 20
@@ -507,7 +507,7 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
         type=str,
         help="筛选规则配置，用来推导目标词表和词类型；例如 "
-        "config_files/localization_expressions.json5",
+        "config_files/localization/localization_expressions.json5",
     )
     parser.add_argument(
         "-o",

@@ -28,7 +28,7 @@ from evaluate.data import EvalSample
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PROMPT_DIR = _PROJECT_ROOT / "system_prompt" / "evaluate"
 """仅保留资源路径兼容常量；新推理路径不读取此目录。"""
-IDENTITY_SCHEMA_VERSION = 2
+IDENTITY_SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -150,11 +150,14 @@ def _batch_error_kind(message: str | None) -> str:
 
 
 def _sanitize_batch_cache(cache_path: str | Path, cfg: dict | None) -> bool:
-    """把旧 sidecar 里已经落盘的错误文本再洗一遍，返回 False 表示读不到文件。
+    """对 Batch 缓存里的错误文本与结果 dumps 做统一脱敏，返回 False 表示读不到文件。
 
     新结果的错误已在 ``BatchSession`` 落盘前脱敏（sanitize_error 钩子）；这里
-    只是给 --batch-resume 的旧缓存兜底。缓存是本地文件，但用户可能把它连同
-    报告一起分享；只改 ``error`` 字段，成功结果与键保持原样。
+    同时兜底旧缓存和本轮写入：再次清洗 ``error``，并递归脱敏 ``dumps`` 中的字符串
+    值（成功结果也可能带 URL 或凭据）。条目的 ``key``、嵌套字典键与其他字段值保持
+    不变；只有内容变化时才原子重写整个文件（空行会被略去，JSON 会重新序列化）。
+    文件不存在或不是普通文件时返回 True；读取发生 ``OSError`` 时返回 False，写入
+    异常向上传播。
     """
     path = Path(cache_path)
     if not path.exists() or not path.is_file():
@@ -173,11 +176,17 @@ def _sanitize_batch_cache(cache_path: str | Path, cfg: dict | None) -> bool:
         except json.JSONDecodeError:
             cleaned.append(line)
             continue
-        if isinstance(entry, dict) and entry.get("error"):
-            new_error = sanitize_text(entry["error"], cfg)
-            if new_error != entry["error"]:
-                entry["error"] = new_error
-                changed = True
+        if isinstance(entry, dict):
+            if entry.get("error"):
+                new_error = sanitize_text(entry["error"], cfg)
+                if new_error != entry["error"]:
+                    entry["error"] = new_error
+                    changed = True
+            if "dumps" in entry:
+                cleaned_dumps = _sanitize_value(entry["dumps"], cfg)
+                if cleaned_dumps != entry["dumps"]:
+                    entry["dumps"] = cleaned_dumps
+                    changed = True
         cleaned.append(json.dumps(entry, ensure_ascii=False))
     if changed:
         with file_paths.atomic_write_text(path) as handle:
@@ -208,29 +217,187 @@ def _digest(value) -> str:
     return _sha256(_json(value))
 
 
-def _public_config(value, cfg):
-    """配置快照只输出非凭据字段；URL 与任意嵌套字符串沿用现有脱敏口径。"""
-    if isinstance(value, dict):
-        return {
-            key: _public_config(item, cfg) for key, item in value.items()
-            if not re.fullmatch(
-                r"(?i)(?:.*[-_])?(?:api[-_]?key|token|secret|password|authorization|credentials)"
-                r"|(?:access|refresh|auth)[-_]?token",
-                str(key),
-            )
+_SAFE_GENERATION_PATHS = frozenset({
+    "max_tokens", "max_completion_tokens", "max_output_tokens",
+    "reasoning_max_tokens", "top_p", "top_k", "seed", "stop",
+    "reasoning_effort", "effort", "enable_thinking", "thinking_budget",
+    "reasoning.max_tokens", "reasoning.effort", "reasoning.enabled",
+    "extra_body.max_tokens", "extra_body.max_completion_tokens",
+    "extra_body.max_output_tokens", "extra_body.thinking.type",
+    "extra_body.thinking.budget_tokens",
+    "extra_body.chat_template_kwargs.enable_thinking",
+    "extra_body.reasoning.effort",
+})
+"""完整点分路径白名单；不按叶子键名判断，避免未知祖先夹带秘密。"""
+
+
+def _scalar(value) -> bool:
+    if isinstance(value, (str, bool, int, float)) or value is None:
+        return True
+    return isinstance(value, list) and all(
+        isinstance(item, (str, bool, int, float)) or item is None for item in value)
+
+
+def _flatten_generation(value: dict, prefix: str = "") -> tuple[dict, bool]:
+    result, unpublished = {}, False
+    for key, item in value.items():
+        name = f"{prefix}.{key}" if prefix else str(key)
+        if isinstance(item, dict):
+            nested, hidden = _flatten_generation(item, name)
+            result.update(nested)
+            unpublished = unpublished or hidden
+        elif name in _SAFE_GENERATION_PATHS and _scalar(item):
+            result[name] = item
+        else:
+            unpublished = True
+    return result, unpublished
+
+
+def public_generation(cfg: dict) -> dict:
+    """把实际生效的思考/生成策略压缩成固定安全字段；未知参数只标记存在。"""
+    from agents import disable_thinking_kwargs
+
+    configured = cfg.get("disable_thinking")
+    source = "default" if configured is None else "explicit_empty" if configured == {} else "override"
+    fields, unpublished = _flatten_generation(disable_thinking_kwargs(cfg))
+    return {
+        **fields,
+        "thinking_policy_source": source,
+        "has_unpublished_parameters": unpublished,
+    }
+
+
+def public_request_policy(policy: dict) -> dict:
+    """请求策略固定白名单；不把任意扩展字段带入公开结果。"""
+    return {
+        "timeout_seconds": policy.get("timeout"),
+        "max_retries": policy.get("max_retries"),
+        "backoff_seconds": policy.get("backoff_seconds"),
+        "backoff_max_seconds": policy.get("backoff_max_seconds"),
+        "jitter_seconds": policy.get("jitter_seconds"),
+    }
+
+
+def actual_mode(batch_mode: str, outcome) -> str:
+    if outcome is None or not outcome.plan.requests:
+        return "not_executed"
+    if outcome.batch is None:
+        return "sync"
+    return str(outcome.batch.get("mode") or "native")
+
+
+def public_model_info(
+    spec: ModelSpec, *, batch_mode: str, actual_mode: str | None = None,
+) -> dict:
+    """报告中的模型/调用摘要：固定字段，不复制 cfg 或 batch.extra。"""
+    cfg, batch = spec.cfg, spec.batch
+    use_native = batch is not None and batch.enabled and (
+        actual_mode in ("native", "mixed")
+        or (actual_mode is None and batch_mode != "off")
+    )
+    model = (batch.model if use_native and batch.model else
+             cfg.get("model") or cfg.get("model_name") or "")
+    provider = (batch.provider if use_native and batch.provider else
+                cfg.get("model_provider") or cfg.get("provider") or "")
+    temperature = float((batch.temperature if use_native else cfg.get("temperature", 0)) or 0)
+    # 同步链路与原生请求都会在基础 kwargs 之后合并额外调用参数；复现摘要取最终值。
+    if use_native:
+        override = batch.extra
+    else:
+        from agents import disable_thinking_kwargs
+
+        override = disable_thinking_kwargs(cfg)
+    if isinstance(override.get("model"), str) and override["model"].strip():
+        model = override["model"]
+    if isinstance(override.get("temperature"), (int, float)) and not isinstance(
+            override["temperature"], bool):
+        temperature = float(override["temperature"])
+    # 只有同步构造会合并 model_provider；native extra 仅是请求体字段，
+    # 不能把 payload 里的 provider 当成实际传输后端。
+    if not use_native and isinstance(override.get("model_provider"), str):
+        provider = override["model_provider"]
+    batch_endpoint = ""
+    if batch is not None and batch.enabled:
+        batch_endpoint = f"{redact_url(batch.base_url).rstrip('/')}/batches"
+    return {
+        "config_key": spec.key,
+        "provider": str(provider),
+        "model_name": str(model),
+        "endpoint": redact_url(cfg.get("base_url")),
+        "temperature": temperature,
+        "proxy_mode": spec.proxy_mode,
+        "request": public_request_policy(spec.policy),
+        "batch": {
+            "enabled": bool(batch.enabled) if batch is not None else False,
+            "protocol": batch.protocol if batch is not None else None,
+            "endpoint": batch_endpoint,
+            "disabled_reason": sanitize_text(batch.disabled_reason, cfg) if batch is not None else "",
+        },
+    }
+
+
+def _batch_profile_identity(profile) -> str:
+    return _digest({
+        "model_key": profile.model_key, "provider": profile.provider, "model": profile.model,
+        "base_url": profile.base_url, "protocol": profile.protocol,
+        "temperature": profile.temperature, "completion_window": profile.completion_window,
+        "extra": profile.extra, "enabled": profile.enabled,
+        "proxy_mode": profile.proxy_mode, "proxy_url": profile.proxy_url,
+    })
+
+
+def safe_batch_meta(profile, cfg: dict | None = None) -> dict:
+    """共享 BatchSession 的 .meta.json：只留公开摘要和不可逆签名。"""
+    return {
+        "schema_version": 1,
+        "model_key": profile.model_key,
+        "provider": profile.provider,
+        "model": profile.model,
+        "endpoint": redact_url(profile.base_url),
+        "protocol": profile.protocol,
+        "temperature": profile.temperature,
+        "completion_window": profile.completion_window,
+        "enabled": bool(profile.enabled),
+        "disabled_reason": sanitize_text(profile.disabled_reason, cfg),
+        "signature": _batch_profile_identity(profile),
+    }
+
+
+class SafeBatchProfile:
+    """把写 .meta.json 时调用的 fingerprint() 换成安全摘要，其余参数原样代理。"""
+
+    def __init__(self, profile, cfg: dict | None = None):
+        self._profile = profile
+        self._cfg = cfg
+
+    def __getattr__(self, name):
+        return getattr(self._profile, name)
+
+    def fingerprint(self) -> dict:
+        return safe_batch_meta(self._profile, self._cfg)
+
+
+def private_model_identity(spec: ModelSpec) -> str:
+    """不可见的运行配置摘要：用于续跑校验，不写回报告。"""
+    cfg = {key: value for key, value in spec.cfg.items() if key != "api_key"}
+    batch = None
+    if spec.batch is not None:
+        batch = {
+            "model_key": spec.batch.model_key, "provider": spec.batch.provider,
+            "model": spec.batch.model, "base_url": spec.batch.base_url,
+            "protocol": spec.batch.protocol, "temperature": spec.batch.temperature,
+            "completion_window": spec.batch.completion_window,
+            "extra": spec.batch.extra, "enabled": spec.batch.enabled,
+            "proxy_mode": spec.batch.proxy_mode, "proxy_url": spec.batch.proxy_url,
         }
-    if isinstance(value, (list, tuple)):
-        return [_public_config(item, cfg) for item in value]
-    if isinstance(value, str):
-        return redact_url(value) if "://" in value else sanitize_text(value, cfg)
-    return value
+    return _digest({"cfg": cfg, "policy": spec.policy, "proxy_mode": spec.proxy_mode, "batch": batch})
 
 
 def pipeline_provenance(pipeline, spec: ModelSpec) -> dict:
-    """实际 agent 实例的可报告快照；不读取模板/表第二遍，也不接收样本。
+    """实验结果材料与公开路由摘要；模型/请求配置只走固定公开字段。
 
-    指纹含有效 system prompt、加载的原模板/表/示例、输出 schema、预算/重试策略，
-    以及生成 user message / 查表 / 解析的实现文件哈希。路径用于溯源，不替代内容哈希。
+    这里保留提示语、模板、配置表、示例、输出 schema 和实现文件的版本/哈希，
+    让外部知道复现依赖哪些材料；实际模型配置不在这份材料快照中出现。
     """
     import batch_inference as bi
     from evaluate import annotation
@@ -268,7 +435,6 @@ def pipeline_provenance(pipeline, spec: ModelSpec) -> dict:
             "class_prompts_sha256": _digest(getattr(agent, "class_prompts", [])),
             "output_schema": {"sha256": _digest(agent.response_model().model_json_schema())},
             "policy": {
-                "retry": _public_config(agent.retry_policy, spec.cfg),
                 "allow_structured_retry": agent.allow_structured_retry,
                 "max_requests": agent.max_requests,
                 "batch_max_requests": getattr(agent.batch_budget, "max_requests", None),
@@ -285,22 +451,78 @@ def pipeline_provenance(pipeline, spec: ModelSpec) -> dict:
         for module in modules
     }
     implementation[__name__] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
-    batch_profile = None
-    if spec.batch is not None:
-        batch_profile = spec.batch.fingerprint()
-        # fingerprint() 将 extra 编码成字符串；先取实际字典，才能递归去凭据而不丢请求选项。
-        batch_profile["extra"] = spec.batch.extra
-    provenance = {
+    materials = {
         "agents": agents,
-        "model_config": _public_config(spec.cfg, spec.cfg),
-        "request_policy": _public_config(spec.policy, spec.cfg),
-        "proxy_mode": spec.proxy_mode,
-        "batch_profile": _public_config(batch_profile, spec.cfg),
-        "native_output_policy": {"tool_name": bi.TOOL_NAME, "strict_native": True},
         "implementation": implementation,
+        "native_output_policy": {"tool_name": bi.TOOL_NAME, "strict_native": True},
     }
-    metadata = _sanitize_value({**pipeline.metadata(), "provenance": provenance}, spec.cfg)
+    metadata = _sanitize_value({**pipeline.metadata(), "materials": materials}, spec.cfg)
     return {**metadata, "fingerprint": _digest(metadata)}
+
+
+def pipeline_private_identity(pipeline, spec: ModelSpec) -> str:
+    return _digest({"pipeline": pipeline, "configuration": private_model_identity(spec)})
+
+
+def _sync_structured_output(spec: ModelSpec) -> str:
+    """同步链路实际使用的结构化输出策略；与 agents 工厂共用同一份配置规则。"""
+    try:
+        from agents import structured_output_mode
+        return f"{structured_output_mode(spec.cfg, spec.key)}_strategy"
+    except Exception:  # noqa: BLE001 —— 配置错误会在模型调用处另行报告
+        return "unknown"
+
+
+def public_reproducibility(
+    spec: ModelSpec, pipeline: dict | None, *, batch_mode: str, workers: int,
+    poll_seconds: float, timeout_seconds: float, chunk_size: int, outcome,
+) -> dict:
+    """执行与调用参数：让外部知道实际走的是同步、回退还是原生 Batch。"""
+    actual = actual_mode(batch_mode, outcome)
+    fallback_reason = None
+    if outcome is not None and actual in ("fallback", "mixed") and outcome.batch_error:
+        fallback_reason = sanitize_text(outcome.batch_error, spec.cfg)
+    agents = ((pipeline or {}).get("materials") or {}).get("agents") or {}
+    retry_flags = {name: item.get("policy", {}).get("allow_structured_retry")
+                   for name, item in agents.items()}
+    budgets = {name: {"max_requests": item.get("policy", {}).get("max_requests"),
+                      "batch_max_requests": item.get("policy", {}).get("batch_max_requests")}
+               for name, item in agents.items()}
+    sync_output = _sync_structured_output(spec)
+    if actual == "native":
+        structured_output = "native_batch_tool"
+    elif actual == "mixed":
+        # mixed 里原生 Batch 项仍用工具 schema；同步回退项的实际情况另记。
+        structured_output = "native_batch_tool"
+    elif actual == "not_executed":
+        structured_output = None
+    else:
+        structured_output = sync_output
+    invocation = {
+        "structured_output": structured_output,
+        "strict_native": actual in ("native", "mixed"),
+        "allow_structured_retry": retry_flags,
+        "request_budget": budgets,
+    }
+    if actual == "mixed":
+        invocation["structured_output_components"] = {
+            "native": "native_batch_tool",
+            "sync": sync_output,
+        }
+    return {
+        "execution": {
+            "requested_batch_mode": batch_mode,
+            "actual_mode": actual,
+            "fallback_reason": fallback_reason,
+            "workers": workers,
+            "batch_poll_seconds": poll_seconds,
+            "batch_timeout_seconds": timeout_seconds,
+            "batch_chunk_size": chunk_size,
+        },
+        "invocation": invocation,
+        "generation": public_generation(spec.cfg),
+        "configuration_fingerprint": private_model_identity(spec),
+    }
 
 
 def prepare_requests(samples: list[EvalSample], pipeline) -> RequestPlan:
@@ -352,11 +574,20 @@ def _valid_request_keys(keys):
     )
 
 
-def _validate_cache_identity(cache_path, metadata, spec, *, resume):
+def _identity_pipeline(metadata: dict, private_identity: str) -> dict:
+    """缓存身份只保留路由、公开指纹和不可见配置摘要，不复制材料快照。"""
+    keys = ("step", "graph", "needs", "allow_lookup", "model_key", "corpus_type", "llm", "fingerprint")
+    return {
+        **{key: metadata.get(key) for key in keys},
+        "configuration_fingerprint": private_identity,
+    }
+
+
+def _validate_cache_identity(cache_path, metadata, spec, *, resume, private_identity):
     expected = {
         "schema_version": IDENTITY_SCHEMA_VERSION,
         "cache_path": str(Path(cache_path).resolve()),
-        "pipeline": metadata,
+        "pipeline": _identity_pipeline(metadata, private_identity),
     }
     if not resume:
         return {**expected, "native_lifecycle": {
@@ -397,7 +628,7 @@ def _validate_cache_identity(cache_path, metadata, spec, *, resume):
             actual_model = json.loads(native_meta.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             raise ValueError("Batch 缓存缺少有效模型身份，拒绝续跑") from None
-        if actual_model != spec.batch.fingerprint():
+        if actual_model != safe_batch_meta(spec.batch, spec.cfg):
             raise ValueError("Batch 缓存模型身份不一致，拒绝续跑")
         jobs_path = file_paths.sidecar_paths(cache_path)[1]
         recorded = {}
@@ -450,15 +681,9 @@ def _run_batch(spec, pipeline, outcome, *, workers, cache_path, poll_seconds,
                timeout_seconds, chunk_size, resume, allow_sync_fallback, log):
     import batch_inference as bi
 
-    # 共享 BatchSession 会把原始 extra 完整写入 .meta.json。不能仅清理评测
-    # provenance，也不能悄悄删掉真实请求的凭据/选项；必须在所有 sidecar 写入前拒绝。
-    if _json(_public_config(spec.batch.extra, spec.cfg)) != _json(spec.batch.extra):
-        raise ValueError(
-            "原生 Batch extra 含凭据字段或需脱敏内容，拒绝执行以免写入身份缓存；"
-            "请使用独立的模型 API key 配置，不要把凭据放入 extra"
-        )
-
-    identity = _validate_cache_identity(cache_path, outcome.pipeline, spec, resume=resume)
+    private_identity = pipeline_private_identity(outcome.pipeline, spec)
+    identity = _validate_cache_identity(
+        cache_path, outcome.pipeline, spec, resume=resume, private_identity=private_identity)
     lifecycle = identity["native_lifecycle"]
 
     def persist_lifecycle():
@@ -507,6 +732,12 @@ def _run_batch(spec, pipeline, outcome, *, workers, cache_path, poll_seconds,
                 raise bi.BatchPending(agent.NAME, bi.item_key(agent.NAME, content, agent.system_prompt))
             return super().add(agent, content)
 
+        def _append_result(self, key, dumps, error):
+            # 共享缓存写入前统一脱敏：成功结果的 reason/error 也能带 URL 或凭据。
+            # 成功项必须保持 error=None；空字符串会被 lookup 当成失败。
+            clean_error = None if error is None else sanitize_text(error, spec.cfg)
+            return super()._append_result(key, _sanitize_value(dumps, spec.cfg), clean_error)
+
         def _job_submitted(self, job):
             # 先记独立受理账，再写共享 jobs 快照。两次写之间中断时，续跑会因不一致
             # fail closed；绝不把「已受理但 jobs 尚未落盘」误认为从未提交。
@@ -516,7 +747,7 @@ def _run_batch(spec, pipeline, outcome, *, workers, cache_path, poll_seconds,
             super()._job_submitted(job)
 
     session = ReplaySession(
-        spec.batch, cache_path=cache_path, poll_seconds=poll_seconds,
+        SafeBatchProfile(spec.batch, spec.cfg), cache_path=cache_path, poll_seconds=poll_seconds,
         timeout_seconds=timeout_seconds, chunk_size=chunk_size, retry_policy=spec.policy,
         logger=lambda message: log(sanitize_text(message, spec.cfg)),
         sanitize_error=lambda message: sanitize_text(message, spec.cfg),
@@ -584,7 +815,7 @@ def _run_batch(spec, pipeline, outcome, *, workers, cache_path, poll_seconds,
                 outcome.batch_error or "批量结果缺失；请使用 --batch-resume 继续收取",
             )
     if not _sanitize_batch_cache(cache_path, spec.cfg):
-        log("警告：无法读取 Batch 缓存，旧错误文本可能尚未脱敏；请检查文件权限")
+        log("警告：无法读取 Batch 缓存，错误文本与结果可能尚未脱敏；请检查文件权限")
     outcome.batch = _sanitize_value(session.summary(), spec.cfg)
     outcome.batch["identity_file"] = str(cache_identity_path(cache_path))
     outcome.batch["resume_blocked"] = identity.get("resume_blocked")

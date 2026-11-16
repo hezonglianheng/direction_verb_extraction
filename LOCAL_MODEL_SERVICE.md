@@ -56,7 +56,7 @@
 
 ```bash
 # 提取：使用本地模型做 LLM 筛选
-.venv/bin/python -m extract data/raw.jsonl -f config_files/direction_expressions.json5 \
+.venv/bin/python -m extract data/raw.jsonl -f config_files/direction/direction_expressions.json5 \
   --screen-model local-qwen
 
 # 替换：同样使用本地模型做两侧检查
