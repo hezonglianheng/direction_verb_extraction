@@ -137,11 +137,15 @@ python pipeline.py --from-stage annotate --to-stage annotate --pairs results/loc
 python pipeline.py --source raw.jsonl --corpus-type 方位词 --dry-run
 ```
 
-默认：方位词使用 `results/location_corpus.jsonl`、`location_pairs.jsonl`、`location_annotated.jsonl`；趋向动词使用相应 `direction_*` 文件，规则也自动选 `config_files/direction/direction_expressions.json5`。传 `--filter-config` 可覆盖提取规则；请确保其研究词性与 `--corpus-type` 一致，程序不猜测自定义规则的词性。
+默认：方位词使用 `results/location_corpus.jsonl`、`location_pairs.jsonl`、`location_annotated.jsonl`；趋向动词使用相应 `direction_*` 文件，规则也自动选 `config_files/direction/direction_expressions.json5`。传 `--filter-config` 可覆盖提取规则；请确保其研究词性与 `--corpus-type` 一致，程序不猜测自定义规则的词性。`--corpus-type` 与单模块一致，接受中文名及 `localization/location/loc`、`direction/dir/direction_verb` 等英文别名（不区分大小写）。
+
+pipeline 只接力正式句对标注图 `pair/synonym/all_in_one`。`single`、`alter_check` 仍可在独立入口运行，但读取的是原句而不是替换句对，且 `--pairs` 在接力中同时表示替换产物，语义冲突；pipeline 会在起跑前明确拒绝并提示改用 `python annotate --graph single|alter_check --corpus <原句.jsonl>`。
 
 使用 `--extracted`、`--pairs`、`--output` 指定各阶段 JSONL 路径。路径按调用时的当前目录解析，内部资源始终按项目根解析。驱动在预检通过后创建提取输出目录，其余目录由原阶段创建。文件名须以小写 `.jsonl` 结尾（不接受 `.JSONL`，避免旧提取器再次追加后缀）。
 
 默认拒绝覆盖本次选中阶段的产物及标注 CSV/summary；`--overwrite` 明确允许覆盖，但不能让输入输出或多份产物指向同一个文件（包括链接别名）。中途起跑不会重跑上游。某阶段非零退出时立即停止并保留退出码；已完成阶段的产物保留，不回滚，也不假装全链路成功。
+
+替换规则（`--alter-rules`，含按词性解析的默认规则）和 `--reference-file` 作为只读输入参加这项冲突检查。自定义 Batch 缓存、jobs/meta 或多模型 raw 路径不能指向这些实际输入。非配置模式与 JSON5 模式口径一致；涉及路径规划的透传选项必须写全名，不能用 `--alter-rule`、`--print-prom` 等缩写绕过预检。`--print-prompt` 只预览标注提示词：标注主产物、CSV/summary、多模型 raw 和 Batch sidecar 都不写，因此不检查这些路径的既有文件或 `.jsonl` 后缀；但起始语料、reference、图/模型组合等输入校验仍然执行，上游 extract/replace 的写入检查也不放松。
 
 Batch 缓存/jobs/meta（含自定义 `--batch-cache`）和多模型原始结果也参与全链路路径冲突检查，不能覆盖原始输入或其他阶段产物。缓存路径推导由预检与实际会话共用。缓存允许已存在以便续跑；仍沿用原接口约定：只有 `--batch-resume` 才复用已有任务，不加它可能清空旧缓存并发起新任务。
 
@@ -163,7 +167,7 @@ python pipeline.py --source raw.jsonl --extract-model screen-model --replace-mod
 
 `--extract-model` 映射到 `extract --screen-model`（规则命中后的 LLM 筛选），`--replace-model` 映射到 `replace --model`（原句补筛与替换句检查；机械替换本身不调用模型）。二者只在对应阶段被选中时生效，传了未选中阶段的模型参数会被忽略；未指定时流水线不注入默认值，各阶段继续使用自己的默认配置（当前均为 `config.SCREEN_MODEL`）。同一阶段的一等参数与透传里的同义模型选项互斥，即使值相同也报错，`--opt=value` 和前缀缩写同样会被识别（歧义前缀本就会被子命令拒绝）；冲突在任何阶段启动/建目录之前报错。预检只传递模型配置名，不校验 `model_config/api_keys.json` 里的条目是否存在。
 
-流水线管理的输入、输出、词性、覆盖和 engine 参数不能通过透传覆盖；请使用驱动的对应选项。涉及路径规划的透传选项必须写全名，不能用 argparse 缩写（例如 `--out-f`、`--batch-c`、`--gra`）。`--annotate-args '["--graph","all_in_one","--models","model-a","model-b"]'` 可不指定 `--annotation-engine`；显式指定引擎时必须与图兼容。预检和共同 runner 共用轻量选择校验，`--graph=x` 和拆分写法均不能靠最后一个值掩盖冲突；冲突在任何上游阶段启动/建目录之前报错。独立阶段仍接受全部旧参数。默认 limit 为 pair/synonym 100、all_in_one 1；要处理更多句对，务必显式指定 `--limit`。未选中阶段的透传参数不执行。
+流水线管理的输入、输出、词性、覆盖和 engine 参数不能通过透传覆盖；请使用驱动的对应选项。涉及路径规划/预检的透传选项必须写全名，不能用 argparse 缩写（例如 `--out-f`、`--batch-c`、`--gra`、`--alter-rule`、`--print-prom`）。`--annotate-args '["--graph","all_in_one","--models","model-a","model-b"]'` 可不指定 `--annotation-engine`；显式指定引擎时必须与图兼容。预检和共同 runner 共用轻量选择校验，`--graph=x` 和拆分写法均不能靠最后一个值掩盖冲突；冲突在任何上游阶段启动/建目录之前报错。独立阶段仍接受全部旧参数。默认 limit 为 pair/synonym 100、all_in_one 1；要处理更多句对，务必显式指定 `--limit`。未选中阶段的透传参数不执行。
 
 ### JSON5 配置文件
 
@@ -177,6 +181,8 @@ python pipeline.py --config pipeline_config/full.example.json5 --from-stage repl
 配置里的相对路径按配置文件所在目录解析；`extract.src_path` 是原始输入，`extract.tgt_path` + `out_name` 是提取产物，`replace.corpus`/`out_file` 与 `annotate.corpus`/`out_file` 分别是替换、标注的输入/输出。显式路径都按配置文件目录解析；省略时沿用项目根 `results/` 下的默认文件名。
 
 `null` 表示省略该参数；布尔开关用 `true/false`；`allow_retry` 为三态（`true` → `--allow-retry`，`false` → `--no-allow-retry`，`null` → 不传）；`vocab_config_path` 可写字符串或字符串数组；`models` 必须是非空字符串数组。模块内未知键、错误类型、重复模型名会报错。`corpus_type`、`overwrite` 只能走全局 CLI，不能写进模块。`annotate.out_dir` 与 `out_file` 二选一；`list_graphs: true` 不支持（配置模式会跑完整链路）；正式图不允许 `annotate.alter_rules`。
+
+JSON5 现已覆盖单模块的现有抽样与筛选参数：`extract.screen_batch_size`、`extract.sentence_dedup_window`；`replace.batch_size`、`replace.limit`、`replace.limit_mode`、`replace.seed`、`replace.reference_file`、`replace.log_dir`；`annotate.limit_mode`、`annotate.seed`、`annotate.reference_file`。`replace.reference_file` 与 `annotate.reference_file` 作为只读输入参与冲突检查；`replace.log_dir` 是输出目录，只按配置文件目录解析，不要求已存在。replace 的抽样组合与独立 CLI 一致：`reference_file` 自动进入 aligned，不能与 seed 或非 aligned 模式同用；`random`/`proportional` 和显式 seed 必须同时给出 `limit`。
 
 使用 `--config` 时不能再同时传 `--source`、`--extracted`、`--pairs`、`--output`、`--filter-config`、`--extract-model`、`--replace-model`、`--annotation-engine` 或 `--*-args`；请把对应值放进模块字典。配置文件本身以及配置里声明的词表、替换规则会作为只读输入参与冲突预检，不能被输出覆盖。
 

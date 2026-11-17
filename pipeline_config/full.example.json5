@@ -12,6 +12,9 @@
 // - 使用 --config 时，不能再从命令行传 --source/--extracted/--pairs/--output/--filter-config、
 //   两个模型参数、--annotation-engine 或三个 --*-args；请把对应值写进下面的模块。
 // - corpus_type、overwrite 是流水线全局参数，只能用 --corpus-type / --overwrite；下面保留 null 仅作提示。
+// - --corpus-type 接受方位词/趋向动词及英文别名（localization/location/loc、direction/dir/direction_verb）。
+// - 配置里声明的词表、替换规则、reference，以及非配置模式的替换规则/reference，
+//   都作为只读输入参加冲突检查；后续输出或 Batch 缓存不能指向它们。
 // - 示例里的 data/raw.jsonl 等是占位路径，运行前请改成真实路径。
 {
   extract: {
@@ -34,11 +37,15 @@
     // 筛选模型配置名（model_config/api_keys.json 的键）；null = config.SCREEN_MODEL。
     screen_model: null,
     screen_workers: 8,
+    // 每次 LLM 筛选请求最多放入多少条判定项；null = 模型配置或全局默认。
+    screen_batch_size: null,
     // 方位词 / 趋向动词；null = 按规则文件名推断。
     screen_kind: null,
 
     extract_workers: 4,
     filter_workers: 1,
+    // 跨文件原句去重窗口；0 = 关闭，null = 全局默认。
+    sentence_dedup_window: null,
   },
 
   replace: {
@@ -56,6 +63,16 @@
     model: null,
     workers: 4,
     chunk_size: 100,
+    // 每次 LLM 请求放入多少条判定项；null = 模型配置或全局默认。
+    batch_size: null,
+    // 限额抽样：limit 必须 >0；random/proportional 需要 limit，seed 可省略（默认 0）。
+    // reference_file 给出后自动进入 aligned 模式，不能与 seed 或非 aligned 的 limit_mode 同用。
+    limit: null,
+    limit_mode: null, // sequential / random / proportional / aligned
+    seed: null,
+    reference_file: null,
+    // 替换日志目录；null = 项目根 log/。相对路径按本配置文件所在目录解析。
+    log_dir: null,
     // true = 不调用模型；未检查的句对不能进入标注。
     no_llm: false,
 
@@ -65,7 +82,9 @@
   },
 
   annotate: {
-    // 标注图：pair / synonym / all_in_one / single / alter_check。省略/null = pair。
+    // 标注图：pair / synonym / all_in_one。省略/null = pair。
+    // single / alter_check 是独立诊断入口，不属于 pipeline 接力：请运行
+    // python annotate --graph single|alter_check --corpus <原句.jsonl>。
     graph: "pair",
     // 兼容旧入口：staged / all-in-one；null = 由 graph 决定。
     engine: null,
@@ -87,6 +106,10 @@
     batch_max_requests: null,
     // null = 按图默认：pair/synonym 100，all_in_one 1。
     limit: null,
+    // 限额抽样：random/proportional 需要 limit；aligned 由 reference_file 自动启用。
+    limit_mode: null, // sequential / random / proportional / aligned
+    seed: null,
+    reference_file: null,
     offset: 0,
 
     // 单模型模式与多模型投票二选一；null = 单模型默认值。
@@ -98,6 +121,8 @@
     batch_inference: false,
     no_llm: false,
     feature_deep: false,
+    // true = 离线预览提示词；标注不写 jsonl/CSV/summary/Batch sidecar，
+    // 因此本次预检不检查 annotate.out_file/out_dir 的既有输出与后缀。
     print_prompt: false,
     // true = --allow-retry；false = --no-allow-retry；null = 不传（按图默认）。
     allow_retry: null,

@@ -11,13 +11,14 @@ from pathlib import Path
 
 from file_paths import collect_jsonl_inputs, validate_output_paths, resolve_cache_path, same_file_path, sidecar_paths
 from annotate.cli_args import ConsistentSelection, resolve_graph_selection
+from annotate.cli_constants import FORMAL_GRAPHS
 from annotate.voting import model_output_paths
+from corpus_metadata import CORPUS_TYPE_DIRS, DEFAULT_CORPUS_TYPE, normalize_corpus_type
 from filter_funcs import LIMIT_MODES
 
 
 ROOT = Path(__file__).resolve().parent
 STAGES = ("extract", "replace", "annotate")
-KINDS = {"方位词": "localization", "趋向动词": "direction"}
 STAGE_MODEL_OPTIONS = {
     "extract": ("--extract-model", "--screen-model"),
     "replace": ("--replace-model", "--model"),
@@ -25,7 +26,7 @@ STAGE_MODEL_OPTIONS = {
 """一等模型参数到各阶段子命令参数的映射；annotate 仍走 --annotate-args 的 --model/--models。"""
 
 ANNOTATE_GRAPHS = ("pair", "synonym", "all_in_one", "single", "alter_check")
-FORMAL_GRAPHS = ("pair", "synonym", "all_in_one")
+DIAGNOSTIC_GRAPHS = tuple(name for name in ANNOTATE_GRAPHS if name not in FORMAL_GRAPHS)
 CONFIG_MANAGED_CLI = (
     "source", "extracted", "pairs", "output", "filter_config",
     "extract_model", "replace_model", "annotation_engine",
@@ -48,9 +49,11 @@ EXTRACT_FIELDS = {
     "no_llm_screen": {"kind": "extra_flag"},
     "screen_model": {"kind": "pipeline", "dest": "extract_model", "type": "model"},
     "screen_workers": {"kind": "extra_value", "type": "int"},
+    "screen_batch_size": {"kind": "extra_value", "type": "int"},
     "screen_kind": {"kind": "extra_value", "type": "choice", "choices": ("方位词", "趋向动词")},
     "extract_workers": {"kind": "extra_value", "type": "int"},
     "filter_workers": {"kind": "extra_value", "type": "int"},
+    "sentence_dedup_window": {"kind": "extra_value", "type": "int"},
     "corpus_type": {"kind": "unsupported", "message": "这是全局参数，请用 --corpus-type 指定"},
     "overwrite": {"kind": "unsupported", "message": "这是全局参数，请用 --overwrite 指定"},
 }
@@ -61,6 +64,12 @@ REPLACE_FIELDS = {
     "model": {"kind": "pipeline", "dest": "replace_model", "type": "model"},
     "workers": {"kind": "extra_value", "type": "int"},
     "chunk_size": {"kind": "extra_value", "type": "int"},
+    "batch_size": {"kind": "extra_value", "type": "int"},
+    "limit": {"kind": "extra_value", "type": "int"},
+    "limit_mode": {"kind": "extra_value", "type": "choice", "choices": LIMIT_MODES},
+    "seed": {"kind": "extra_value", "type": "int"},
+    "reference_file": {"kind": "extra_value", "type": "path", "input": True},
+    "log_dir": {"kind": "extra_value", "type": "path"},
     "no_llm": {"kind": "extra_flag"},
     "corpus_type": {"kind": "unsupported", "message": "这是全局参数，请用 --corpus-type 指定"},
     "overwrite": {"kind": "unsupported", "message": "这是全局参数，请用 --overwrite 指定"},
@@ -73,7 +82,8 @@ ANNOTATE_FIELDS = {
     "corpus": {"kind": "pipeline", "dest": "corpus", "type": "path"},
     "alter_rules": {"kind": "extra_value", "type": "path", "input": True},
     "out_dir": {"kind": "pipeline", "dest": "out_dir", "type": "path"},
-    "out_file": {"kind": "pipeline", "dest": "out_file", "type": "output_path"},
+    # 后缀在确定“本轮真的会写标注结果”时再查：--print-prompt 不写这个文件。
+    "out_file": {"kind": "pipeline", "dest": "out_file", "type": "path"},
     "max_requests": {"kind": "extra_value", "type": "int"},
     "batch_max_requests": {"kind": "extra_value", "type": "int"},
     "limit": {"kind": "extra_value", "type": "int"},
@@ -105,6 +115,14 @@ ANNOTATE_FIELDS = {
 CONFIG_FIELDS = {"extract": EXTRACT_FIELDS, "replace": REPLACE_FIELDS, "annotate": ANNOTATE_FIELDS}
 
 
+def _corpus_type_arg(value: str) -> str:
+    """把中文类型名或英文别名规范化；未知值走 argparse 的参数错误（退出码 2）。"""
+    try:
+        return normalize_corpus_type(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--config", default=None,
@@ -112,7 +130,11 @@ def parse_args(argv=None):
                              "只读取本次选中阶段的字典，未选中阶段即使填写也忽略")
     parser.add_argument("--from-stage", choices=STAGES, default="extract")
     parser.add_argument("--to-stage", choices=STAGES, default="annotate")
-    parser.add_argument("--corpus-type", choices=KINDS, default="方位词")
+    parser.add_argument(
+        "--corpus-type", type=_corpus_type_arg, default=DEFAULT_CORPUS_TYPE,
+        help="语料类型：方位词（别名 localization/location/loc）或 趋向动词"
+             "（别名 direction/dir/direction_verb）；英文别名不区分大小写",
+    )
     parser.add_argument("--source", help="原始文章 JSONL 文件或目录；从 extract 开始时必填")
     parser.add_argument("--extracted", help="提取阶段输出/替换阶段输入 JSONL")
     parser.add_argument("--pairs", help="替换阶段输出/标注阶段输入 JSONL")
@@ -151,6 +173,7 @@ def _extra_args(value: str, stage: str) -> list[str]:
     planned = {
         "--batch-cache", "--batch", "--models", "--model", "--no-llm", "--no-pairs-csv",
         "--batch-resume", "--graph", "--reference-file",
+        "--alter-rules", "--print-prompt",
     }
     for token in tokens:
         option = token.split("=", 1)[0]
@@ -159,6 +182,34 @@ def _extra_args(value: str, stage: str) -> list[str]:
         if option.startswith("--") and option not in planned and any(name.startswith(option) for name in reserved | planned):
             raise ValueError(f"--{stage}-args 中涉及路径规划的参数不能缩写：{token}")
     return tokens
+
+
+def _annotation_options(tokens: list[str], engine):
+    """解析 annotate 透传参数中与预检有关的选项，并返回解析结果与图选择。"""
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False, exit_on_error=False)
+    parser.add_argument("--batch-cache")
+    parser.add_argument("--batch", choices=("auto", "native", "off"), default="auto")
+    parser.add_argument("--batch-resume", action="store_true")
+    parser.add_argument("--no-llm", action="store_true")
+    parser.add_argument("--no-pairs-csv", action="store_true")
+    parser.add_argument("--models", nargs="+")
+    parser.add_argument("--print-prompt", action="store_true")
+    parser.add_argument("--graph", choices=ANNOTATE_GRAPHS, action=ConsistentSelection)
+    try:
+        options, _ = parser.parse_known_args(tokens)
+    except argparse.ArgumentError as exc:
+        raise ValueError(str(exc)) from exc
+    graph = resolve_graph_selection(options.graph, engine, engine_option="--annotation-engine")
+    return options, graph
+
+
+def _reject_diagnostic_graph(graph: str, *, source: str = "") -> None:
+    if graph in DIAGNOSTIC_GRAPHS:
+        where = f"{source} " if source else ""
+        raise ValueError(
+            f"{where}pipeline 仅支持正式句对标注图 {FORMAL_GRAPHS}；诊断图 {graph} 请直接运行 "
+            f"python annotate --graph {graph} --corpus <原句.jsonl>"
+        )
 
 
 def _uses_option(token: str, target: str) -> bool:
@@ -299,6 +350,12 @@ def _convert_stage_config(stage: str, section: dict, config_path: Path, base: Pa
     values: dict[str, object] = {}
     extras: list[str] = []
     inputs: list[Path] = []
+    graph = None
+    if stage == "annotate":
+        graph = resolve_graph_selection(
+            section.get("graph"), section.get("engine"), engine_option="annotate.engine",
+        )
+        _reject_diagnostic_graph(graph, source=f"配置文件 {config_path} 的 annotate：")
     for key, value in section.items():
         if key.startswith("--"):
             raise ValueError(f"配置文件 {config_path} 的 {stage} 键名不要带 --：{key}")
@@ -357,10 +414,6 @@ def _convert_stage_config(stage: str, section: dict, config_path: Path, base: Pa
             raise ValueError(f"配置文件 {config_path} 的 annotate.model 与 annotate.models 不能同时设置")
         if section.get("out_dir") is not None and section.get("out_file") is not None:
             raise ValueError(f"配置文件 {config_path} 的 annotate.out_dir 与 annotate.out_file 不能同时设置")
-        graph = section.get("graph")
-        if graph is None and section.get("engine") == "all-in-one":
-            graph = "all_in_one"
-        graph = graph or "pair"
         if graph in FORMAL_GRAPHS and section.get("alter_rules") is not None:
             raise ValueError(
                 f"配置文件 {config_path} 的 annotate.alter_rules 只用于 alter_check 诊断图；"
@@ -416,12 +469,42 @@ def _convert_stage_config(stage: str, section: dict, config_path: Path, base: Pa
         offset_value = section.get("offset")
         if isinstance(offset_value, int) and not isinstance(offset_value, bool) and offset_value < 0:
             raise ValueError(f"配置文件 {config_path} 的 annotate.offset 必须是大于等于 0 的整数")
+        seed_value = section.get("seed")
+        if isinstance(seed_value, int) and not isinstance(seed_value, bool) and seed_value < 0:
+            raise ValueError(f"配置文件 {config_path} 的 annotate.seed 必须是大于等于 0 的整数")
         if limit_mode in ("sequential", "random", "proportional") and limit_value is None:
             raise ValueError(
                 f"配置文件 {config_path} 的 annotate.limit_mode={limit_mode} 需要同时设置 limit（X>0）"
             )
         if section.get("seed") is not None and limit_value is None:
             raise ValueError(f"配置文件 {config_path} 的 annotate.seed 只能在设置 limit 时使用")
+    elif stage == "replace":
+        reference = section.get("reference_file")
+        limit_mode = section.get("limit_mode")
+        limit_value = section.get("limit")
+        seed_value = section.get("seed")
+        if reference is not None:
+            if limit_mode not in (None, "aligned"):
+                raise ValueError(
+                    f"配置文件 {config_path} 的 replace.reference_file 只能配合 limit_mode=aligned；"
+                    f"当前是 {limit_mode!r}"
+                )
+            if seed_value is not None:
+                raise ValueError(
+                    f"配置文件 {config_path} 的 replace.reference_file 不对齐随机过程，不能与 seed 同时设置"
+                )
+        elif limit_mode == "aligned":
+            raise ValueError(
+                f"配置文件 {config_path} 的 replace.limit_mode=aligned 必须同时设置 reference_file"
+            )
+        elif limit_value is None and (limit_mode is not None or seed_value is not None):
+            raise ValueError(
+                f"配置文件 {config_path} 的 replace.limit_mode 与 replace.seed 只能在设置 replace.limit 时使用"
+            )
+        if isinstance(limit_value, int) and not isinstance(limit_value, bool) and limit_value <= 0:
+            raise ValueError(f"配置文件 {config_path} 的 replace.limit 必须是大于 0 的整数")
+        if isinstance(seed_value, int) and not isinstance(seed_value, bool) and seed_value < 0:
+            raise ValueError(f"配置文件 {config_path} 的 replace.seed 必须是大于等于 0 的整数")
     return values, extras, inputs
 
 
@@ -438,9 +521,22 @@ def _apply_config(args) -> argparse.Namespace:
     if start > end:
         raise ValueError("起点不能晚于终点：extract → replace → annotate")
     selected = STAGES[start:end + 1]
-    suffix = KINDS[args.corpus_type]
+    suffix = CORPUS_TYPE_DIRS[args.corpus_type]
     prefix = "location" if suffix == "localization" else "direction"
     base = config_path.parent
+
+    # 诊断图不属于接力链路；先于任何输入存在性检查拒绝，避免被上游缺失文件掩盖。
+    if "annotate" in selected:
+        annotate_section = data.get("annotate", {})
+        if not isinstance(annotate_section, dict):
+            raise ValueError(f"pipeline 配置 {config_path} 的 annotate 必须是字典")
+        _reject_diagnostic_graph(
+            resolve_graph_selection(
+                annotate_section.get("graph"), annotate_section.get("engine"),
+                engine_option="annotate.engine",
+            ),
+            source=f"配置文件 {config_path} 的 annotate：",
+        )
 
     stage_values: dict[str, dict] = {}
     stage_extras: dict[str, list[str]] = {}
@@ -540,7 +636,7 @@ def build_commands(args) -> list[tuple[str, list[str]]]:
     if start > end:
         raise ValueError("起点不能晚于终点：extract → replace → annotate")
     selected = STAGES[start:end + 1]
-    suffix = KINDS[args.corpus_type]
+    suffix = CORPUS_TYPE_DIRS[args.corpus_type]
     prefix = "location" if suffix == "localization" else "direction"
     extracted = Path(args.extracted or ROOT / "results" / f"{prefix}_corpus.jsonl").resolve()
     pairs = Path(args.pairs or ROOT / "results" / f"{prefix}_pairs.jsonl").resolve()
@@ -562,6 +658,13 @@ def build_commands(args) -> list[tuple[str, list[str]]]:
         if any(_uses_option(token, child_option) for token in extras[stage]):
             raise ValueError(f"{pipeline_option} 与 --{stage}-args 中的 {child_option} 不能同时使用；请只保留一种写法")
         extras[stage] = [child_option, model, *extras[stage]]
+    options = None
+    graph = None
+    preview = False
+    if "annotate" in selected:
+        options, graph = _annotation_options(extras["annotate"], args.annotation_engine)
+        _reject_diagnostic_graph(graph, source="--from-stage/--to-stage 选中的 annotate：")
+        preview = bool(options.print_prompt)
     inputs = []
     if start == 0:
         if not args.source:
@@ -583,46 +686,49 @@ def build_commands(args) -> list[tuple[str, list[str]]]:
         inputs = [first_input]
     # 配置文件本身，以及配置里显式声明的词表/替换规则，都是只读输入。
     inputs.extend(getattr(args, "_config_inputs", []))
+    # 替换阶段实际读取的规则也必须参加输入/输出别名检查。
+    if "replace" in selected:
+        rules = _option_value(extras["replace"], "--alter-rules")
+        if rules:
+            inputs.append(Path(rules).resolve())
+        else:
+            default_rules = (ROOT / "config_files" / suffix / "alter_rules.json5").resolve()
+            if default_rules.is_file():
+                inputs.append(default_rules)
     # --replace-args / --annotate-args 里的 --reference-file 都是只读输入，必须参加
     # 输出别名检查；否则后续阶段可能把前一阶段读过的 reference 覆盖掉。
     for stage in ("replace", "annotate"):
         if stage in selected:
             reference = _option_value(extras[stage], "--reference-file")
             if reference:
-                inputs.append(_reference_input_path(reference))
+                reference_path = _reference_input_path(reference)
+                if not reference_path.is_file():
+                    raise ValueError(f"找不到 reference 文件：{reference_path}")
+                inputs.append(reference_path)
 
-    outputs = [paths[stage] for stage in selected]
-    sidecars = []
+    extra_outputs: list[Path] = []
+    sidecars: list[Path] = []
     # Share the exact naming functions with the actual annotation runners.
-    if "annotate" in selected:
-        parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False, exit_on_error=False)
-        parser.add_argument("--batch-cache")
-        parser.add_argument("--batch", choices=("auto", "native", "off"), default="auto")
-        parser.add_argument("--batch-resume", action="store_true")
-        parser.add_argument("--no-llm", action="store_true")
-        parser.add_argument("--no-pairs-csv", action="store_true")
-        parser.add_argument("--models", nargs="+")
-        parser.add_argument("--graph", choices=("pair", "synonym", "all_in_one", "single", "alter_check"),
-                            action=ConsistentSelection)
-        try:
-            options, _ = parser.parse_known_args(extras["annotate"])
-        except argparse.ArgumentError as exc:
-            raise ValueError(str(exc)) from exc
-        graph = resolve_graph_selection(options.graph, args.annotation_engine, engine_option="--annotation-engine")
+    # --print-prompt 在 runner 里早于输出规划返回；标注主产物、CSV/summary、
+    # 多模型 raw 与 Batch sidecar 都不会写，因此不参加本阶段的写入检查。
+    if "annotate" in selected and not preview:
         models = options.models or []
         multi = len(models) > 1
         raw = model_output_paths(output, models)[1] if multi else {}
         results = [output, *raw.values()]
-        outputs.extend(raw.values())
+        extra_outputs.extend(raw.values())
         for result in results:
-            if not options.no_pairs_csv and graph in ("pair", "synonym", "all_in_one"):
-                outputs.append(result.with_suffix(".csv"))
-            outputs.append(result.with_suffix(".summary.json"))
+            if not options.no_pairs_csv and graph in FORMAL_GRAPHS:
+                extra_outputs.append(result.with_suffix(".csv"))
+            extra_outputs.append(result.with_suffix(".summary.json"))
         if not options.no_llm and options.batch != "off":
             cache_outputs = raw.items() if multi else [(None, output)]
             for model, result in cache_outputs:
                 cache = resolve_cache_path(options.batch_cache, result, model_key=model, multi_model=multi)
                 sidecars.extend(sidecar_paths(cache))
+
+    outputs = [paths[stage] for stage in selected if not (stage == "annotate" and preview)]
+    outputs.extend(extra_outputs)
     validate_output_paths(inputs, outputs + sidecars)
     for path in sidecars:
         if path.exists() and not path.is_file():
