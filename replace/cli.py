@@ -119,7 +119,8 @@ def build_parser() -> argparse.ArgumentParser:
              "random=从全部可用原句中随机抽 X 条；"
              "proportional=在带本类关注词的可用原句中按主关注词比例分配 X 条"
              "（配额描述选中记录的分层，句内其他位置仍会展开）；"
-             "aligned=按 --reference-file 逐条对回源语料",
+             "aligned=按 --reference-file 逐条对回源语料。"
+             "除 aligned（由 --reference-file 自动启用）外，必须同时给出 --limit",
     )
     parser.add_argument(
         "--seed", type=_non_negative_int, default=None,
@@ -137,7 +138,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--log-dir", default=None,
         help="替换日志目录；默认项目根目录下的 log/（不存在会自动创建）",
     )
-    parser.add_argument("--no-llm", action="store_true", help="不调用模型；未检查的句对不可进入标注")
+    parser.add_argument("--no-llm", action="store_true",
+                        help="不调用模型（默认会调用模型做语法、空间义检查）；未检查的句对不可进入标注")
     parser.add_argument(
         "--overwrite", action="store_true",
         help="允许覆盖已存在的输出句对文件（默认拒绝；不会覆盖输入文件或参考文件）",

@@ -41,6 +41,7 @@ from typing import Iterable
 
 import config
 import file_paths
+from corpus_metadata import normalize_corpus_type
 from evaluate import data, metrics
 from evaluate.inference import (
     ModelSpec,
@@ -102,9 +103,7 @@ def _positive_int(value: str) -> int:
 
 
 def _corpus_type(value: str) -> str:
-    # 只在 argparse 返回后调用，--corpus-type 出现在 --help 前也不会加载标注/LTP 依赖。
-    from annotate.spatial_tools import normalize_corpus_type
-
+    # 只依赖 corpus_metadata 的纯函数，不导入 annotate.spatial_tools 及其 LTP/torch 链。
     try:
         return normalize_corpus_type(value)
     except ValueError as exc:
@@ -156,8 +155,9 @@ def add_batch_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
+        prog="python -m evaluate",
         description="五档同义判断评测：用 annotate/ 的既有标注作参考，逐模型独立报告",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__.split("用法：")[-1],
@@ -167,7 +167,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--input",
         dest="corpus",
         required=True,
-        help="annotate/ 输出的 JSONL 文件或目录（单模型结果、多模型投票结果均可）",
+        help="annotate/ 输出的 JSONL 文件或目录（传目录时读取其中 *.jsonl；"
+        "单模型结果、多模型投票结果均可）",
     )
     parser.add_argument(
         "--models",
@@ -176,7 +177,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         nargs="+",
         metavar="模型",
         default=None,
-        help="待测模型配置名（model_config/api_keys.json 里的键），可给多个分别评测",
+        help="待测模型配置名（model_config/api_keys.json 里的键），可给多个分别评测；"
+        "除 --print-prompt 外必填",
     )
     parser.add_argument(
         "--step", type=int, choices=(0, 1, 2, 3, 4), default=0,
@@ -197,7 +199,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=f"同时评测几个模型；0 = 有几个跑几个（默认 {config.EVALUATE_MODEL_WORKERS}）",
     )
     parser.add_argument("--limit", type=_non_negative_int, default=None,
-                        help="只评测筛选后有效记录的前多少条（默认全部）")
+                        help="只评测筛选后有效记录的前多少条（默认全部；0 表示一条都不选）")
     parser.add_argument("--offset", type=_non_negative_int, default=0,
                         help="跳过筛选后有效记录的前多少条（默认 0）")
     parser.add_argument("--out-dir", default=None, help=f"报告目录（默认 {DEFAULT_OUT_DIR}）")
@@ -213,6 +215,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="离线打印本 step 的 agent 提示语与可渲染消息；"
                              "下游动态依赖只作说明，不读模型配置、不调用模型、不写文件")
     add_batch_args(parser)
+    return parser
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = build_parser()
     args = parser.parse_args(argv)
     if args.prompt_dir is not None:
         parser.error("--prompt-dir 已停用：五档评测复用 annotate 的 agent 提示语/配置；"

@@ -92,10 +92,8 @@ from extract import sentence_screening
 from annotate import spatial_tools as st
 from annotate import prompt_examples as pe
 from annotate import annotation_tables as tables
+from annotate.cli_constants import ALL_IN_ONE_PROMPT_FILE, DEFAULT_MODEL
 import utils
-
-DEFAULT_MODEL = "deepseek-flash"
-"""默认模型配置名（model_config/api_keys.json 里的键）"""
 
 _FIRST_ERROR_CHARS = 200
 """调用失败时留给第一个例外 repr 的字符数（见 BaseAgent._invoke）
@@ -433,8 +431,6 @@ JUDGE_PROMPT_FILE = "annotate/pair/annotate_pair_judgement"
 """pair 的判定表没有直接结论时使用的主提示语"""
 SYNONYM_PROMPT_FILE = "annotate/synonym/annotate_synonym_judgement"
 """synonym 独立同义判断的主提示语，不查特征、图式或判定表"""
-ALL_IN_ONE_PROMPT_FILE = "annotate/all_in_one/annotate_all_in_one"
-"""all_in_one 单次完整标注的主提示语，与 pair 共享类别片段"""
 
 
 FOCUS_ROLE_RECORD = "record"

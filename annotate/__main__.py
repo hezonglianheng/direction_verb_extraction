@@ -5,9 +5,10 @@ from pathlib import Path
 
 def main(argv=None):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from annotate import spatial_runner
-    return spatial_runner.main(argv)
+    # 先走轻量 CLI：--help 不会导入 spatial_runner 及其 LTP/torch/langchain 依赖。
+    from annotate import cli
+    return cli.main(argv)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

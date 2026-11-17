@@ -12,12 +12,12 @@
 """
 
 import sys
+from pathlib import Path
 
-from annotate import spatial_agents as sa
-from annotate import spatial_runner as sr
+from annotate.cli_constants import ALL_IN_ONE_PROMPT_FILE
 
-_PROJECT_ROOT = sr._PROJECT_ROOT
-PROMPT_FILE = sa.ALL_IN_ONE_PROMPT_FILE
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROMPT_FILE = ALL_IN_ONE_PROMPT_FILE
 DEFAULT_OUT_PREFIX = "all_in_one"
 DEFAULT_LIMIT = 1
 
@@ -28,12 +28,17 @@ def _forward_args(argv=None):
 
 
 def parse_args(argv=None):
-    return sr.parse_args(_forward_args(argv))
+    # 延迟到调用时导入：模块导入本身（含 --help 路径）不加载 LTP/torch/langchain。
+    from annotate import cli
+
+    return cli.parse_args(_forward_args(argv))
 
 
 def main(argv=None):
-    return sr.main(_forward_args(argv))
+    from annotate import cli
+
+    return cli.main(_forward_args(argv))
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
