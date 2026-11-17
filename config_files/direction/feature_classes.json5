@@ -12,7 +12,7 @@
 //   description 该类特征要抽什么、按什么判据抽。这句话会原样进 subagent 的提示语，
 //               写得越具体（列出可选取值、边界情形怎么算）抽取越稳
 //   values      可选取值列表（留空表示开放式取值，由模型自行概括）
-// 示例独立存放在 system_prompt/examples/feature_direction.json5，按关注词精确选择。
+// 示例独立存放在本目录 feature_examples.json5，按关注词精确选择。
 // 本表不再读取 examples；每组示例的格式是 {words: [...], examples: [{sentence, instruction}]}。
 //
 // instruction 可以写多行：JSON5 字符串里用 \n 换行，后续每一行都会缩进渲染到「说明：」下面。

@@ -1517,7 +1517,7 @@ def render_schema_candidates(candidates: dict[str, dict]) -> str:
             condition = " ／ ".join(format_match(group) for group in groups)
         parts = [f"  {name}：{entry.get('description') or '（未写说明）'}"]
         parts.append(f"      命中条件：{condition}")
-        # 示例单独由 system_prompt/annotate/examples 按关注词选择，不夹带表内旧例句。
+        # 示例单独由 config_files/<语料类型>/<步骤>_examples.json5 按关注词选择，不夹带表内旧例句。
         lines.append("\n".join(parts))
     return "\n".join(lines)
 

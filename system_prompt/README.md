@@ -49,20 +49,21 @@
 
 ## 示例来源（不按链路复制）
 
-示例由 `annotate/prompt_examples.py` 按步骤、词性加载。特征与图式按本侧关注词精确匹配；
+示例由 `annotate/prompt_examples.py` 按步骤、词性加载，与四张配置表同一口径：每个词性目录下同名，
+路径为 `config_files/<localization|direction>/<步骤>_examples.json5`。特征与图式按本侧关注词精确匹配；
 判定示例按两侧图式名精确匹配（支持双向）。命中的多个组均按文件顺序共享。
 
 | 步骤 | 方位词 | 趋向动词 |
 | --- | --- | --- |
-| 特征 | `annotate/examples/feature_localization.json5` | `annotate/examples/feature_direction.json5` |
-| 图式 | `annotate/examples/schema_localization.json5` | `annotate/examples/schema_direction.json5` |
-| 判定 | `annotate/examples/judge_localization.json5` | `annotate/examples/judge_direction.json5` |
+| 特征 | `config_files/localization/feature_examples.json5` | `config_files/direction/feature_examples.json5` |
+| 图式 | `config_files/localization/schema_examples.json5` | `config_files/direction/schema_examples.json5` |
+| 判定 | `config_files/localization/judge_examples.json5` | `config_files/direction/judge_examples.json5` |
 
 pair/single 每侧每步选自己的示例；all_in_one 的 user message 分成原句/改写句 × 特征/图式四个独立块。
 synonym 不读取上述示例；all_in_one 不读取判定示例。
 
-判定文件是带字段说明的模板：`judge_direction.json5` 当前为空模板（有效内容为 `[]`），
-`judge_localization.json5` 已按命中图式填写示例；两份文件都允许为空或继续补充句对。
+判定文件是带字段说明的模板：`config_files/direction/judge_examples.json5` 当前为空模板（有效内容为 `[]`），
+`config_files/localization/judge_examples.json5` 已按命中图式填写示例；两份文件都允许为空或继续补充句对。
 顶层是组列表，每组仅有以下字段：
 
 - `schema_pair`：恰好两个图式名的列表，例如 `["上22", "旁1"]`；`(A, B)`、`(B, A)` 均能匹配，
@@ -99,7 +100,7 @@ synonym 不依赖上述特征、图式或判定表。配置路径统一由 `anno
   synonym/all_in_one 展示完整渲染消息。预览不读模型密钥或投票权重，不建模型、日志或输出。
 - 仅改文件名不改变 agent 名、system/user 正文或渲染输入，因此不应使内容缓存无意义失效，也不跨链路串用缓存。
 - 同步部署应完整包含 `annotate/` 下十个 `annotate_*.txt`（`pair/`、`synonym/`、`all_in_one/`）与三份共享片段、
-  `extract/` 下筛选提示语、本索引、六个示例 JSON5 与配置表；旧名文件与旧目录须随重命名移除。
+  `extract/` 下筛选提示语、本索引、`config_files/` 下的六个示例 JSON5 与配置表；旧名文件与旧目录须随重命名移除。
   历史审查报告保留当时路径，不作为当前维护入口。
 
 ### 部署重命名/迁目录映射（旧名必须删除）

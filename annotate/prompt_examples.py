@@ -1,18 +1,47 @@
 # encoding: utf8
-"""按标注步骤、词性和关注词／图式对选取 JSON5 示例。"""
+"""按标注步骤、词性和关注词／图式对选取 JSON5 示例。
+
+示例与四张配置表同一口径：随词性放在 `config_files/<词性目录>/` 下，各词性目录里
+同名（`<步骤>_examples.json5`）。判据随词类不同，示例也按词类独立维护。
+"""
 
 from pathlib import Path
 
 import json5
 
-EXAMPLES_DIR = Path(__file__).resolve().parents[1] / "system_prompt" / "annotate" / "examples"
-_KINDS = {"方位词": "localization", "趋向动词": "direction"}
+from corpus_metadata import CORPUS_TYPE_DIRS
+
+EXAMPLES_ROOT = Path(__file__).resolve().parents[1] / "config_files"
+"""示例的根目录；每类语料一个子目录（见 corpus_metadata.CORPUS_TYPE_DIRS）"""
+
+EXAMPLE_FILES: dict[str, str] = {
+    # 逻辑步骤名 -> 各词性目录里的同名文件（与四张配置表一样，文件名只有一处定义）
+    "feature": "feature_examples.json5",
+    "schema": "schema_examples.json5",
+    "judge": "judge_examples.json5",
+}
+"""本流水线读的三份示例；值同时是各词性目录里的文件名（单一真源）"""
+
+
+def examples_path(stage: str, kind: str, *, root: str | Path | None = None) -> Path:
+    """示例文件路径：<root>/<词性目录>/<步骤>_examples.json5
+
+    Args:
+        stage (str): feature / schema / judge
+        kind (str): 语料类型（方位词 / 趋向动词）
+        root (str | Path | None): 覆盖 config_files 根目录；测试注入临时目录时仍须按词性
+            建子目录。None = 仓库的 config_files/
+    """
+    if stage not in EXAMPLE_FILES:
+        raise ValueError(f"不支持的示例步骤：{stage!r}；可用：{'、'.join(EXAMPLE_FILES)}")
+    if kind not in CORPUS_TYPE_DIRS:
+        raise ValueError(f"不支持的示例词性：{kind!r}；可用：{'、'.join(CORPUS_TYPE_DIRS)}")
+    base = Path(root) if root is not None else EXAMPLES_ROOT
+    return base / CORPUS_TYPE_DIRS[kind] / EXAMPLE_FILES[stage]
 
 
 def load_examples(stage: str, kind: str, *, root: str | Path | None = None) -> list[dict]:
-    if stage not in ("feature", "schema", "judge") or kind not in _KINDS:
-        raise ValueError(f"不支持的示例步骤/词性：{stage!r}/{kind!r}")
-    path = (Path(root) if root is not None else EXAMPLES_DIR) / f"{stage}_{_KINDS[kind]}.json5"
+    path = examples_path(stage, kind, root=root)
     with path.open(encoding="utf-8-sig") as handle:
         groups = json5.load(handle)
     if not isinstance(groups, list):

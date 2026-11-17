@@ -4,7 +4,7 @@
 
 语料提取见 extract/sentence_extract.py，机械替换及两侧检查见 replace/sentence_replace.py。
 正式 pair/synonym/all_in_one 图只消费替换阶段的句对，不展开候选、不重新筛选、不准备句法证据。
-原句和替换句各用自己的关注词与三元组，特征/图式示例从 system_prompt/annotate/examples 按词选择。
+原句和替换句各用自己的关注词与三元组，特征/图式示例从 config_files/<语料类型>/<步骤>_examples.json5 按词选择。
 single/alter_check 保留为显式诊断图，不是正式句对标注入口。
 
 默认输入：results/location_pairs.jsonl（方位词）、results/direction_pairs.jsonl（趋向动词）。
@@ -377,7 +377,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="类型",
         type=_corpus_type_arg,
         help="语料类型：方位词（别名 localization/location/loc）或 趋向动词（别名 direction/dir/direction_verb）。"
-        "决定读取该词性的特征、图式与判定配置，以及 system_prompt/annotate/examples 下的示例。"
+        "决定读取该词性的特征、图式与判定配置，以及 config_files 对应词性目录下的示例。"
         "默认方位词；**刻意不按语料文件名推断**——推断猜错时是静默读错一整组表，"
         "宁可要你显式说一句（语料名像另一类时会提醒一句，但不会替你改）。"
         "正式标注前请先运行 python replace 生成该类型的句对",

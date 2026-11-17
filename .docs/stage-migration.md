@@ -65,7 +65,7 @@ from annotate import spatial_tools, spatial_runner, all_in_one
 - pair 的主提示词为 `system_prompt/annotate/pair/annotate_pair_feature_flat.txt`（默认）、`annotate_pair_feature_deep.txt`（可选 deep）、`annotate_pair_feature_unfilled.txt`（类别表未填）、`annotate_pair_schema.txt` 与 `annotate_pair_judgement.txt`。
 - synonym 独立读取 `system_prompt/annotate/synonym/annotate_synonym_judgement.txt`，不读特征、图式或判定表。
 - all_in_one 读取 `system_prompt/annotate/all_in_one/annotate_all_in_one.txt`，单次完成特征、图式及同义判断，后置查表仍优先；不再注入筛选判据。
-- `annotate_shared_feature_class.txt`、`annotate_shared_feature_usage_deep.txt`、`annotate_shared_feature_usage_flat.txt` 是共享类别片段；single 诊断复用 pair 的特征和图式资源。四个 `system_prompt/annotate/examples/*.json5` 仍按步骤/词性共享，不按链路复制。
+- `annotate_shared_feature_class.txt`、`annotate_shared_feature_usage_deep.txt`、`annotate_shared_feature_usage_flat.txt` 是共享类别片段；single 诊断复用 pair 的特征和图式资源。六个 `config_files/<词性>/<步骤>_examples.json5` 仍按步骤/词性共享，不按链路复制。
 
 部署时必须同步十项资源重命名、代码引用和旧名删除，不能把新旧提示词双份保留。筛选用的 `screen_*.txt`、`judgement_criteria.txt`、`semantic.txt` 及 `config_files/<词性目录>/reality.txt` 不在此次重命名范围。纯文件名变化不改变 agent 名和渲染消息，因此不应主动清空已有内容缓存。
 

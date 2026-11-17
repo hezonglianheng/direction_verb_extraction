@@ -726,7 +726,7 @@ def _class_prompt(template: str, feature_class: dict, *, usage: str) -> str:
             # 「示例：」这段有没有取决于有没有示例，末尾那个换行也得跟着一起消失，所以整段
             # （含标签与结尾换行）当**一个**占位符传进去，空时给空串。别把它拆成「模板里写死
             # 『示例：\n』+ 只替换行列表」——那样空示例时会多出一行「示例：」，而模板里看不出问题。
-            "examples": "",  # 示例只从 system_prompt/annotate/examples 按本侧关注词选取
+            "examples": "",  # 示例只从 config_files/<语料类型>/<步骤>_examples.json5 按本侧关注词选取
         },
         source=f"{FEATURE_CLASS_PROMPT_FILE}.txt",
     )

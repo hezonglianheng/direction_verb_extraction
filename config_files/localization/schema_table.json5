@@ -41,7 +41,7 @@
 //   6. match 省略、写成空列表 `[]`、或写成 `[{}]` 的条目是**兜底**：只有同组的其他图式都
 //      没命中时才采用。想让 LLM 去挑最接近的，就别写兜底条目。
 //   7. 同组的所有图式都不命中时，schema_agent 把候选名单（名字 + description + 命中条件）及
-//      system_prompt/examples/schema_localization.json5 按关注词选出的示例交给 LLM。
+//      本目录 schema_examples.json5 按关注词选出的示例交给 LLM。
 //      选择结果的 source 记成 "llm"；这一组下一条图式都没有
 //      时退化为让 LLM 自由命名（按组名 + 编号），source 记成 "llm_free"。所以看一条结果的
 //      source 就知道这个 schema 是查表来的还是模型给的。
