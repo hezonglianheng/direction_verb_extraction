@@ -21,6 +21,7 @@ from typing import Iterable, Sequence
 import json5
 
 import config
+from extract.vocab_paths import resolve_vocab_path, vocab_path_candidates
 
 _suffix_vocab: tuple[str, ...] | None = None
 _lock = threading.Lock()
@@ -31,18 +32,13 @@ def _resolve_vocab_path(path: str | Path) -> Path:
 
     两处必须落到同一个文件上，否则筛选与切分看的不是同一份方位词表。
     """
-    candidates: list[Path] = []
-    if Path(path).is_absolute():
-        candidates.append(Path(path))
-    else:
-        candidates.append(Path(config._PROJECT_ROOT) / path)
-        candidates.append(Path.cwd() / path)
-
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate
-
-    raise FileNotFoundError(f"找不到方位词词表 {path}，已尝试：{[str(c) for c in candidates]}")
+    try:
+        return resolve_vocab_path(path, project_root=config._PROJECT_ROOT)
+    except FileNotFoundError:
+        candidates = vocab_path_candidates(path, project_root=config._PROJECT_ROOT)
+        raise FileNotFoundError(
+            f"找不到方位词词表 {path}，已尝试：{[str(c) for c in candidates]}"
+        ) from None
 
 
 def get_suffix_vocab() -> tuple[str, ...]:

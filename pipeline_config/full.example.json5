@@ -13,8 +13,9 @@
 //   两个模型参数、--annotation-engine 或三个 --*-args；请把对应值写进下面的模块。
 // - corpus_type、overwrite 是流水线全局参数，只能用 --corpus-type / --overwrite；下面保留 null 仅作提示。
 // - --corpus-type 接受方位词/趋向动词及英文别名（localization/location/loc、direction/dir/direction_verb）。
-// - 配置里声明的词表、替换规则、reference，以及非配置模式的替换规则/reference，
-//   都作为只读输入参加冲突检查；后续输出或 Batch 缓存不能指向它们。
+// - 配置里声明的词表、替换规则、reference，以及非配置模式的同类透传参数，都作为只读输入
+//   参加冲突检查；后续输出或 Batch 缓存不能指向它们。相对词表只保护实际读取的那一份
+//   （项目根优先、其次当前目录）；两边都没有时预检直接报错。
 // - 示例里的 data/raw.jsonl 等是占位路径，运行前请改成真实路径。
 {
   extract: {

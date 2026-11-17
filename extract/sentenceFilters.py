@@ -9,6 +9,7 @@ from collections import defaultdict
 
 import config
 from extract.sentenceTable import SentenceTaskCache
+from extract.vocab_paths import resolve_vocab_path
 
 cache = SentenceTaskCache(max_size=config.CACHE_MAX_SIZE)
 
@@ -71,26 +72,16 @@ def load_vocab_file(path: str, base_dir: str | Path | None = None) -> set[str]:
     Returns:
         set[str]: 去重后的词条集合
     """
-    candidates: list[Path] = []
-    if base_dir is not None:
-        candidates.append(Path(base_dir) / path)
-    if Path(path).is_absolute():
-        candidates.append(Path(path))
-    else:
-        candidates.append(Path(config._PROJECT_ROOT) / path)
-        candidates.append(Path.cwd() / path)
-
-    for candidate in candidates:
-        if candidate.is_file():
-            with open(candidate, "r", encoding="utf-8") as f:
-                words = json5.load(f)
-            if not isinstance(words, list):
-                raise ValueError(
-                    f"词表文件 {candidate} 的内容必须是词条列表（JSON5 数组），实际是 {type(words).__name__}"
-                )
-            return set(words)
-
-    raise FileNotFoundError(f"找不到词表文件 {path}，已尝试：{[str(c) for c in candidates]}")
+    # 候选顺序与存在性判断只在 vocab_paths 里维护：pipeline 的只读输入预检也走那一份，
+    # 预检保护的必须是这里真正打开的文件。
+    candidate = resolve_vocab_path(path, project_root=config._PROJECT_ROOT, base_dir=base_dir)
+    with open(candidate, "r", encoding="utf-8") as f:
+        words = json5.load(f)
+    if not isinstance(words, list):
+        raise ValueError(
+            f"词表文件 {candidate} 的内容必须是词条列表（JSON5 数组），实际是 {type(words).__name__}"
+        )
+    return set(words)
 
 
 def _as_tag_tuple(value: Any) -> tuple:

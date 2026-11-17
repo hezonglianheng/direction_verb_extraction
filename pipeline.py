@@ -14,6 +14,7 @@ from annotate.cli_args import ConsistentSelection, resolve_graph_selection
 from annotate.cli_constants import FORMAL_GRAPHS
 from annotate.voting import model_output_paths
 from corpus_metadata import CORPUS_TYPE_DIRS, DEFAULT_CORPUS_TYPE, normalize_corpus_type
+from extract.vocab_paths import resolve_vocab_path
 from filter_funcs import LIMIT_MODES
 
 
@@ -172,7 +173,7 @@ def _extra_args(value: str, stage: str) -> list[str]:
     # planning must be spelled in full here, or the child could bypass preflight.
     planned = {
         "--batch-cache", "--batch", "--models", "--model", "--no-llm", "--no-pairs-csv",
-        "--batch-resume", "--graph", "--reference-file",
+        "--batch-resume", "--graph", "--reference-file", "--vocab_config_path",
         "--alter-rules", "--print-prompt",
     }
     for token in tokens:
@@ -259,6 +260,46 @@ def _reference_input_path(value: str) -> Path:
     目录下的同名相对路径，留下“预检保护 A、子命令读 B”的覆盖缺口。
     """
     return Path(value).resolve()
+
+
+def _option_values(tokens: list[str], options: tuple[str, ...]) -> list[str]:
+    """收集可重复选项的值，兼容长选项、短选项、紧邻写法和 ``=`` 写法。"""
+    values: list[str] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token in options:
+            following = tokens[index + 1] if index + 1 < len(tokens) else None
+            if following is not None and not _looks_like_option(following):
+                values.append(following)
+                index += 1
+        else:
+            for option in options:
+                if option.startswith("--"):
+                    prefix = option + "="
+                    if token.startswith(prefix):
+                        values.append(token[len(prefix):])
+                        break
+                elif token.startswith(option) and len(token) > len(option):
+                    value = token[len(option):]
+                    values.append(value[1:] if value.startswith("=") else value)
+                    break
+        index += 1
+    return [value for value in values if value]
+
+
+def _vocab_input_paths(value: str) -> list[Path]:
+    """词表路径里**实际会被读取**的那一份（与 extract 加载端共用同一优先级）
+
+    不能把项目根与当前目录两个候选都当输入：加载端只打开第一个存在的文件，另一个
+    候选即使被 ``--batch-cache`` 指到也不会被读取，按输入保护会误报覆盖。
+    相对词表在两边都不存在时直接报错——extract 随后也只会抛同一个找不到文件的错，
+    预检不该替它把某个不存在的候选说成“与输出冲突”。
+    """
+    try:
+        return [resolve_vocab_path(value, project_root=ROOT).resolve()]
+    except FileNotFoundError as exc:
+        raise ValueError(str(exc)) from None
 
 
 def _load_pipeline_config(value: str) -> tuple[Path, dict]:
@@ -686,15 +727,24 @@ def build_commands(args) -> list[tuple[str, list[str]]]:
         inputs = [first_input]
     # 配置文件本身，以及配置里显式声明的词表/替换规则，都是只读输入。
     inputs.extend(getattr(args, "_config_inputs", []))
-    # 替换阶段实际读取的规则也必须参加输入/输出别名检查。
-    if "replace" in selected:
-        rules = _option_value(extras["replace"], "--alter-rules")
-        if rules:
-            inputs.append(Path(rules).resolve())
-        else:
-            default_rules = (ROOT / "config_files" / suffix / "alter_rules.json5").resolve()
-            if default_rules.is_file():
-                inputs.append(default_rules)
+    # 透传参数里的词表、替换规则和 reference 同样会在子阶段被读取；它们必须参加
+    # 输入/输出别名检查，否则后续 Batch 缓存/jobs/meta 可能覆盖这些资源。
+    # 词表按加载端优先级只保护实际读取的那一份，见 _vocab_input_paths。
+    for stage in selected:
+        if stage == "extract":
+            for value in _option_values(extras[stage], ("--vocab_config_path", "-v")):
+                for item in value.split(","):
+                    item = item.strip()
+                    if item:
+                        inputs.extend(_vocab_input_paths(item))
+        elif stage == "replace":
+            rules = _option_value(extras[stage], "--alter-rules")
+            if rules:
+                inputs.append(Path(rules).resolve())
+            else:
+                default_rules = (ROOT / "config_files" / suffix / "alter_rules.json5").resolve()
+                if default_rules.is_file():
+                    inputs.append(default_rules)
     # --replace-args / --annotate-args 里的 --reference-file 都是只读输入，必须参加
     # 输出别名检查；否则后续阶段可能把前一阶段读过的 reference 覆盖掉。
     for stage in ("replace", "annotate"):

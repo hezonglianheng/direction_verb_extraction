@@ -145,7 +145,7 @@ pipeline 只接力正式句对标注图 `pair/synonym/all_in_one`。`single`、`
 
 默认拒绝覆盖本次选中阶段的产物及标注 CSV/summary；`--overwrite` 明确允许覆盖，但不能让输入输出或多份产物指向同一个文件（包括链接别名）。中途起跑不会重跑上游。某阶段非零退出时立即停止并保留退出码；已完成阶段的产物保留，不回滚，也不假装全链路成功。
 
-替换规则（`--alter-rules`，含按词性解析的默认规则）和 `--reference-file` 作为只读输入参加这项冲突检查。自定义 Batch 缓存、jobs/meta 或多模型 raw 路径不能指向这些实际输入。非配置模式与 JSON5 模式口径一致；涉及路径规划的透传选项必须写全名，不能用 `--alter-rule`、`--print-prom` 等缩写绕过预检。`--print-prompt` 只预览标注提示词：标注主产物、CSV/summary、多模型 raw 和 Batch sidecar 都不写，因此不检查这些路径的既有文件或 `.jsonl` 后缀；但起始语料、reference、图/模型组合等输入校验仍然执行，上游 extract/replace 的写入检查也不放松。
+词表（`--vocab_config_path` / `-v`）按 extract 的解析优先级（项目根优先、其次当前目录）只保护实际读取的那一份，两边都没有时预检直接报找不到词表；替换规则（`--alter-rules`，含按词性解析的默认规则）和 `--reference-file` 同样作为只读输入参加这项冲突检查。自定义 Batch 缓存、jobs/meta 或多模型 raw 路径不能指向这些实际输入。非配置模式与 JSON5 模式口径一致；涉及路径规划的透传选项必须写全名，不能用 `--vocab_config_p`、`--alter-rule`、`--print-prom` 等缩写绕过预检。`--print-prompt` 只预览标注提示词：标注主产物、CSV/summary、多模型 raw 和 Batch sidecar 都不写，因此不检查这些路径的既有文件或 `.jsonl` 后缀；但起始语料、reference、图/模型组合等输入校验仍然执行，上游 extract/replace 的写入检查也不放松。
 
 Batch 缓存/jobs/meta（含自定义 `--batch-cache`）和多模型原始结果也参与全链路路径冲突检查，不能覆盖原始输入或其他阶段产物。缓存路径推导由预检与实际会话共用。缓存允许已存在以便续跑；仍沿用原接口约定：只有 `--batch-resume` 才复用已有任务，不加它可能清空旧缓存并发起新任务。
 
@@ -167,7 +167,7 @@ python pipeline.py --source raw.jsonl --extract-model screen-model --replace-mod
 
 `--extract-model` 映射到 `extract --screen-model`（规则命中后的 LLM 筛选），`--replace-model` 映射到 `replace --model`（原句补筛与替换句检查；机械替换本身不调用模型）。二者只在对应阶段被选中时生效，传了未选中阶段的模型参数会被忽略；未指定时流水线不注入默认值，各阶段继续使用自己的默认配置（当前均为 `config.SCREEN_MODEL`）。同一阶段的一等参数与透传里的同义模型选项互斥，即使值相同也报错，`--opt=value` 和前缀缩写同样会被识别（歧义前缀本就会被子命令拒绝）；冲突在任何阶段启动/建目录之前报错。预检只传递模型配置名，不校验 `model_config/api_keys.json` 里的条目是否存在。
 
-流水线管理的输入、输出、词性、覆盖和 engine 参数不能通过透传覆盖；请使用驱动的对应选项。涉及路径规划/预检的透传选项必须写全名，不能用 argparse 缩写（例如 `--out-f`、`--batch-c`、`--gra`、`--alter-rule`、`--print-prom`）。`--annotate-args '["--graph","all_in_one","--models","model-a","model-b"]'` 可不指定 `--annotation-engine`；显式指定引擎时必须与图兼容。预检和共同 runner 共用轻量选择校验，`--graph=x` 和拆分写法均不能靠最后一个值掩盖冲突；冲突在任何上游阶段启动/建目录之前报错。独立阶段仍接受全部旧参数。默认 limit 为 pair/synonym 100、all_in_one 1；要处理更多句对，务必显式指定 `--limit`。未选中阶段的透传参数不执行。
+流水线管理的输入、输出、词性、覆盖和 engine 参数不能通过透传覆盖；请使用驱动的对应选项。涉及路径规划/预检的透传选项必须写全名，不能用 argparse 缩写（例如 `--out-f`、`--batch-c`、`--gra`、`--vocab_config_p`、`--alter-rule`、`--print-prom`）。`--annotate-args '["--graph","all_in_one","--models","model-a","model-b"]'` 可不指定 `--annotation-engine`；显式指定引擎时必须与图兼容。预检和共同 runner 共用轻量选择校验，`--graph=x` 和拆分写法均不能靠最后一个值掩盖冲突；冲突在任何上游阶段启动/建目录之前报错。独立阶段仍接受全部旧参数。默认 limit 为 pair/synonym 100、all_in_one 1；要处理更多句对，务必显式指定 `--limit`。未选中阶段的透传参数不执行。
 
 ### JSON5 配置文件
 
