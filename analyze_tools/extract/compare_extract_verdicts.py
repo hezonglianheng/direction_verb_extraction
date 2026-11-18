@@ -8,28 +8,41 @@
 
 比较对象是 ``results/extract_result`` 下同名的
 ``location_corpus_with_locative_split_*.screening_verdicts.csv``（或原始 ``.jsonl``）。
-一行 CSV / 一个布尔 verdict 表示模型对某个方位词候选的一次 true/false 判定，其
+一行 CSV / 一个三态 verdict 表示模型对某个方位词候选的一次 true/false/unknown
+判定，其
 ``(目标物, 参照物, 动词)`` 就是本项目所说的三元组。
 
 对齐口径（默认）::
 
-    base = (源文件, 原句, 方位词, 方位词下标)
+    base = (源文件, 原句, 方位词, 方位词字符偏移)
     key  = base + (同一 base 在该文件中按原始顺序出现的序号,)
+
+字符偏移是方位词在“原句拼接文本”中的起始位置（从 0 开始的 Unicode 字符数），
+可由 token 列表 ``sum(len(token) for token in tokens[:index])`` 得到。它比 token
+下标稳定：不同批次即使重新分词，只要原句文本不变，同一个方位词的偏移就不变。
 
 ``JSONL行号`` **不参与** 对齐：不同批次的结果会因记录增删而整体平移，用它对齐会把
 大量相同项误判为“仅单侧”。三元组本身也不参与 key：角色可能为空、grounding 也可能
-变化；三元组文本是否变化单独统计，不混进 true/false 翻转。
+变化；三元组文本是否变化单独统计，不混进判定翻转。
+
+``screening.verdicts`` 中实际存在的 verdict 若 ``extractable=None``（典型为
+limit/error；旧数据里也可能有逐词 ``no_llm`` verdict），表示该方位词没有拿到
+true/false 判定。脚本**不再跳过**这些行，而是作为 ``unknown`` 参与对齐、明细和统计；
+``unknown`` 不是 ``false``，也不会被当成 ``false``。真实 ``annotate_no_llm`` 记录是
+记录级状态、``verdicts=[]``，不产生比较行，也不会计入 ``unknown``。
 
 同一 ``base`` 在一侧重复出现时，按原始顺序第 1 对第 1、第 2 对第 2 配对；若一侧多出
 或缺少其中一条，序号配对只能保证确定性，无法消除歧义，因此输出会单独打印“重复 base
-组数”和一致率可能范围。
+组数”和相同判断数可能范围。
 
 输入 2 个或更多文件时，脚本对每一对文件生成一个逐项明细 CSV，并额外写一份
 ``summary.md``，其中包含每个文件的统计、两两汇总表和一致性矩阵。一致性矩阵的单元格
-是 ``一致率（相同/共同）``；对角线写 ``—``，无共同项写 ``N/A (0/0)``。
+是 ``一致率（相同/并集）``，分母是两侧 key 的并集
+``common + only_left + only_right``，仅单侧项也进入分母；对角线写 ``—``，并集为 0
+时写 ``N/A (0/0)``。共同项中三态判定相等（含 ``unknown`` 对 ``unknown``）记为相同。
 
-脚本只读输入；差异本身不算失败，返回 0。只有至少一对完全没有共同判定项才返回 1；
-无法开始比较（少于两个文件、重复输入、格式混合、文件损坏、输出冲突）返回 2。
+脚本只读输入；差异本身不算失败，返回 0。只有至少一对的并集为 0（两侧都没有判定行）
+才返回 1；无法开始比较（少于两个文件、重复输入、格式混合、文件损坏、输出冲突）返回 2。
 
 用法::
 
@@ -83,6 +96,7 @@ CSV_COLUMNS = [
     "源文件",
     "方位词",
     "方位词下标",
+    "方位词字符偏移",
     "目标物",
     "参照物",
     "动词",
@@ -100,6 +114,7 @@ CSV_REQUIRED = frozenset(
         "源文件",
         "方位词",
         "方位词下标",
+        "方位词字符偏移",
         "目标物",
         "参照物",
         "动词",
@@ -114,7 +129,9 @@ DETAIL_COLUMNS = [
     "源文件",
     "原句",
     "方位词",
-    "方位词下标",
+    "方位词字符偏移",
+    "左方位词下标",
+    "右方位词下标",
     "左目标物",
     "左参照物",
     "左动词",
@@ -135,27 +152,42 @@ LOCATIVE_COLUMNS = [
     "不同",
     "true→false",
     "false→true",
+    "unknown→unknown",
+    "unknown≠bool",
     "仅左",
     "仅右",
 ]
-LOCATIVE_ALIGNS = ["---", "---:", "---:", "---:", "---:", "---:", "---:", "---:"]
+LOCATIVE_ALIGNS = ["---"] + ["---:"] * 9
+
+
+def verdict_text(value: bool | None) -> str:
+    """三态判定的统一文本：true / false / unknown。"""
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    return "unknown"
 
 
 @dataclass(frozen=True)
 class VerdictRow:
-    """一个可比较的逐方位词判定投影。"""
+    """一个可比较的逐方位词判定投影。
 
-    key: tuple[str, str, str, str, int]
-    base: tuple[str, str, str, str]
+    ``verdict`` 是三态：``True`` / ``False`` / ``None``（unknown，没拿到判定）。
+    """
+
+    key: tuple[str, str, str, int, int]
+    base: tuple[str, str, str, int]
     line_no: str
     source_file: str
     sentence: str
     locative: str
     locative_index: str
+    locative_offset: int
     target: str
     reference: str
     verb: str
-    verdict: bool
+    verdict: bool | None
     reason: str
     status: str
 
@@ -167,6 +199,64 @@ class VerdictRow:
     def complete(self) -> bool:
         """目标物、参照物、动词三者都不为空。"""
         return bool(self.target and self.reference and self.verb)
+
+    @property
+    def verdict_text(self) -> str:
+        return verdict_text(self.verdict)
+
+
+def _state_counts(rows: Sequence[VerdictRow]) -> tuple[int, int, int]:
+    """返回 (true, false, unknown) 三态计数。"""
+    true_count = sum(1 for row in rows if row.verdict is True)
+    false_count = sum(1 for row in rows if row.verdict is False)
+    return true_count, false_count, len(rows) - true_count - false_count
+
+
+def _max_cross_pairs(
+    left_counts: tuple[int, int, int], right_counts: tuple[int, int, int]
+) -> int:
+    """最多能配出多少对不同状态的 pair（小型三态最大流）。"""
+    source, sink = 0, 7
+    size = 8
+    capacity = [[0] * size for _ in range(size)]
+    for state, count in enumerate(left_counts):
+        capacity[source][1 + state] = count
+    for left_state in range(3):
+        for right_state in range(3):
+            if left_state != right_state:
+                capacity[1 + left_state][4 + right_state] = 10**9
+    for state, count in enumerate(right_counts):
+        capacity[4 + state][sink] = count
+
+    total = 0
+    while True:
+        parent = [-1] * size
+        parent[source] = source
+        queue = [source]
+        for node in queue:
+            for nxt in range(size):
+                if parent[nxt] == -1 and capacity[node][nxt] > 0:
+                    parent[nxt] = node
+                    queue.append(nxt)
+                    if nxt == sink:
+                        break
+            if parent[sink] != -1:
+                break
+        if parent[sink] == -1:
+            return total
+        amount = 10**9
+        node = sink
+        while node != source:
+            prev = parent[node]
+            amount = min(amount, capacity[prev][node])
+            node = prev
+        node = sink
+        while node != source:
+            prev = parent[node]
+            capacity[prev][node] -= amount
+            capacity[node][prev] += amount
+            node = prev
+        total += amount
 
 
 @dataclass
@@ -182,18 +272,18 @@ class Comparison:
     def __post_init__(self) -> None:
         self.left_total = len(self.left)
         self.right_total = len(self.right)
-        self.left_true = sum(row.verdict for row in self.left)
-        self.left_false = self.left_total - self.left_true
-        self.right_true = sum(row.verdict for row in self.right)
-        self.right_false = self.right_total - self.right_true
+        self.left_true, self.left_false, self.left_unknown = _state_counts(self.left)
+        self.right_true, self.right_false, self.right_unknown = _state_counts(self.right)
         self.left_complete = sum(row.complete for row in self.left)
         self.right_complete = sum(row.complete for row in self.right)
 
         self.common = len(self.common_keys)
         self.only_left = len(self.only_left_keys)
         self.only_right = len(self.only_right_keys)
+        # 一致性矩阵的分母：两侧 key 的并集。仅单侧项也进入分母。
+        self.union = self.common + self.only_left + self.only_right
 
-        self.matrix: Counter[tuple[bool, bool]] = Counter()
+        self.matrix: Counter[tuple[bool | None, bool | None]] = Counter()
         self.same = 0
         self.different = 0
         self.common_complete = 0
@@ -228,15 +318,26 @@ class Comparison:
             if left.line_no != right.line_no:
                 self.line_mismatch += 1
 
-        self.only_left_true = sum(self.left_by_key[key].verdict for key in self.only_left_keys)
-        self.only_left_false = self.only_left - self.only_left_true
-        self.only_right_true = sum(self.right_by_key[key].verdict for key in self.only_right_keys)
-        self.only_right_false = self.only_right - self.only_right_true
+        self.only_left_true, self.only_left_false, self.only_left_unknown = _state_counts(
+            [self.left_by_key[key] for key in self.only_left_keys]
+        )
+        self.only_right_true, self.only_right_false, self.only_right_unknown = (
+            _state_counts([self.right_by_key[key] for key in self.only_right_keys])
+        )
 
-        left_by_base: dict[tuple[str, str, str, str], list[VerdictRow]] = {}
+        self.common_unknown = sum(
+            1
+            for key in self.common_keys
+            if self.left_by_key[key].verdict is None
+            or self.right_by_key[key].verdict is None
+        )
+        self.same_unknown = self.matrix[(None, None)]
+        self.different_unknown = self.common_unknown - self.same_unknown
+
+        left_by_base: dict[tuple[str, str, str, int], list[VerdictRow]] = {}
         for row in self.left:
             left_by_base.setdefault(row.base, []).append(row)
-        right_by_base: dict[tuple[str, str, str, str], list[VerdictRow]] = {}
+        right_by_base: dict[tuple[str, str, str, int], list[VerdictRow]] = {}
         for row in self.right:
             right_by_base.setdefault(row.base, []).append(row)
         self.duplicate_groups_left = sum(
@@ -270,16 +371,12 @@ class Comparison:
                     left_rows[i].verdict == right_rows[i].verdict
                     for i in range(paired)
                 )
-                left_true = sum(row.verdict for row in left_rows)
-                left_false = len(left_rows) - left_true
-                right_true = sum(row.verdict for row in right_rows)
-                right_false = len(right_rows) - right_true
-                duplicate_same_max += min(left_true, right_true) + min(
-                    left_false, right_false
+                left_counts = _state_counts(left_rows)
+                right_counts = _state_counts(right_rows)
+                duplicate_same_max += min(
+                    paired, sum(min(a, b) for a, b in zip(left_counts, right_counts))
                 )
-                cross_possible = min(left_true, right_false) + min(
-                    left_false, right_true
-                )
+                cross_possible = _max_cross_pairs(left_counts, right_counts)
                 duplicate_same_min += paired - min(paired, cross_possible)
                 if len(left_rows) != len(right_rows):
                     self.duplicate_unequal_both += 1
@@ -303,6 +400,12 @@ class Comparison:
 
     @property
     def agreement(self) -> float | None:
+        """矩阵口径：相同 / 两侧并集；仅单侧项也进入分母。"""
+        return self.same / self.union if self.union else None
+
+    @property
+    def common_agreement(self) -> float | None:
+        """诊断口径：相同 / 共同项，仅用于对照。"""
         return self.same / self.common if self.common else None
 
     def _by_locative(self) -> list[dict[str, Any]]:
@@ -316,10 +419,14 @@ class Comparison:
                 item["same"] += 1
             else:
                 item["different"] += 1
-            if left.verdict and not right.verdict:
+            if left.verdict is True and right.verdict is False:
                 item["tf"] += 1
-            elif not left.verdict and right.verdict:
+            elif left.verdict is False and right.verdict is True:
                 item["ft"] += 1
+            if left.verdict is None and right.verdict is None:
+                item["uu"] += 1
+            elif left.verdict is None or right.verdict is None:
+                item["udiff"] += 1
         for key in self.only_left_keys:
             item = stats.setdefault(self.left_by_key[key].locative, Counter())
             item["only_left"] += 1
@@ -372,11 +479,15 @@ class LoadedFile:
 
     @property
     def true_count(self) -> int:
-        return sum(row.verdict for row in self.rows)
+        return sum(1 for row in self.rows if row.verdict is True)
 
     @property
     def false_count(self) -> int:
-        return self.total - self.true_count
+        return sum(1 for row in self.rows if row.verdict is False)
+
+    @property
+    def unknown_count(self) -> int:
+        return self.total - self.true_count - self.false_count
 
     @property
     def complete_count(self) -> int:
@@ -397,6 +508,7 @@ class PairSummary:
     right: LoadedFile
     csv_name: str
     common: int
+    union: int
     same: int
     different: int
     only_left: int
@@ -410,13 +522,13 @@ class PairSummary:
 
     @property
     def agreement(self) -> float | None:
-        return self.same / self.common if self.common else None
+        return self.same / self.union if self.union else None
 
     @property
     def agreement_text(self) -> str:
-        if not self.common:
+        if not self.union:
             return "N/A (0/0)"
-        return f"{self.agreement * 100:.2f}% ({self.same}/{self.common})"
+        return f"{self.agreement * 100:.2f}% ({self.same}/{self.union})"
 
 
 def pair_summary_from_comparison(
@@ -427,6 +539,7 @@ def pair_summary_from_comparison(
         right=right,
         csv_name=csv_name,
         common=comparison.common,
+        union=comparison.union,
         same=comparison.same,
         different=comparison.different,
         only_left=comparison.only_left,
@@ -459,6 +572,25 @@ def _cell(value: Any) -> str:
     return str(value)
 
 
+def _offset_value(value: Any) -> int:
+    """把字符偏移规范化为非负整数；bool 不能冒充整数。"""
+    if isinstance(value, bool):
+        raise ValueError(f"方位词字符偏移非法：{value!r}")
+    if isinstance(value, int):
+        offset = value
+    else:
+        text = _cell(value).strip()
+        if not text:
+            raise ValueError("方位词字符偏移为空；请用新版导出脚本重新生成 CSV")
+        try:
+            offset = int(text)
+        except ValueError as exc:
+            raise ValueError(f"方位词字符偏移非法：{text!r}（只接受非负整数）") from exc
+    if offset < 0:
+        raise ValueError(f"方位词字符偏移非法：{offset}（只接受非负整数）")
+    return offset
+
+
 def _node_word(node: Any) -> str:
     if isinstance(node, dict):
         return _cell(node.get("word"))
@@ -472,10 +604,11 @@ def _make_row(
     sentence: Any,
     locative: Any,
     locative_index: Any,
+    locative_offset: Any,
     target: Any,
     reference: Any,
     verb: Any,
-    verdict: bool,
+    verdict: bool | None,
     reason: Any = "",
     status: Any = "",
 ) -> VerdictRow:
@@ -483,7 +616,8 @@ def _make_row(
     text = sentence_text(sentence)
     loc = _cell(locative)
     index = _cell(locative_index)
-    base = (source, text, loc, index)
+    offset = _offset_value(locative_offset)
+    base = (source, text, loc, offset)
     return VerdictRow(
         key=(*base, 0),
         base=base,
@@ -492,6 +626,7 @@ def _make_row(
         sentence=text,
         locative=loc,
         locative_index=index,
+        locative_offset=offset,
         target=_cell(target),
         reference=_cell(reference),
         verb=_cell(verb),
@@ -503,7 +638,7 @@ def _make_row(
 
 def assign_keys(rows: Sequence[VerdictRow]) -> list[VerdictRow]:
     """给同一 base 的多行按原始顺序编号，保证 key 在文件内唯一。"""
-    seen: Counter[tuple[str, str, str, str]] = Counter()
+    seen: Counter[tuple[str, str, str, int]] = Counter()
     result = []
     for row in rows:
         ordinal = seen[row.base]
@@ -533,17 +668,44 @@ def read_csv_rows(
             fieldnames = reader.fieldnames or []
             missing = sorted(CSV_REQUIRED - set(fieldnames))
             if missing:
-                raise ValueError(f"{source} 缺列：{', '.join(missing)}")
+                hint = (
+                    "；旧版 CSV 不含字符偏移，请用新版 "
+                    "export_extract_verdicts_csv.py 重新导出"
+                    if "方位词字符偏移" in missing
+                    else ""
+                )
+                raise ValueError(f"{source} 缺列：{', '.join(missing)}{hint}")
             for raw in reader:
                 raw_verdict = _cell(raw.get("模型判定")).strip().lower()
                 if raw_verdict == "true":
                     verdict = True
                 elif raw_verdict == "false":
                     verdict = False
+                elif raw_verdict == "unknown":
+                    verdict = None
                 else:
                     raise ValueError(
                         f"{source} 第 {reader.line_num} 行「模型判定」非法："
-                        f"{_cell(raw.get('模型判定'))!r}（只接受 true/false）"
+                        f"{_cell(raw.get('模型判定'))!r}"
+                        "（只接受 true/false/unknown）"
+                    )
+                try:
+                    offset = _offset_value(raw.get("方位词字符偏移"))
+                except ValueError as exc:
+                    raise ValueError(
+                        f"{source} 第 {reader.line_num} 行：{exc}"
+                    ) from exc
+                sentence_value = _cell(raw.get("原句"))
+                locative_value = _cell(raw.get("方位词"))
+                if (
+                    offset + len(locative_value) > len(sentence_value)
+                    or sentence_value[offset : offset + len(locative_value)]
+                    != locative_value
+                ):
+                    raise ValueError(
+                        f"{source} 第 {reader.line_num} 行「方位词字符偏移」"
+                        f"与「原句/方位词」不一致：offset={offset}, "
+                        f"方位词={locative_value!r}"
                     )
                 rows.append(
                     _make_row(
@@ -552,6 +714,7 @@ def read_csv_rows(
                         sentence=raw.get("原句"),
                         locative=raw.get("方位词"),
                         locative_index=raw.get("方位词下标"),
+                        locative_offset=offset,
                         target=raw.get("目标物"),
                         reference=raw.get("参照物"),
                         verb=raw.get("动词"),
@@ -566,6 +729,52 @@ def read_csv_rows(
                 f"{source} 第 {reader.line_num} 行 CSV 解析失败：{exc}"
             ) from exc
     return assign_keys(rows)
+
+
+def _jsonl_locative_offset(
+    sentence: Any, index: Any, word: Any, source: Path, line_no: int
+) -> int:
+    """从 JSONL 的 token 列表计算方位词字符偏移，并校验下标/词形。"""
+    if isinstance(sentence, list):
+        if (
+            isinstance(index, bool)
+            or not isinstance(index, int)
+            or not 0 <= index < len(sentence)
+        ):
+            raise ValueError(
+                f"{source} 第 {line_no} 行 verdict index 非法：{index!r}"
+            )
+        token = sentence[index]
+        if not isinstance(token, str):
+            raise ValueError(
+                f"{source} 第 {line_no} 行 index={index} 的 token 不是字符串：{token!r}"
+            )
+        if token != _cell(word):
+            raise ValueError(
+                f"{source} 第 {line_no} 行 index={index} 的 token={token!r} "
+                f"与 verdict.word={_cell(word)!r} 不一致"
+            )
+        return sum(len(item) for item in sentence[:index] if isinstance(item, str))
+    if isinstance(sentence, str):
+        text = sentence
+        needle = _cell(word)
+        positions = []
+        start = 0
+        while needle:
+            found = text.find(needle, start)
+            if found < 0:
+                break
+            positions.append(found)
+            start = found + 1
+        if len(positions) == 1:
+            return positions[0]
+        raise ValueError(
+            f"{source} 第 {line_no} 行无法从字符串原句确定方位词字符偏移："
+            f"word={needle!r} 出现 {len(positions)} 次；请提供 token 列表或字符偏移"
+        )
+    raise ValueError(
+        f"{source} 第 {line_no} 行 sentence 类型非法：{type(sentence).__name__}"
+    )
 
 
 def _jsonl_verdict_rows(
@@ -601,21 +810,26 @@ def _jsonl_verdict_rows(
         if not isinstance(verdict, dict):
             continue
         extractable = verdict.get("extractable")
-        # None 表示未送模型（limit/error/no_llm），按导出器口径跳过；
-        # 其余非布尔值属于损坏数据，必须报错而不是静默当成“未判定”。
-        if extractable is None:
-            continue
+        # None 表示这个实际存在的 verdict 没拿到判定（典型 limit/error；旧数据里
+        # 可能有逐词 no_llm），按 unknown 保留并参与统计。真实 annotate_no_llm 记录
+        # 的 verdicts 为空，不会走到这里。其余非布尔值属于损坏数据，必须报错。
         if extractable is True:
             extractable_value = True
         elif extractable is False:
             extractable_value = False
+        elif extractable is None:
+            extractable_value = None
         else:
             raise ValueError(
                 f"{source} 第 {line_no} 行 verdict extractable 非法："
                 f"{extractable!r}（只接受 true/false/None）"
             )
+        index = verdict.get("index")
+        offset = _jsonl_locative_offset(
+            record.get("sentence"), index, verdict.get("word"), source, line_no
+        )
         try:
-            candidate = candidates_by_index.get(verdict.get("index"))
+            candidate = candidates_by_index.get(index)
         except TypeError as exc:
             raise ValueError(
                 f"{source} 第 {line_no} 行 verdict index 非法（不可哈希）：{exc}"
@@ -627,7 +841,8 @@ def _jsonl_verdict_rows(
             source_file=record.get("source_file"),
             sentence=record.get("sentence"),
             locative=verdict.get("word"),
-            locative_index=verdict.get("index"),
+            locative_index=index,
+            locative_offset=offset,
             target=_node_word(candidate.get("target")),
             reference=_node_word(candidate.get("reference")),
             verb=_node_word(candidate.get("verb")),
@@ -725,6 +940,8 @@ def _locative_rows(comparison: Comparison) -> list[dict[str, Any]]:
             "不同": item.get("different", 0),
             "true→false": item.get("tf", 0),
             "false→true": item.get("ft", 0),
+            "unknown→unknown": item.get("uu", 0),
+            "unknown≠bool": item.get("udiff", 0),
             "仅左": item.get("only_left", 0),
             "仅右": item.get("only_right", 0),
         }
@@ -737,25 +954,32 @@ def format_summary(comparison: Comparison, left_path: Path, right_path: Path) ->
     lines = [
         f"左结果: {left_path}",
         f"右结果: {right_path}",
-        "对齐口径: (源文件, 原句, 方位词, 方位词下标, 同 base 序号)；比较字段: 模型判定",
+        "对齐口径: (源文件, 原句, 方位词, 方位词字符偏移, 同 base 序号)；"
+        "比较字段: 模型判定（true/false/unknown）",
         "",
         f"左侧: 判定={c.left_total} "
-        f"(true={c.left_true}, false={c.left_false})，完整三元组={c.left_complete}",
+        f"(true={c.left_true}, false={c.left_false}, unknown={c.left_unknown})，"
+        f"完整三元组={c.left_complete}",
         f"右侧: 判定={c.right_total} "
-        f"(true={c.right_true}, false={c.right_false})，完整三元组={c.right_complete}",
+        f"(true={c.right_true}, false={c.right_false}, unknown={c.right_unknown})，"
+        f"完整三元组={c.right_complete}",
         "",
-        f"共同判定项: {c.common}",
+        f"共同判定项: {c.common}；两侧并集（矩阵分母）: {c.union}",
     ]
     if c.common:
-        rate = (c.agreement or 0.0) * 100
+        common_rate = (c.common_agreement or 0.0) * 100
+        union_rate = (c.agreement or 0.0) * 100
         lines.extend(
             [
-                f"  相同判断: {c.same} ({rate:.2f}%)",
+                f"  相同判断: {c.same}（共同项内 {common_rate:.2f}%）；"
+                f"并集口径 {union_rate:.2f}% ({c.same}/{c.union})",
                 f"    true→true : {c.matrix[(True, True)]}",
                 f"    false→false: {c.matrix[(False, False)]}",
-                f"  不同判断: {c.different} ({100 - rate:.2f}%)",
+                f"    unknown→unknown: {c.matrix[(None, None)]}",
+                f"  不同判断: {c.different}（共同项内 {100 - common_rate:.2f}%）",
                 f"    true→false: {c.matrix[(True, False)]}",
                 f"    false→true: {c.matrix[(False, True)]}",
+                f"    unknown≠bool: {c.different_unknown}",
                 f"  其中两侧三元组都完整: {c.common_complete} "
                 f"(相同={c.same_complete}, 不同={c.different_complete})",
             ]
@@ -763,11 +987,21 @@ def format_summary(comparison: Comparison, left_path: Path, right_path: Path) ->
     else:
         lines.append("  相同判断: N/A（没有可对齐的判定项）")
 
+    union_text = (
+        "N/A (0/0)"
+        if not c.union
+        else f"{(c.agreement or 0.0) * 100:.2f}% ({c.same}/{c.union})"
+    )
     lines.extend(
         [
             "",
-            f"仅左侧: {c.only_left} (true={c.only_left_true}, false={c.only_left_false})",
-            f"仅右侧: {c.only_right} (true={c.only_right_true}, false={c.only_right_false})",
+            f"仅左侧: {c.only_left} "
+            f"(true={c.only_left_true}, false={c.only_left_false}, "
+            f"unknown={c.only_left_unknown})",
+            f"仅右侧: {c.only_right} "
+            f"(true={c.only_right_true}, false={c.only_right_false}, "
+            f"unknown={c.only_right_unknown})",
+            f"一致率（相同/并集）: {union_text}",
             f"三元组文本变化（共同项）: {c.triple_changed} "
             f"(判定相同={c.triple_changed_same_verdict}, "
             f"判定不同={c.triple_changed_diff_verdict})",
@@ -791,7 +1025,7 @@ def _short(value: str, limit: int = 60) -> str:
 
 
 def _format_example(index: int, left: VerdictRow, right: VerdictRow | None) -> str:
-    left_verdict = "true" if left.verdict else "false"
+    left_verdict = left.verdict_text
     triple = " / ".join(part or "∅" for part in left.triple)
     head = (
         f"[{index}] 左行 {left.line_no} / 右行 "
@@ -805,7 +1039,7 @@ def _format_example(index: int, left: VerdictRow, right: VerdictRow | None) -> s
     return (
         f"{head}\n"
         f"    左: {left_verdict} | {_short(left.reason)}\n"
-        f"    右: {'true' if right.verdict else 'false'} | 三元组: {right_triple} | "
+        f"    右: {right.verdict_text} | 三元组: {right_triple} | "
         f"{_short(right.reason)}"
     )
 
@@ -833,7 +1067,7 @@ def format_examples(comparison: Comparison, limit: int) -> str:
             f"[{i}] 右行 {row.line_no} | {Path(row.source_file).name} | "
             f"{row.locative}[{row.locative_index}] | "
             f"三元组: {' / '.join(part or '∅' for part in row.triple)} | "
-            f"判定: {'true' if row.verdict else 'false'} | 理由: {_short(row.reason)}"
+            f"判定: {row.verdict_text} | 理由: {_short(row.reason)}"
             for i, row in enumerate(only_right, 1)
         )
     return "\n".join(lines)
@@ -851,15 +1085,17 @@ def _detail_row(comparison: Comparison, key: tuple, kind: str) -> dict[str, str]
         "源文件": source.source_file,
         "原句": source.sentence,
         "方位词": source.locative,
-        "方位词下标": source.locative_index,
+        "方位词字符偏移": str(source.locative_offset),
+        "左方位词下标": left.locative_index if left else "",
+        "右方位词下标": right.locative_index if right else "",
         "左目标物": left.target if left else "",
         "左参照物": left.reference if left else "",
         "左动词": left.verb if left else "",
         "右目标物": right.target if right else "",
         "右参照物": right.reference if right else "",
         "右动词": right.verb if right else "",
-        "左判定": ("true" if left.verdict else "false") if left else "",
-        "右判定": ("true" if right.verdict else "false") if right else "",
+        "左判定": left.verdict_text if left else "",
+        "右判定": right.verdict_text if right else "",
         "三元组是否变化": (
             ("是" if left.triple != right.triple else "否") if left and right else ""
         ),
@@ -1154,7 +1390,7 @@ def compare_all_pairs(
             summaries.append(summary)
             print(
                 f"[{pair_no}/{pair_total}] {left.label} vs {right.label}: "
-                f"共同={summary.common}, 相同={summary.same}, "
+                f"共同={summary.common}, 并集={summary.union}, 相同={summary.same}, "
                 f"不同={summary.different}, 一致率={summary.agreement_text}",
                 file=progress_stream or sys.stdout,
             )
@@ -1196,7 +1432,17 @@ def format_overall_markdown(
     ]
     lines.extend(
         _md_table(
-            ["编号", "文件", "格式", "判定数", "true", "false", "完整三元组", "重复 base 组"],
+            [
+                "编号",
+                "文件",
+                "格式",
+                "判定数",
+                "true",
+                "false",
+                "unknown",
+                "完整三元组",
+                "重复 base 组",
+            ],
             [
                 {
                     "编号": f"{item.index:02d}",
@@ -1205,24 +1451,39 @@ def format_overall_markdown(
                     "判定数": item.total,
                     "true": item.true_count,
                     "false": item.false_count,
+                    "unknown": item.unknown_count,
                     "完整三元组": item.complete_count,
                     "重复 base 组": item.duplicate_groups,
                 }
                 for item in files
             ],
-            ["---", "---", "---", "---:", "---:", "---:", "---:", "---:"],
+            ["---", "---", "---", "---:"] + ["---:"] * 5,
         )
     )
     lines.extend(["", "## 两两对比汇总", ""])
     lines.extend(
         _md_table(
-            ["#", "左", "右", "共同", "相同", "不同", "一致率", "仅左", "仅右", "三元组变化", "明细 CSV"],
+            [
+                "#",
+                "左",
+                "右",
+                "共同",
+                "并集",
+                "相同",
+                "不同",
+                "一致率",
+                "仅左",
+                "仅右",
+                "三元组变化",
+                "明细 CSV",
+            ],
             [
                 {
                     "#": index,
                     "左": summary.left.label,
                     "右": summary.right.label,
                     "共同": summary.common,
+                    "并集": summary.union,
                     "相同": summary.same,
                     "不同": summary.different,
                     "一致率": summary.agreement_text,
@@ -1233,7 +1494,7 @@ def format_overall_markdown(
                 }
                 for index, summary in enumerate(summaries, 1)
             ],
-            ["---"] * 7 + ["---:"] * 3 + ["---"],
+            ["---", "---", "---"] + ["---:"] * 8 + ["---"],
         )
     )
     lines.extend(
@@ -1241,8 +1502,9 @@ def format_overall_markdown(
             "",
             "## 一致性矩阵",
             "",
-            "单元格为 `一致率（相同/共同）`；只统计两侧都存在的共同判定项，"
-            "仅单侧项不进入分母。对角线不与自己比较，写 `—`；无共同项写 `N/A (0/0)`。",
+            "单元格为 `一致率（相同/并集）`；分母是两侧 key 的并集 "
+            "`共同 + 仅左 + 仅右`，仅单侧项也进入分母但不计入相同。"
+            "对角线不与自己比较，写 `—`；并集为 0 时写 `N/A (0/0)`。",
             "",
         ]
     )
@@ -1280,10 +1542,16 @@ def format_overall_markdown(
             "",
             "## 口径说明",
             "",
-            "- 对齐 key: `(源文件, 原句, 方位词, 方位词下标, 同 base 序号)`。",
-            "- 比较字段: `模型判定` 的 true/false；三元组文本变化单独统计。",
+            "- 对齐 key: `(源文件, 原句, 方位词, 方位词字符偏移, 同 base 序号)`。",
+            "- 比较字段: `模型判定` 的 true/false/unknown；三元组文本变化单独统计。",
+            "- `unknown` 是实际存在的 verdict 没拿到判定（典型 limit/error；"
+            "旧数据可能含逐词 no_llm），不是 false；它参与共同项、仅单侧和分母统计。",
+            "- 真实 `no_llm` 记录 `verdicts=[]`，不产生比较行；"
+            "`unknown` 不用于表示整条记录未启用 LLM。",
+            "- 共同项中 `unknown` 对 `unknown` 计为相同状态，"
+            "`unknown` 对 true/false 计为不同；因此这里的一致率是三态状态一致率。",
             "- 两两 CSV 保留全部共同相同、共同不同、仅左侧、仅右侧明细。",
-            "- 差异本身不是错误；只有至少一对完全没有共同判定项时才返回 1。",
+            "- 差异本身不是错误；只有至少一对两侧并集为 0 时才返回 1。",
             "",
         ]
     )
@@ -1302,22 +1570,25 @@ def print_terminal_summary(
     print(f"已加载 {len(files)} 个文件，完成 {len(summaries)} 对比较")
     print()
     print(
-        "| 编号 | 文件 | 判定数 | true | false | 完整三元组 | 重复 base 组 |"
+        "| 编号 | 文件 | 判定数 | true | false | unknown | 完整三元组 | 重复 base 组 |"
     )
-    print("| --- | --- | ---: | ---: | ---: | ---: | ---: |")
+    print("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |")
     for item in files:
         print(
             f"| {item.index:02d} | {item.path} | {item.total} | "
-            f"{item.true_count} | {item.false_count} | {item.complete_count} | "
-            f"{item.duplicate_groups} |"
+            f"{item.true_count} | {item.false_count} | {item.unknown_count} | "
+            f"{item.complete_count} | {item.duplicate_groups} |"
         )
     print()
-    print("| 对比 | 共同 | 相同 | 不同 | 一致率 | 仅左 | 仅右 | 明细 CSV |")
-    print("| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |")
+    print(
+        "| 对比 | 共同 | 并集 | 相同 | 不同 | 一致率 | 仅左 | 仅右 | 明细 CSV |"
+    )
+    print("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |")
     for summary in summaries:
         print(
             f"| {summary.left.label} vs {summary.right.label} | "
-            f"{summary.common} | {summary.same} | {summary.different} | "
+            f"{summary.common} | {summary.union} | {summary.same} | "
+            f"{summary.different} | "
             f"{summary.agreement_text} | {summary.only_left} | "
             f"{summary.only_right} | {summary.csv_name} |"
         )
@@ -1422,9 +1693,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"错误：{exc}", file=sys.stderr)
         return 2
 
-    if any(summary.common == 0 for summary in summaries):
+    if any(summary.union == 0 for summary in summaries):
         print(
-            "\n警告：至少一对没有共同判定项，矩阵中对应单元格为 N/A；"
+            "\n警告：至少一对两侧都没有判定行，矩阵中对应单元格为 N/A；"
             "其他对比和输出文件仍然有效。",
             file=sys.stderr,
         )

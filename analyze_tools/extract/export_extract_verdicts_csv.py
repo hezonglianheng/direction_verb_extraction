@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 # encoding: utf8
 
-"""把 extract 模块的方位词筛选结果导出为逐词 true/false CSV。
+"""把 extract 模块的方位词筛选结果导出为逐词判定 CSV。
 
 输入是 ``python extract`` / ``pipeline.py`` 落盘的原句 JSONL。模型的逐词判定在
-``screening.verdicts[]`` 里，``extractable`` 为 ``True``/``False`` 的条目才是模型
-真正判定过的方位词；``None`` 表示未送模型（limit/error/no_llm），不导出。
+``screening.verdicts[]`` 里：``extractable`` 为 ``True``/``False`` 表示模型判定过；
+实际存在的 verdict 中 ``None``（典型为 limit/error）导出为 ``unknown``。真实
+``no_llm`` 记录是记录级状态，``screening.verdicts`` 为空，只计入读取记录数，不产生
+CSV 行。CSV 同时写出方位词在拼接原句中的字符偏移，供比较脚本稳定对齐（不受重新分词
+影响）。
 
 目标物、参照物、动词来自 ``localization_grounding.candidates[]``，按
 ``verdict.index == candidate.index`` 对应。混合判定的整句里，被判 false 的候选会被
@@ -50,6 +53,7 @@ CSV_COLUMNS = [
     "源文件",
     "方位词",
     "方位词下标",
+    "方位词字符偏移",
     "目标物",
     "参照物",
     "动词",
@@ -110,8 +114,49 @@ def _node_word(node: Any) -> str:
     return ""
 
 
+def _locative_offset(
+    sentence: Any, index: Any, word: Any, source_file: Any, line_no: int
+) -> str:
+    """方位词在拼接原句中的字符偏移；无法唯一确定时直接报错。"""
+    needle = _cell(word)
+    where = f"{_cell(source_file) or '<未知源文件>'} 第 {line_no} 行"
+    if isinstance(sentence, list):
+        if (
+            isinstance(index, bool)
+            or not isinstance(index, int)
+            or not 0 <= index < len(sentence)
+        ):
+            raise ValueError(f"{where} verdict index 非法：{index!r}")
+        token = sentence[index]
+        if not isinstance(token, str):
+            raise ValueError(f"{where} index={index} 的 token 不是字符串：{token!r}")
+        if token != needle:
+            raise ValueError(
+                f"{where} index={index} 的 token={token!r} 与 word={needle!r} 不一致"
+            )
+        return str(
+            sum(len(item) for item in sentence[:index] if isinstance(item, str))
+        )
+    if isinstance(sentence, str):
+        positions = []
+        start = 0
+        while needle:
+            found = sentence.find(needle, start)
+            if found < 0:
+                break
+            positions.append(found)
+            start = found + 1
+        if len(positions) == 1:
+            return str(positions[0])
+        raise ValueError(
+            f"{where} 无法从字符串原句确定方位词字符偏移："
+            f"word={needle!r} 出现 {len(positions)} 次；请提供 token 列表"
+        )
+    raise ValueError(f"{where} sentence 类型非法：{type(sentence).__name__}")
+
+
 def _verdict_rows(record: dict[str, Any], line_no: int) -> Iterator[dict[str, str]]:
-    """产出一条记录里所有有效的逐词 true/false 判定行。"""
+    """产出一条记录里所有逐词判定行（true/false/unknown）。"""
     screening = record.get("screening")
     if not isinstance(screening, dict):
         return
@@ -137,11 +182,21 @@ def _verdict_rows(record: dict[str, Any], line_no: int) -> Iterator[dict[str, st
         if not isinstance(verdict, dict):
             continue
         extractable = verdict.get("extractable")
-        # 只导出模型明确判定过的 true/false；None 是 limit/error/no_llm。
-        if extractable is not True and extractable is not False:
+        # true/false 是模型判定；实际 verdict 里的 None（典型为 limit/error）是 unknown。
+        # 真实 no_llm 记录没有逐词 verdict，不会走到这里，也不会被补造成 unknown 行。
+        if extractable is True:
+            verdict_text = "true"
+        elif extractable is False:
+            verdict_text = "false"
+        elif extractable is None:
+            verdict_text = "unknown"
+        else:
             continue
         index = verdict.get("index")
-        candidate = candidates_by_index.get(index)
+        try:
+            candidate = candidates_by_index.get(index)
+        except TypeError:
+            candidate = None
         if not isinstance(candidate, dict):
             candidate = {}
 
@@ -151,10 +206,17 @@ def _verdict_rows(record: dict[str, Any], line_no: int) -> Iterator[dict[str, st
             "源文件": source_file,
             "方位词": _cell(verdict.get("word")),
             "方位词下标": _cell(index),
+            "方位词字符偏移": _locative_offset(
+                record.get("sentence"),
+                index,
+                verdict.get("word"),
+                record.get("source_file"),
+                line_no,
+            ),
             "目标物": _node_word(candidate.get("target")),
             "参照物": _node_word(candidate.get("reference")),
             "动词": _node_word(candidate.get("verb")),
-            "模型判定": "true" if extractable is True else "false",
+            "模型判定": verdict_text,
             "判定理由": _cell(verdict.get("reason")),
             "判定来源": _cell(verdict.get("source") or screening.get("source")),
             "整句筛选状态": status,
@@ -193,7 +255,9 @@ def export_jsonl_to_csv(
         raise FileExistsError(f"输出文件 {target} 已存在；如需覆盖请显式加 --overwrite")
 
     target.parent.mkdir(parents=True, exist_ok=True)
-    stats: Counter[str] = Counter()
+    # 即使一条判定都没写出、甚至输入为空，返回的普通 dict 也始终带这两个键；
+    # main 才能安全打印零行统计，而不是在写完 header-only CSV 后抛 KeyError。
+    stats: Counter[str] = Counter(records=0, rows_written=0)
     fd, temp_name = tempfile.mkstemp(
         dir=target.parent, prefix=f".{target.name}.", suffix=".tmp"
     )
@@ -239,6 +303,8 @@ def export_jsonl_to_csv(
                     for row in _verdict_rows(record, line_no):
                         if not row["目标物"] or not row["参照物"]:
                             stats["rows_missing_role"] += 1
+                        if row["模型判定"] == "unknown":
+                            stats["rows_unknown"] += 1
                         writer.writerow(row)
                         stats["rows_written"] += 1
 
@@ -314,8 +380,9 @@ def main(argv: list[str] | None = None) -> int:
 
     print(
         f"已写出 {target}：{stats['rows_written']} 行 "
-        f"(true={stats.get('verdict_true', 0)}, false={stats.get('verdict_false', 0)})；"
-        f"读取 {stats['records']} 条记录，跳过 {stats.get('verdict_null', 0)} 个未判定/限制项"
+        f"(true={stats.get('verdict_true', 0)}, false={stats.get('verdict_false', 0)}, "
+        f"unknown={stats.get('rows_unknown', 0)})；"
+        f"读取 {stats['records']} 条记录"
     )
     return 0
 

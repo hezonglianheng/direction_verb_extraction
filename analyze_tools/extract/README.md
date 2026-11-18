@@ -12,7 +12,7 @@
 | 文件 | 用途 |
 | --- | --- |
 | `compare_extract_verdicts.py` | 对比 2 个或更多 extract 筛选结果，输出两两明细 CSV 和总体一致性矩阵 Markdown |
-| `export_extract_verdicts_csv.py` | 从 extract 结果 JSONL 导出逐方位词 true/false 判定 CSV |
+| `export_extract_verdicts_csv.py` | 从 extract 结果 JSONL 导出逐方位词判定（true/false/unknown）CSV |
 
 ---
 
@@ -27,7 +27,7 @@
 
 支持两种同构结果文件，同一次运行中必须全部为同一种格式：
 
-- `*.screening_verdicts.csv`：每行一个逐方位词 true/false 判定；
+- `*.screening_verdicts.csv`：每行一个逐方位词判定，必须包含 `方位词字符偏移` 列；
 - `*.jsonl`：直接从 JSONL 的 `screening.verdicts[]` 和 `localization_grounding.candidates[]` 投影。
 
 至少需要两个输入；重复文件（包括符号链接指向同一文件）会被拒绝。
@@ -64,7 +64,8 @@ analyze_results/compare_verdicts/<YYYYmmdd_HHMMSS>/
 每个 pair CSV 的列固定为：
 
 ```text
-比较结果, 左侧行号, 右侧行号, 源文件, 原句, 方位词, 方位词下标,
+比较结果, 左侧行号, 右侧行号, 源文件, 原句, 方位词,
+方位词字符偏移, 左方位词下标, 右方位词下标,
 左目标物, 左参照物, 左动词, 右目标物, 右参照物, 右动词,
 左判定, 右判定, 三元组是否变化, 左理由, 右理由
 ```
@@ -75,8 +76,8 @@ analyze_results/compare_verdicts/<YYYYmmdd_HHMMSS>/
 
 包含：
 
-1. **输入文件表**：编号、路径、格式、判定数、true/false、完整三元组数、重复 base 组数；
-2. **两两对比汇总表**：共同、相同、不同、一致率、仅左、仅右、三元组变化和明细 CSV 链接；
+1. **输入文件表**：编号、路径、格式、判定数、true/false/unknown、完整三元组数、重复 base 组数；
+2. **两两对比汇总表**：共同、并集、相同、不同、一致率、仅左、仅右、三元组变化和明细 CSV 链接；
 3. **一致性矩阵**；
 4. **重复 base 歧义警告**；
 5. **口径说明**。
@@ -84,14 +85,16 @@ analyze_results/compare_verdicts/<YYYYmmdd_HHMMSS>/
 一致性矩阵的单元格格式为：
 
 ```text
-一致率（相同/共同）
+一致率（相同/并集）
 ```
 
-- 只统计两侧都存在的共同判定项，仅单侧项不进入分母；
+- 分母是两侧 key 的并集 `共同 + 仅左 + 仅右`，仅单侧项也进入分母；
+- `unknown`（没拿到 true/false 判定）参与共同项和分母统计，不会被当成 `false`；
+- 共同项中 `unknown` 对 `unknown` 计为“相同状态”，`unknown` 对 true/false 计为不同；因此这里的一致率是**三态状态一致率**，不只是有效模型判定一致率；
 - 对角线表示“不与自己比较”，写 `—`；
-- 没有共同判定项时写 `N/A (0/0)`，不会伪装成 0% 或 100%。
+- 两侧并集为 0 时写 `N/A (0/0)`，不会伪装成 0% 或 100%。
 
-示例：
+示例（数值仅示意格式，实际以当次并集分母为准）：
 
 ```text
 | 文件 | 01_20261029 | 02_20261031 | 03_20261103 |
@@ -104,12 +107,14 @@ analyze_results/compare_verdicts/<YYYYmmdd_HHMMSS>/
 ### 对齐口径
 
 ```text
-base = (源文件, 原句, 方位词, 方位词下标)
+base = (源文件, 原句, 方位词, 方位词字符偏移)
 key  = base + (同一 base 在该文件中按原始顺序出现的序号,)
 ```
 
+- 字符偏移是方位词在拼接原句中的起始位置，可由 token 列表 `sum(len(token) for token in tokens[:index])` 得到；重新分词不会改变它；
 - `JSONL行号` 不参与对齐：不同批次记录增删会让行号整体平移；
 - 三元组 `(目标物, 参照物, 动词)` 不参与 key，角色为空或 grounding 变化不会拆散同一条判定；
+- 实际存在的 verdict 中 `extractable=None`（典型 limit/error；旧数据可能含逐词 no_llm）作为 `unknown` 参与统计，不跳过、不当成 `false`；真实 `no_llm` 记录 `verdicts=[]`，不产生比较行；
 - 同一 base 重复出现时按原始顺序配对；一侧多出/缺少时存在配对歧义，`summary.md` 会给出警告和相同判断数范围。
 
 ### 用法
@@ -151,8 +156,8 @@ python analyze_tools/extract/compare_extract_verdicts.py \
 
 | 退出码 | 含义 |
 | --- | --- |
-| `0` | 全部文件对都至少有一个共同判定项 |
-| `1` | 至少一对没有共同判定项；其余 pair 和输出文件仍然有效，矩阵对应单元格为 `N/A (0/0)` |
+| `0` | 全部文件对的两侧并集都大于 0 |
+| `1` | 至少一对两侧都没有判定行（并集为 0）；其余 pair 和输出文件仍然有效，矩阵对应单元格为 `N/A (0/0)` |
 | `2` | 输入不足、重复输入、格式混合、文件损坏/缺列、输出目录冲突或写入失败 |
 
 ### 资源与限制
@@ -160,24 +165,28 @@ python analyze_tools/extract/compare_extract_verdicts.py \
 - 每个输入文件只加载一次；常驻内存约为所有输入判定投影之和。每个 pair 比较时还会临时复制左右两边的行对象并建立 key 索引，峰值约为“两侧投影 + 索引”的 2 倍左右，pair 结束后释放。
 - 输出磁盘和比较时间为 `O(N²)`：N 个文件生成 `N(N-1)/2` 个 pair CSV。
 - 全量明细 CSV 可能很大（三份真实结果约 166MB），但不做静默截断。
-- 仅比较 `模型判定` 的 true/false；理由、`grammatical`、`spatial_coherent` 等字段不在比较范围内。
+- 仅比较 `模型判定` 的 true/false/unknown；理由、`grammatical`、`spatial_coherent` 等字段不在比较范围内。
 - 重复 base 的顺序配对歧义无法完全消除，需结合 `summary.md` 的警告解释一致率。
 
 ---
 
 ## export_extract_verdicts_csv.py
 
-把筛选结果 JSONL 中的逐词 true/false 判定导出为 CSV。
+把筛选结果 JSONL 中的逐词判定（true/false/unknown）导出为 CSV。
 
-- 模型判定在 `screening.verdicts[]` 中；`extractable` 为 `True`/`False` 才导出；
-- `extractable=None` 表示未送模型（limit/error/no_llm），跳过；
+- 模型判定在 `screening.verdicts[]` 中；`True`/`False` 导出为 `true`/`false`；
+- 实际存在的 verdict 中，`extractable=None`（典型为 limit/error）导出为 `unknown`，不再跳过；
+- 真实 `no_llm` 记录是记录级状态，`screening.verdicts=[]`，只计入读取记录数，不产生 CSV 行，也不会从 grounding 候选补造 `unknown`；
+- 空文件或没有任何 verdict 的输入会成功写出仅含表头的 CSV（退出码 0）；
 - 目标物、参照物、动词来自 `localization_grounding.candidates[]`，按 `verdict.index == candidate.index` 对应；
+- 同时导出 `方位词字符偏移`，供比较脚本稳定对齐；
 - 一行对应一个方位词判定，同一句可能有多行。
 
 ### 输出列
 
 ```text
-JSONL行号, 原句, 源文件, 方位词, 方位词下标, 目标物, 参照物, 动词,
+JSONL行号, 原句, 源文件, 方位词, 方位词下标, 方位词字符偏移,
+目标物, 参照物, 动词,
 模型判定, 判定理由, 判定来源, 整句筛选状态
 ```
 
@@ -226,7 +235,8 @@ python analyze_tools/extract/export_extract_verdicts_csv.py \
 专项回归统一放在 `tests/`（沿用仓库现有忽略规则，默认不入库）：
 
 ```bash
-python -m unittest discover -s tests -p test_extract_analysis.py -v
+python -m unittest discover -s tests -p test_compare_screening_verdicts.py -v
+python -m unittest discover -s tests -p test_export_screening_verdicts_csv.py -v
 ```
 
 测试使用临时语料，覆盖迁移后的仓库根路径、导出/比较兼容、句对拒绝和输出保护。

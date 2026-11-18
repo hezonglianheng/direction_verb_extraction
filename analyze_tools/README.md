@@ -12,7 +12,7 @@
 
 原来的 `export_screening_verdicts_csv.py`、`compare_screening_verdicts.py` 已**保留实现、迁移并改名**至 `extract/`，旧路径不再提供入口，请更新已有命令。
 
-- **extract**：一行一个布尔逐词判定，按原句/关注词/下标/重复序号对齐；详见 [extract 说明](extract/README.md)。
+- **extract**：一行一个三态逐词判定（true/false/unknown），按原句/关注词/字符偏移/重复序号对齐；详见 [extract 说明](extract/README.md)。
 - **replace**：一行一个句对，A/B 字段并列；只读 `pair_screening`，按唯一 `candidate_key` 对齐；详见 [replace 说明](replace/README.md)。
 - 两类工具不能互换。extract 工具会拒绝句对 JSONL；旧脚本错误导出的 replace 逐词 CSV 无法恢复 B 侧信息，须从 replace JSONL 重新导出。
 - extract 自动发现仍沿用旧目录规则，可能选到旧数据；replace 不自动发现。**推荐始终显式指定输入文件。**
@@ -33,7 +33,8 @@ python analyze_tools/replace/compare_replace_pairs.py run_a.jsonl run_b.jsonl --
 ## 测试
 
 ```bash
-python -m unittest discover -s tests -p "test_*_analysis.py" -v
+python -m unittest discover -s tests -p "test_compare_screening_verdicts.py" -v
+python -m unittest discover -s tests -p "test_export_screening_verdicts_csv.py" -v
 ```
 
 专项测试放在 `tests/`，只用临时文件和离线构造语料，不依赖实际大结果文件或模型配置。
