@@ -60,6 +60,7 @@ from pydantic import BaseModel
 import agents as agent_factory
 import config
 import retry
+from annotate import prompt_cache as pc
 from file_paths import resolve_cache_path, sidecar_paths
 
 TOOL_NAME = "submit_verdict"
@@ -163,6 +164,12 @@ class BatchProfile:
     原生 Batch 走裸 requests，不经过 langchain 的 http_client，所以必须在这里显式带上。
     """
     proxy_url: str | None = None
+    cache_family: str = "none"
+    """提示词缓存家族（见 prompt_cache.family_for_config）
+
+    Batch 可以覆盖模型（``batch.model``），所以这一项按**实际送批的 model** 判断，
+    不能沿用同步链路的模型配置名。只有 ``"anthropic"`` 才会在稳定前缀末尾加断点。
+    """
 
     def describe(self) -> str:
         if self.enabled:
@@ -324,6 +331,8 @@ def batch_profile(model_key: str) -> BatchProfile:
         extra=extra,
         proxy_mode=proxy_mode,
         proxy_url=proxy_url,
+        # Batch 可能把模型换成 batch.model，缓存家族必须按真正送批的那个标识判断。
+        cache_family=pc.family_for_config(cfg, model_override=model),
     )
 
 
@@ -356,12 +365,18 @@ class BatchItem:
     """False = 这条只能同步跑（例如 deep feature agent 的工具回合），不送原生 Batch"""
 
     def request_body(self, profile: BatchProfile) -> dict:
-        """OpenAI 兼容 chat.completions 请求体（结构与同步链路的 ToolStrategy 对齐）"""
+        """OpenAI 兼容 chat.completions 请求体（结构与同步链路的 ToolStrategy 对齐）
+
+        user content 与同步链路共用 ``prompt_cache.user_content``，system 共用
+        ``prompt_cache.system_blocks``：Claude 模型在稳定前缀与 system 末尾各得到一个
+        ``cache_control`` 断点，其余模型仍是普通字符串。两条链路各写一份的话，迟早出现
+        「同步命中了、Batch 没命中」。
+        """
         body: dict[str, Any] = {
             "model": profile.model,
             "messages": [
-                {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": self.content},
+                {"role": "system", "content": pc.system_blocks(self.system_prompt, profile.cache_family)},
+                {"role": "user", "content": pc.user_content(self.content, profile.cache_family)},
             ],
             "temperature": profile.temperature,
         }

@@ -22,6 +22,7 @@ from deepagents import create_deep_agent
 
 import config
 import retry
+from annotate import prompt_cache
 
 call_with_retry = retry.call_with_retry
 """给业务 agent 用的重试入口（见 spatial_agents.BaseAgent._invoke / all_in_one.call_once）"""
@@ -483,7 +484,8 @@ def get_agent(model_name: str, tools: list, system_prompt: str, response_format=
     Args:
         model_name (str): 模型名称
         tools (list): 工具列表，每个工具是一个 langchain Tool 对象
-        system_prompt (str): 系统提示语，用于指导模型的行为
+        system_prompt (str): 系统提示语，用于指导模型的行为。Claude 家族会在其末尾
+            加一个显式缓存断点（见 annotate/prompt_cache.py），其余模型保持原字符串。
         response_format: 结构化输出策略，如 ToolStrategy(SomeModel)。传入时会自动关闭
             思考模式（见 get_model）；不传则保留模型的默认行为。
 
@@ -494,10 +496,13 @@ def get_agent(model_name: str, tools: list, system_prompt: str, response_format=
     # JSON Schema（见 _structured_output_for）。其余 provider 保持 ToolStrategy。
     response_format = _structured_output_for(model_name, response_format)
     model = get_model(model_name, disable_thinking=response_format is not None)
+    # system 与 user 的稳定段各是一个断点：示例组变化时 system 缓存仍有效，反之亦然。
+    # 非 Claude 家族返回原字符串，不携带任何缓存字段。
+    family = prompt_cache.family_for_model_key(model_name)
     return create_agent(
         model=model,
         tools=list(tools),
-        system_prompt=system_prompt,
+        system_prompt=prompt_cache.system_message(system_prompt, family),
         **(dict(response_format=response_format) if response_format is not None else {}),
     )
 
@@ -527,10 +532,19 @@ def get_deep_agent(
     # 模型要先由 init_chat_model 建好再传进来。
     response_format = _structured_output_for(model_name, response_format)
     model = get_model(model_name, disable_thinking=response_format is not None)
+    # 主 agent 的 system 与普通 get_agent 同样按模型家族加断点；subagent 的提示语仍是
+    # 纯字符串（deepagents 的子 agent 定义不接受 SystemMessage），它们的 user 稳定段
+    # 依旧由 _invoke_sync 加断点。
+    #
+    # 注意 deepagents 自带 AnthropicPromptCachingMiddleware：它只对 ChatAnthropic 生效，
+    # 本项目的 ZenMux Claude 走 ChatOpenAI 兼容接口，因此不会重复注入。若改用
+    # provider="anthropic"，框架会给 tools/system/顶层各加断点（总数接近 4 个上限），
+    # 且不受 config.PROMPT_CACHE_ENABLED 控制——那是框架行为，改档位前要先实测。
+    family = prompt_cache.family_for_model_key(model_name)
     return create_deep_agent(
         model=model,
         tools=list(tools),
-        system_prompt=system_prompt,
+        system_prompt=prompt_cache.system_message(system_prompt, family),
         subagents=list(subagents or ()),
         response_format=response_format,
     )

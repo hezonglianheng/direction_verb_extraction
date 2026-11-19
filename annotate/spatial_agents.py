@@ -89,6 +89,7 @@ from pydantic import BaseModel, Field, create_model
 import agents as agent_factory
 import batch_inference as bi
 from extract import sentence_screening
+from annotate import prompt_cache as pc
 from annotate import spatial_tools as st
 from annotate import prompt_examples as pe
 from annotate import annotation_tables as tables
@@ -640,12 +641,15 @@ def head_block(focus_word: dict | None, *, corpus_type: str | None = None) -> st
     关注词那句按 source 自动选措辞（见 focus_role）：语料里取来的词与改写句里换上去的词，
     在 semantic / feature / schema 三个 agent 那里都要说成对应的一侧。
 
-    类型行只排在关注词整段**之后**（第 3 行），三处约束逼出来的：
+    类型行只排在关注词整段**之后**（该段第 3 行），三处约束逼出来的：
 
-    - 提示语正文（semantic 与 pair 的 feature/schema 系列）的条件句都写作「用户消息的
-      **第一行**若点名了本次需要重点关注的词」，第 1 行必须仍是关注词行；
+    - 提示语正文（pair 的 feature/schema 系列）的条件句都写作「关注词那一段的第 **1 行**
+      若点名了本次需要重点关注的词」，该段第 1 行必须仍是关注词行；
     - annotate_pair_feature_deep.txt 要求「紧接的下一行」交代同义替换以哪个词为准，第 1、2 行之间不能插东西；
-    - verify_focus_wiring.py 断言首行以「本次需要重点关注的词：」开头。
+    - 外部接线检查按「本次需要重点关注的词：」定位这一段。
+
+    注意这里说的是**段内**行号：提示词缓存（见 annotate/prompt_cache.py）把按关注词选出的
+    示例与候选表排在整段之前，所以它不再是 user message 的首行，而是稳定前缀之后的输入段。
 
     corpus_type=None 时逐字节等于 focus_line(...)：离线接线测试的既有断言靠这条成立。
     judge 那张图不在这里拼——它同时拿着两句的关注词，走 pair_head_block。
@@ -675,8 +679,9 @@ def pair_head_block(
     """两侧关注词的开头块：a 侧那份 + b 侧那份 + 语料类型行（有类型时）+ 三元组行（有标注时）
 
     比其余三个 agent 多一段（各 2 行 + 类型行）：这里同时拿着原句与改写句的两份关注词——原句里
-    被替换掉的那个，与改写句里换上去的那个（见 st.replacement_focus_word）。第 1 行仍是关注词
-    那一行：四份提示语的条件句都按「第一行点名了本次要关注的词」写。
+    被替换掉的那个，与改写句里换上去的那个（见 st.replacement_focus_word）。该段第 1 行仍是
+    关注词那一行：四份提示语的条件句都按「关注词那一段的第 1 行点名了本次要关注的词」写。
+    这一段在 user message 中排在稳定前缀（示例与候选）之后，段内行号不受影响。
 
     role_a 决定 a 侧那句怎么说，默认 FOCUS_ROLE_ORIGINAL——judge 走这条：它同时拿着两句，
     第 2 行要点明「本次要判的就是把原句这个词换成改写句那个词之后是否同义」。all_in_one 也
@@ -1114,6 +1119,8 @@ class BaseAgent:
             "batch_failed": 0,
         }
         self._stats_lock = threading.Lock()
+        self._cache_family_value: str | None = None
+        """提示词缓存家族（"anthropic" / "none"），首次发请求时按模型配置算一次"""
 
     # -- 子类实现 ----------------------------------------------------------
     def run(self, **kwargs) -> dict:
@@ -1342,10 +1349,11 @@ class BaseAgent:
                 self._reserve_request(scope)
             attempt_no += 1
             probe = _ModelStartProbe(lambda: self._reserve_request(scope), note_start)
+            payload = pc.user_content(content, self._cache_family())
             sent_any = True
             try:
                 return self._model().invoke(
-                    {"messages": [{"role": "user", "content": content}]}, config={"callbacks": [probe]}
+                    {"messages": [{"role": "user", "content": payload}]}, config={"callbacks": [probe]}
                 )
             except Exception as exc:
                 last_error = exc
@@ -1461,6 +1469,12 @@ class BaseAgent:
         """记一次“决定重发”（含最终成功的那几次），不改变 roundtrips/failed 口径"""
         with self._stats_lock:
             self._stats["retries"] += 1
+
+    def _cache_family(self) -> str:
+        """本 agent 的提示词缓存家族（只按实际模型标识判断，不看 provider）"""
+        if self._cache_family_value is None:
+            self._cache_family_value = pc.family_for_model_key(self.model_key)
+        return self._cache_family_value
 
     def stats(self) -> dict:
         """本次跑批的调用统计（跑批入口收尾汇总用）：往返数、失败数、缓存命中数
@@ -2145,15 +2159,20 @@ class FeatureAgent(BaseAgent):
     def tools(self) -> list:
         return []
 
-    def _content(self, sentence: str, focus_word: dict) -> str:
-        """各模式共用：句子、语义三元组与按关注词选中的示例，不传句法证据。"""
+    def _content(self, sentence: str, focus_word: dict) -> pc.PromptParts:
+        """各模式共用：按关注词选中的示例在前，本条句子与关注词在后，不传句法证据
+
+        示例只随关注词变化，同一组关注词的记录可以共用这段前缀；句子与下标每条都不同，
+        所以放在最后。提示语里对「用户消息中那段关注词」的指代已按这个顺序改过。
+        """
         examples = pe.example_block(self.example_groups, focus_word, "feature")
-        return (
+        stable = f"{examples}\n" if examples else ""
+        dynamic = (
             f"{head_block(focus_word, corpus_type=self.corpus_type)}\n"
-            f"句子：{sentence}"
-            f"\n{examples}\n"
+            f"句子：{sentence}\n"
             f"请抽取这个句子的语义特征。"
         )
+        return pc.PromptParts(stable, dynamic)
 
     def _ask(self, content: str) -> dict:
         """发一次请求，转成与 run() 同形的结果 dict（成功与失败两种形状）"""
@@ -2328,13 +2347,17 @@ class SchemaAgent(BaseAgent):
         class_word: str | None,
         miss: str,
         candidates: dict,
-    ) -> str:
-        """关注词、句子、所选示例、语义特征与本侧候选名单；直接按句意选图式。"""
+    ) -> pc.PromptParts:
+        """按关注词选出的示例与候选名单在前，本条句子、特征与关注词在后
+
+        示例与候选名单只随关注词所属词条变化：同一词条的记录共用同一段前缀。句子、关注词
+        下标和上游特征每条都不同，放在最后。提示语里「消息第一行」「消息开头」这类指代
+        已改成「关注词那一段」，与这里的顺序一致。
+        """
         examples = pe.example_block(self.example_groups, focus_word, "schema")
         head = (
             f"{head_block(focus_word, corpus_type=self.corpus_type)}\n"
-            f"句子：{sentence}"
-            f"\n{examples}\n"
+            f"句子：{sentence}\n"
             f"语义特征：{json.dumps(features, ensure_ascii=False)}\n"
             f"{miss}。"
         )
@@ -2342,16 +2365,24 @@ class SchemaAgent(BaseAgent):
             # 前缀与候选名单同源（class_word），否则「外面」这一类自由命名出的名字与查表路径对不上
             prefix = class_word or word
             style = f"，格式为「{prefix} + 编号」（如 {prefix}1）" if prefix else ""
-            return head + f"请自行给出一个 schema 名{style}。"
+            stable = f"{examples}\n" if examples else ""
+            return pc.PromptParts(stable, head + f"请自行给出一个 schema 名{style}。")
         note = f"这些候选属于关注词所属的「{class_word}」这一类。" if class_word and class_word != word else ""
-        return (
-            head
-            + note
-            + "请从下面这些候选 schema 里挑一个最接近的，名字原样照抄（不要自造名字、不要改编号）：\n"
-            f"{st.render_schema_candidates(candidates)}\n"
-            "一个候选的命中条件有多组（用「／」分开）时，命中任意一组即可；都不完全吻合时挑差别最小的那个，"
-            "并在 reason 里说明差在哪。"
-        )
+        stable = "\n".join(
+            part
+            for part in (
+                examples,
+                note
+                + "本侧可选的图式候选如下；只能从中挑一个最接近的，名字原样照抄"
+                "（不要自造名字、不要改编号）：\n"
+                + st.render_schema_candidates(candidates)
+                + "\n一个候选的命中条件有多组（用「／」分开）时，命中任意一组即可；"
+                "都不完全吻合时挑差别最小的那个，并在 reason 里说明差在哪。",
+            )
+            if part
+        ) + "\n"
+        dynamic = head + "请从上面的候选名单里选一个最接近的图式。"
+        return pc.PromptParts(stable, dynamic)
 
     def _group_summary(self) -> str:
         """「M 个词条（覆盖 K 个词形…）」这段摘要：词条数 + 它们声明的词形数
@@ -2531,9 +2562,36 @@ class JudgeAgent(BaseAgent):
             return local
         situation = tables.judgement_situation(self.table, schema_a, schema_b)
         examples = pe.judge_example_block(self.example_groups, schema_a.get("name"), schema_b.get("name"))
-        example_section = f"{examples}\n\n" if examples else ""
+        content = self._content(
+            sentence_a, sentence_b, schema_a, schema_b, features_a, features_b,
+            focus_word, focus_word_b, situation, examples,
+        )
+        try:
+            verdict: JudgeVerdict = self._invoke(content)
+        except Exception as e:
+            return tables.judgement_from_model(local, None, error=f"调用失败：{e!r}")
+        return tables.judgement_from_model(local, verdict.model_dump())
 
-        content = (
+    def _content(
+        self,
+        sentence_a: str,
+        sentence_b: str,
+        schema_a: dict,
+        schema_b: dict,
+        features_a: dict,
+        features_b: dict,
+        focus_word: dict,
+        focus_word_b: dict | None,
+        situation: str,
+        examples: str,
+    ) -> pc.PromptParts:
+        """示例句对在前，本条两句与两侧图式、特征在后
+
+        示例只随 (schema_a, schema_b) 变化，同一图式对的记录共用这段前缀；句子、关注词
+        下标与上游判断每条都不同。示例为空时 stable 为空、整条消息与旧版逐字节一致。
+        """
+        stable = f"{examples}\n\n" if examples else ""
+        dynamic = (
             f"{pair_head_block(focus_word, focus_word_b, corpus_type=self.corpus_type)}\n"
             f"原句：{sentence_a}\n"
             f"原句 schema：{schema_a.get('name')}（来源 {schema_a.get('source')}）\n"
@@ -2542,14 +2600,9 @@ class JudgeAgent(BaseAgent):
             f"改写句 schema：{schema_b.get('name')}（来源 {schema_b.get('source')}）\n"
             f"改写句语义特征：{json.dumps(features_b or {}, ensure_ascii=False)}\n"
             f"判定表情况：{situation}。\n"
-            f"{example_section}"
             "请判断这两句话的意义是否相同。"
         )
-        try:
-            verdict: JudgeVerdict = self._invoke(content)
-        except Exception as e:
-            return tables.judgement_from_model(local, None, error=f"调用失败：{e!r}")
-        return tables.judgement_from_model(local, verdict.model_dump())
+        return pc.PromptParts(stable, dynamic)
 
     def describe(self) -> str:
         table = self.table or {}
@@ -2692,21 +2745,33 @@ class AllInOneAgent(BaseAgent):
         return f"{head}这一类下还没有编号图式，请按「{prefix or '组名'} + 编号」的格式自行命名。"
 
     def _content(self, sentence_a: str, sentence_b: str, focus_word_a: dict | None,
-                 focus_word_b: dict | None) -> str:
-        # 与旧 all_in_one.prepare 逐字同源：四个示例块仍按步骤、再按本侧关注词分别选择。
-        parts = [pair_head_block(focus_word_a, focus_word_b, corpus_type=self.corpus_type),
-                 f"原句：{sentence_a or ''}", f"改写句：{sentence_b or ''}",
-                 "两侧均已通过语法、空间自洽和空间义检查；本次只标注，不重复筛选。"]
+                 focus_word_b: dict | None) -> pc.PromptParts:
+        """示例与候选名单在前，本条句对与关注词在后
+
+        四个示例块仍按步骤、再按本侧关注词分别选择（与旧 all_in_one.prepare 同源），只是
+        整段前移到消息开头：它们只随词对变化，同词对的记录可以共用这段前缀。句子、关注词
+        下标与两侧候选的收窄结果仍按本条输入放在最后。
+        """
+        stable_parts = []
         for stage in ("feature", "schema"):
             title = "空间特征" if stage == "feature" else "空间图式"
             for label, focus in (("原句", focus_word_a), ("改写句", focus_word_b)):
                 block = pe.example_block(self.example_groups[stage], focus, stage)
                 if block:
-                    parts.append(f"{label}的{title}示例（只供本侧本步骤参考）：\n{block}")
+                    stable_parts.append(f"{label}的{title}示例（只供本侧本步骤参考）：\n{block}")
         for label, focus in (("原句", focus_word_a), ("改写句", focus_word_b)):
-            parts.append(self._candidates_block(label, focus))
-        parts.append("请依次给出两侧空间特征（features）、两侧图式（schema）及同义关系（judgement）。")
-        return "\n\n".join(part for part in parts if part)
+            stable_parts.append(self._candidates_block(label, focus))
+        stable = "\n\n".join(stable_parts) + "\n\n" if stable_parts else ""
+        dynamic = "\n\n".join(
+            part for part in (
+                pair_head_block(focus_word_a, focus_word_b, corpus_type=self.corpus_type),
+                f"原句：{sentence_a or ''}",
+                f"改写句：{sentence_b or ''}",
+                "两侧均已通过语法、空间自洽和空间义检查；本次只标注，不重复筛选。",
+                "请依次给出两侧空间特征（features）、两侧图式（schema）及同义关系（judgement）。",
+            ) if part
+        )
+        return pc.PromptParts(stable, dynamic)
 
     def _ask(self, content: str) -> dict:
         # 只缓存成功的模型输出，meta 每次 run 单独组装，回放绝不继承首发的请求计数。

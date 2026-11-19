@@ -198,6 +198,21 @@ BATCH_MAX_REQUESTS = 0
 达到上限后余下的调用一律不再发请求，记录照常落盘、admission.review_required 记 True，
 留给人工复核。候选预算管「一条候选内别被重试放大」，这条管「候选乘记录别没有上限」。"""
 
+# ---- 提示词缓存（见 annotate/prompt_cache.py）----
+PROMPT_CACHE_ENABLED = True
+"""是否允许按模型家族注入显式缓存断点（全局总开关）
+
+True 时只有 Claude 家族会收到 `cache_control`；其他模型按各自的自动缓存策略走，不补字段。
+False 时**所有模型都不注入**，用于对照实验或网关不接受该字段时回滚——这是排在单个模型
+配置之前的总开关。统计不受它影响，token 账仍然继续采集。单个模型可在 api_keys.json 里用
+"prompt_cache": "auto" / "off" / "implicit" 在本开关为 True 时进一步收窄。
+
+范围说明：本开关管的是本项目自己加的块级断点（system 末块 + user 稳定段末块）。deepagents
+自带的 Anthropic 缓存中间件只在模型是 ChatAnthropic 时生效；本项目 ZenMux 的 Claude 与
+GPT/Gemini 都走 provider="openai"（ChatOpenAI 兼容接口），该中间件不注入。若将来改用
+provider="anthropic"，框架会自行加 tools/system/顶层断点，本开关管不到它，断点总数也会
+接近 Anthropic 的 4 个上限。"""
+
 # FILTER_WORKERS = 0
 FILTER_WORKERS = 1
 """筛选阶段进程数，0 表示自动使用 CPU 核数。
