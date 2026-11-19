@@ -90,6 +90,7 @@ import agents as agent_factory
 import batch_inference as bi
 from extract import sentence_screening
 from annotate import prompt_cache as pc
+from annotate import token_usage as tu
 from annotate import spatial_tools as st
 from annotate import prompt_examples as pe
 from annotate import annotation_tables as tables
@@ -215,24 +216,67 @@ class _ModelStartProbe(BaseCallbackHandler):
 
     LangChain 默认吞掉 callback 异常；raise_error 必须为 True，否则预算拒绝后仍会发请求。
     run_inline 让异步 callback 也在当前调用链内执行，不把预算检查丢到后台。
+
+    同一次底层 invoke 的每个模型结束事件都带 usage（含工具往返与结构修复），由
+    ``on_llm_end`` 按 run_id 去重后交给调用方累计。为什么不在 invoke 返回后遍历 messages：
+    失败重试的那几次请求不会留在最终 messages 里，却照样计费；逐个 run_id 记账才能既覆盖
+    它们、又不重复。超时/连接中断走 ``on_llm_error``，只记一条「缺用量」——回复丢了，
+    拿不到 token，但这次请求可能已经计费，不能假装没发生。
     """
 
     raise_error = True
     run_inline = True
 
-    def __init__(self, reserve_next, note_start):
+    def __init__(self, reserve_next, note_start, record_usage=None):
         self.reserve_next = reserve_next
         self.note_start = note_start
+        self.record_usage = record_usage
         self.starts = 0
         self.lock = threading.Lock()
+        self._started: set = set()
+        """已真正开始的模型 run（预算拒绝发生在加入之前，不能当成「发出去没成」）"""
+        self._accounted: set = set()
+        """已记过用量的 run（结束事件与错误事件共用，避免同一次调用记两笔）"""
 
-    def on_chat_model_start(self, *args, **kwargs):
+    def on_chat_model_start(self, serialized=None, messages=None, *, run_id=None, **kwargs):
         with self.lock:
             internal = self.starts > 0
             if internal:
                 self.reserve_next()
             self.note_start(internal)
             self.starts += 1
+            if run_id is not None:
+                self._started.add(run_id)
+
+    def _claim(self, run_id) -> bool:
+        """认领一次记账；同一 run 只允许记一次（run_id 缺失时无法去重，照记）"""
+        with self.lock:
+            if run_id is None:
+                return True
+            if run_id in self._accounted:
+                return False
+            self._accounted.add(run_id)
+            return True
+
+    def on_llm_end(self, response, *, run_id=None, **kwargs):
+        if self.record_usage is None or not self._claim(run_id):
+            return
+        self.record_usage(tu.from_llm_result(response))
+
+    def on_llm_error(self, error, *, run_id=None, **kwargs):
+        """发出去但没拿到回复（超时、连接中断、可恢复 5xx）：记一条缺用量
+
+        这类调用可能已经产生服务端费用，但 reply 丢了，拿不到 usage。记成 ``usage_missing``
+        而不是零，收尾时才能看出「有几次请求没有账」。请求前的预算拒绝不会走到这里：
+        它发生在 ``on_chat_model_start`` 里，run_id 尚未加入 ``_started``。
+        """
+        if self.record_usage is None or run_id is None:
+            return
+        with self.lock:
+            started = run_id in self._started
+        if not started or not self._claim(run_id):
+            return
+        self.record_usage(None)
 
 
 class StructuredOutputMissing(RuntimeError):
@@ -1117,6 +1161,17 @@ class BaseAgent:
             "batch_items": 0,
             "batch_hits": 0,
             "batch_failed": 0,
+            # 提示词缓存与费用（见 annotate/token_usage.py）：只统计本进程真正拿到回复的调用。
+            # 本地结果复用与 Batch 回放不产生新用量，因此不加任何 token。
+            "usage_observed": 0,
+            "usage_missing": 0,
+            "cache_hit_requests": 0,
+            "input_tokens": 0,
+            "uncached_input_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_tokens": 0,
         }
         self._stats_lock = threading.Lock()
         self._cache_family_value: str | None = None
@@ -1348,7 +1403,9 @@ class BaseAgent:
             if check_budget or attempt_no > 0:
                 self._reserve_request(scope)
             attempt_no += 1
-            probe = _ModelStartProbe(lambda: self._reserve_request(scope), note_start)
+            probe = _ModelStartProbe(
+                lambda: self._reserve_request(scope), note_start, self._note_usage
+            )
             payload = pc.user_content(content, self._cache_family())
             sent_any = True
             try:
@@ -1476,6 +1533,24 @@ class BaseAgent:
             self._cache_family_value = pc.family_for_model_key(self.model_key)
         return self._cache_family_value
 
+    def _note_usage(self, usage: dict | None) -> None:
+        """累计一次模型调用的 token 用量；拿不到 usage 只记缺失，不猜数字
+
+        回调在 LangChain 内部触发，这里绝不能抛异常：记账失败不该让一条已经成功的标注
+        变成失败记录。
+        """
+        with self._stats_lock:
+            if not isinstance(usage, dict):
+                self._stats["usage_missing"] += 1
+                return
+            self._stats["usage_observed"] += 1
+            for name in tu.TOKEN_FIELDS:
+                value = usage.get(name)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    self._stats[name] += max(int(value), 0)
+            if usage.get("cache_hit"):
+                self._stats["cache_hit_requests"] += 1
+
     def stats(self) -> dict:
         """本次跑批的调用统计（跑批入口收尾汇总用）：往返数、失败数、缓存命中数
 
@@ -1501,6 +1576,11 @@ class BaseAgent:
         retries 是超时/连接/限流/5xx 的重发次数（含最终成功的那几次），
         retry_exhausted 是重试用完仍失败的逻辑调用数；failed 仍按**逻辑调用**计数，
         不把每次补发都算成一条新失败。
+
+        token 字段（input/output/cache_read/cache_write/reasoning 等，见 token_usage）只累计
+        **本进程真正拿到回复的模型调用**：本地结果复用、Batch 回放与 --batch-resume 收旧结果
+        都不增加。cache_hit_requests 是「观测到缓存读 token > 0」的请求数，与本地复用无关；
+        usage_missing 是没拿到用量（如超时）的调用数。
         """
         with self._stats_lock:
             stats = dict(self._stats)

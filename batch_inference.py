@@ -61,6 +61,7 @@ import agents as agent_factory
 import config
 import retry
 from annotate import prompt_cache as pc
+from annotate import token_usage as tu
 from file_paths import resolve_cache_path, sidecar_paths
 
 TOOL_NAME = "submit_verdict"
@@ -363,6 +364,12 @@ class BatchItem:
     sync_call: Callable[[], tuple[dict | None, str | None]] | None = None
     native: bool = True
     """False = 这条只能同步跑（例如 deep feature agent 的工具回合），不送原生 Batch"""
+    on_usage: Callable[[dict | None], None] | None = None
+    """收到批量结果时把 usage 交给所属 agent 累计（见 BatchSession.add）
+
+    解析失败也可能已经计费，所以必须在 parse_response 校验之前调用。同步回退的用量由
+    ``_invoke_sync`` 的回调记账，这里不再重复。
+    """
 
     def request_body(self, profile: BatchProfile) -> dict:
         """OpenAI 兼容 chat.completions 请求体（结构与同步链路的 ToolStrategy 对齐）
@@ -396,14 +403,22 @@ class BatchItem:
         body.update(profile.extra)
         return body
 
-    def parse_response(self, body: dict) -> dict:
+    def parse_response(self, body: dict, *, record_usage: bool = True) -> dict:
         """从一条 chat.completion 结果里取出结构化判定并校验
 
         优先读强制工具调用的 arguments（与同步 ToolStrategy 同一形状）；
         个别兼容网关会忽略 tool_choice 而把 JSON 放在 content 里，也接受。
+
+        用量先记、解析后做：批量项可能因为结构化输出不合格而失败，但这次请求的 token
+        已经花掉了。只记成功项的用量会把失败重试的成本从账上抹掉。
+
+        ``record_usage=False`` 用于 ``--batch-resume`` 收**上一次进程已受理**的旧批：
+        那些 token 属于上一轮，计进本轮会把「本次新增花费」说多。
         """
         if not isinstance(body, dict):
             raise ValueError(f"批量结果不是 JSON 对象：{body!r}")
+        if record_usage and self.on_usage is not None:
+            self.on_usage(tu.normalize_usage(body.get("usage")))
         if body.get("error"):
             raise RuntimeError(f"接口返回错误：{body['error']}")
         choices = body.get("choices") or []
@@ -1116,6 +1131,8 @@ class BatchSession:
             response_model=agent.response_model(),
             sync_call=lambda: self._sync_call(agent, content),
             native=bool(agent.supports_batch()),
+            # 用量在结果解析时记到所属 agent 的 _stats；替身 agent 没有这个方法就不记。
+            on_usage=getattr(agent, "_note_usage", None),
         )
         self.pending[key] = item
         return key
@@ -1318,7 +1335,10 @@ class BatchSession:
                         self._append_result(key, None, error or "恢复的 batch 没有返回这一项")
                     continue
                 try:
-                    self._append_result(key, item.parse_response(body), None)
+                    # 这是「收上一次进程已受理的旧批」：token 已记在受理它的那一轮，不能
+                    # 再算进本轮新增花费。若旧批其实是本进程提交、只是先超时后补收，
+                    # 本轮会少算这部分——宁可少算也不重复计账，账单以供应商为准。
+                    self._append_result(key, item.parse_response(body, record_usage=False), None)
                 except Exception as exc:  # noqa: BLE001
                     if self.strict_native:
                         self._append_result(key, None, f"批量结果解析失败：{exc!r}")

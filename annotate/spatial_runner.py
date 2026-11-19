@@ -62,6 +62,7 @@ from annotate import limit_sampler as ls
 from annotate import spatial_agents as sa
 from annotate import spatial_graphs as sg
 from annotate import spatial_tools as st
+from annotate import token_usage as tu
 from annotate import voting
 from annotate.cli_constants import DEFAULT_MODEL, FORMAL_GRAPHS
 
@@ -262,6 +263,9 @@ class ResultWriter:
             provenance["reality_prefill"] = self.reality_prefill
         if self.agent_stats:
             provenance["agent_stats"] = self.agent_stats
+            # token 账单独给一份合计：逐 agent 的明细在 agent_stats 里，这里只回答
+            # 「这一轮一共花了多少输入/输出、其中多少命中缓存」。
+            provenance["usage_totals"] = tu.totals(self.agent_stats.values())
         summary = {
             "output_file": str(self.path),
             # csv 也是这次跑批的产物，与 output_file 并列记进汇总；没导（--no-pairs-csv 或非 pair 图）就不写
@@ -500,12 +504,23 @@ def _print_agent_stats(stats: dict[str, dict]) -> None:
             part += f"／框架内部额外开始 {item['internal_requests']} 次"
         if item.get("batch_items") or item.get("batch_hits"):
             part += f"／批处理登记 {item.get('batch_items', 0)} 项、回放 {item.get('batch_hits', 0)} 次"
-        parts.append(part + f"／{item['cache_hits']} 次命中")
+        parts.append(part + f"／本地结果复用 {item['cache_hits']} 次")
     total = sum(item.get("actual_requests", 0) for item in stats.values())
     failed = sum(item.get("failed", 0) for item in stats.values())
     hits = sum(item["cache_hits"] for item in stats.values())
     tail = f"，{failed} 次失败" if failed else ""
-    print(f"模型调用账（同步模型开始共 {total} 次{tail}，缓存命中 {hits} 次；原生 Batch 另计）：" + "；".join(parts))
+    print(f"模型调用账（同步模型开始共 {total} 次{tail}，本地结果复用 {hits} 次；原生 Batch 另计）：" + "；".join(parts))
+    total_usage = tu.totals(stats.values())
+    if total_usage["usage_observed"] or total_usage["usage_missing"]:
+        print(
+            "token 账（只含本进程收到回复的调用）："
+            f"输入 {total_usage['input_tokens']}"
+            f"（未命中 {total_usage['uncached_input_tokens']}、缓存读 {total_usage['cache_read_tokens']}"
+            f"／{total_usage['cache_hit_rate']:.1%}、缓存写 {total_usage['cache_write_tokens']}）"
+            f"／输出 {total_usage['output_tokens']}（其中推理 {total_usage['reasoning_tokens']}）"
+            f"；观测到缓存读的请求 {total_usage['cache_hit_requests']} 次"
+            f"，缺用量 {total_usage['usage_missing']} 次"
+        )
     if budget:
         print(
             f"提示：有 {budget} 次调用因请求预算未发出，记录里记为 source=error 并转入人工复核；"
@@ -1012,8 +1027,17 @@ def _run_single_model(args, spec, corpus_type, corpus_path, records, out_path: P
         log.event("run_error", stage="single", error=repr(exc))
         raise
     finally:
-        stats = result["writer"].agent_stats if result is not None else {}
-        summary = log.finish(agent_stats=stats)
+        # 跑批中途异常时 result 为 None，但已经建好的 agent 仍持有失败前的调用账
+        # （含已观测的 token）。不能只从成功返回的 writer 取，否则这批用量会整笔丢失。
+        stats = (
+            result["writer"].agent_stats
+            if result is not None
+            else {name: agent.stats() for name, agent in agents.items()}
+        )
+        summary = log.finish(
+            agent_stats=stats,
+            extra={"usage_totals": tu.totals(stats.values())} if stats else None,
+        )
         if summary.get("log_file"):
             print(f"[Agent日志] 已写入 {summary['log_file']}（同名 .jsonl 为机器可读版本）")
 
@@ -1045,6 +1069,9 @@ def _run_multi_model(
         extra={"models": list(model_names), "voting_weights": dict(weights)},
     )
     results: dict[str, dict] = {}
+    # 已建 agent 的注册表。某个模型失败时 results 里没有它，但 agents_by_model
+    # 仍持有它失败前累计的 stats；收尾据此补账，避免整轮 token 被少算。
+    agents_by_model: dict[str, dict] = {}
     try:
         return _run_multi_model_impl(
             args,
@@ -1057,19 +1084,45 @@ def _run_multi_model(
             weights,
             log=log,
             results=results,
+            agents_by_model=agents_by_model,
         )
     except BaseException as exc:
         log.event("run_error", stage="multi", error=repr(exc))
         raise
     finally:
-        merged: dict[str, dict] = {}
-        for name, result in results.items():
-            writer = result.get("writer")
-            for agent_name, item in ((getattr(writer, "agent_stats", None) or {}).items()):
-                merged[f"{name}.{agent_name}"] = item
-        summary = log.finish(agent_stats=merged)
+        merged = {
+            f"{name}.{agent_name}": item
+            for name in model_names
+            for agent_name, item in _model_agent_stats(
+                name, results, agents_by_model
+            ).items()
+        }
+        summary = log.finish(
+            agent_stats=merged,
+            extra={"usage_totals": tu.totals(merged.values())} if merged else None,
+        )
         if summary.get("log_file"):
             print(f"[Agent日志] 已写入 {summary['log_file']}（同名 .jsonl 为机器可读版本）")
+
+
+def _model_agent_stats(
+    name: str,
+    results: dict[str, dict],
+    agents_by_model: dict | None,
+) -> dict:
+    """取一个模型的 agent 调用账：成功用 writer 快照，失败用现存活 agent 的快照
+
+    成功模型的 writer.agent_stats 是收尾时写进结果汇总的那一份，必须沿用它；
+    失败模型没有 result，只能读它失败前已经累计在 agent 实例上的 stats。
+    两条路各自只取一份，不能相加，否则会把同一批调用重复记账。
+    """
+    result = results.get(name)
+    if result is not None:
+        return result["writer"].agent_stats
+    return {
+        agent_name: agent.stats()
+        for agent_name, agent in ((agents_by_model or {}).get(name) or {}).items()
+    }
 
 
 def _model_summary_entry(
@@ -1079,11 +1132,14 @@ def _model_summary_entry(
     results: dict[str, dict],
     failed: dict[str, BaseException],
     model_records: dict[str, list[dict]],
+    *,
+    agents_by_model: dict | None = None,
 ) -> dict:
     """汇总里每个模型一条：跑成功的照旧，失败的标 status=failed 并留下错误与已参与票数
 
     失败模型也占一条，是为了让事后拿到 .summary.json 的人能一眼区分
-    “这个模型没票”是它整轮都没跑起来，还是它跑了但一直弃权。
+    “这个模型没票”是它整轮都没跑起来，还是它跑了但一直弃权。若失败前已经
+    建好 agent 并产生过调用，也把那份 stats 附上，避免汇总里看不到已花的 token。
     """
     result = results.get(name)
     if result is not None:
@@ -1105,7 +1161,7 @@ def _model_summary_entry(
             "batch": writer.extra_summary.get("batch"),
         }
     exc = failed.get(name)
-    return {
+    entry = {
         "name": name,
         "weight": weights[name],
         "output_file": str(raw_paths[name]),
@@ -1113,10 +1169,18 @@ def _model_summary_entry(
         "error": repr(exc) if exc is not None else "未运行",
         "count": len(model_records.get(name) or []),
     }
+    # 模型在构造/预填充/生成本身就失败时，可能仍有已发出的请求；有就补上，
+    # 没有（如构建阶段就抛错）不写空块，保持旧汇总形状。
+    stats = _model_agent_stats(name, results, agents_by_model)
+    if stats:
+        entry["agent_stats"] = stats
+    return entry
 
 
 def _voting_extra_summary(
-    args, spec, weights, final_records, model_names, results, failed, model_records, log, raw_paths
+    args, spec, weights, final_records, model_names, results, failed, model_records, log, raw_paths,
+    *,
+    agents_by_model: dict | None = None,
 ) -> dict:
     """最终投票 writer 的汇总块；独立成函数，便于核对它与各模型 summary 的口径一致。"""
     return {
@@ -1134,7 +1198,10 @@ def _voting_extra_summary(
         # 失败模型也留一条（status=failed + error）：事后看汇总能直接分辨
         # “这个模型没票”是设计如此，还是它那一轮炸了
         "models": [
-            _model_summary_entry(name, weights, raw_paths, results, failed, model_records)
+            _model_summary_entry(
+                name, weights, raw_paths, results, failed, model_records,
+                agents_by_model=agents_by_model,
+            )
             for name in model_names
         ],
     }
@@ -1152,6 +1219,7 @@ def _run_multi_model_impl(
     *,
     log: agent_log.AgentLog,
     results: dict[str, dict],
+    agents_by_model: dict | None = None,
 ) -> dict:
     """多模型投票：每个模型独立跑完整张图，再逐候选加权投票
 
@@ -1186,7 +1254,10 @@ def _run_multi_model_impl(
     print(f"模型并发：{model_workers}；每个模型内部 --workers={max(1, args.workers)}")
 
     overrides = _build_overrides(args, spec)
-    agents_by_model = {}
+    # 注册表由外层传入：某个模型中途失败时，外层 finally 仍能读到已建 agent
+    # 的调用账，把失败前已消耗的 token 记进运行日志。直接调用本函数时可省略。
+    if agents_by_model is None:
+        agents_by_model = {}
     for name in model_names:
         print(f"  准备模型 {name}（voting_weight={weights[name]}）")
         agents_by_model[name] = _build_model_agents(args, spec, corpus_type, name, overrides)
@@ -1325,6 +1396,7 @@ def _run_multi_model_impl(
     voting_writer.extra_summary = _voting_extra_summary(
         args, spec, weights, final_records, model_names,
         results, failed, model_records, log, raw_paths,
+        agents_by_model=agents_by_model,
     )
     for record in final_records:
         voting_writer.write(record)
