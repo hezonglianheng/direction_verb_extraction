@@ -87,6 +87,7 @@ from langchain_core.callbacks import BaseCallbackHandler
 from pydantic import BaseModel, Field, create_model
 
 import agents as agent_factory
+from structured_schema import ClosedModel, FeatureMap
 import batch_inference as bi
 from extract import sentence_screening
 from annotate import prompt_cache as pc
@@ -318,7 +319,7 @@ def _reply_digest(messages: list) -> str:
 # --------------------------------------------------------------------------
 
 
-class SemanticVerdict(BaseModel):
+class SemanticVerdict(ClosedModel):
     """语法与空间语义**分开**判，两项各带自己的理由
 
     SemanticAgent 已改为直接复用语料筛选的 grammatical / spatial_coherent；本模型保留供
@@ -385,7 +386,7 @@ def semantic_blank(source: str, reason: str) -> dict:
     }
 
 
-class RealityVerdict(BaseModel):
+class RealityVerdict(ClosedModel):
     """reality_agent 的输出：关注词在这一句里是不是在表达本类语料认定的空间语义"""
 
     is_spatial_scene: bool = Field(
@@ -396,7 +397,7 @@ class RealityVerdict(BaseModel):
     reason: str = Field(description="判断依据，需说清关注词在这一句里的意思，以及为什么算（或不算）现实空间")
 
 
-class SchemaVerdict(BaseModel):
+class SchemaVerdict(ClosedModel):
     """schema_agent 查表未命中时的输出"""
 
     schema_name: str = Field(
@@ -407,24 +408,28 @@ class SchemaVerdict(BaseModel):
     reason: str = Field(description="选择依据，需说明关注词表达的空间关系，以及依据语感理解的空间语义特征与所选 schema 的命中条件如何对应")
 
 
-class JudgeVerdict(BaseModel):
+class JudgeVerdict(ClosedModel):
     """judge_agent 交 LLM 判断时的输出（表里没给结论才是这条路：格子标了 ○、留空非法、或这一对没收录）"""
 
     same_meaning: bool = Field(description="两句话的意义是否相同")
     reason: str = Field(description="判断依据，需说明替换词带来的语义差别")
 
 
-class SynonymVerdict(BaseModel):
+class SynonymVerdict(ClosedModel):
     """synonym_agent 的独立结构化输出；判断标准由用户填写的提示语决定。"""
 
     same_meaning: bool = Field(description="两句话是否同义")
     reason: str = Field(description="判断理由")
 
 
-class FreeFeatures(BaseModel):
-    """特征类别表未填写时 feature_agent 的兜底输出"""
+class FreeFeatures(ClosedModel):
+    """特征类别表未填写时 feature_agent 的兜底输出
 
-    features: dict[str, Any] = Field(
+    ``features`` 业务上仍是 ``dict[str, Any]``；出站时由 FeatureMap 编成闭合的
+    ``{key, value_json}`` 条目数组，验证时还原（原因见 structured_schema）。
+    """
+
+    features: FeatureMap = Field(
         default_factory=dict,
         description="从句子中读出的空间语义特征，键为特征名，值为该特征上的取值",
     )
@@ -967,7 +972,7 @@ def _feature_model(feature_classes: list[dict]):
         )
         for feature_class in feature_classes
     }
-    return create_model("SemanticFeatures", **fields)
+    return create_model("SemanticFeatures", __config__=ClosedModel.model_config, **fields)
 
 
 def _build_deep_feature_agent(
@@ -1176,6 +1181,8 @@ class BaseAgent:
         self._stats_lock = threading.Lock()
         self._cache_family_value: str | None = None
         """提示词缓存家族（"anthropic" / "none"），首次发请求时按模型配置算一次"""
+        self._schema_key_value: str | None = None
+        """结构化输出 schema 指纹（见 batch_inference.item_key），首次需要请求键时算一次"""
 
     # -- 子类实现 ----------------------------------------------------------
     def run(self, **kwargs) -> dict:
@@ -1212,6 +1219,17 @@ class BaseAgent:
     def response_format(self) -> ToolStrategy:
         """所有同步构造入口共用的结构化补发策略（不是传输重试策略）。"""
         return ToolStrategy(self.response_model(), handle_errors=self.allow_structured_retry)
+
+    def schema_key(self) -> str:
+        """本 agent 输出 schema 的稳定指纹，供 Batch 请求键区分业务契约
+
+        schema 改变意味着「同一句话问的已经不是同一个问题」：旧结果（尤其是旧 schema
+        被后端拒绝后记下的失败项）不能在 `--batch-resume` 时继续回放。指纹按 agent
+        实例缓存；VERDICT_MODEL 在构造期定死，运行中不会换。
+        """
+        if self._schema_key_value is None:
+            self._schema_key_value = bi.schema_fingerprint(self.response_model())
+        return self._schema_key_value
 
     def _invocation_metrics(self) -> _InvocationMetrics | None:
         metrics = _CURRENT_INVOCATION_METRICS.get()
@@ -1320,12 +1338,10 @@ class BaseAgent:
                     # 不会因为下游 batch 超时又把这一条 deep 请求重跑一遍。
                     session.remember(self, content, verdict.model_dump())
                     return verdict
-                session.add(self, content)
+                key = session.add(self, content)
                 with self._stats_lock:
                     self._stats["batch_items"] += 1
-                raise bi.BatchPending(
-                    self.NAME, bi.item_key(self.NAME, content, self.system_prompt)
-                )
+                raise bi.BatchPending(self.NAME, key)
             # 同步回退：这一条在登记时已经扣过预算，别再扣第二次
             already_reserved = session.consume_reservation(self, content)
         return self._invoke_sync(content, check_budget=not already_reserved)
@@ -2785,21 +2801,31 @@ class AllInOneAgent(BaseAgent):
     @staticmethod
     def _build_verdict_model(feature_classes: list[dict]) -> type[BaseModel]:
         # 保持旧 all_in_one 的字段、模型名及说明；空类别表时 features 的两侧都是自由字典。
-        feature_type: Any = create_model("SemanticFeatures", **{
-            c["key"]: (list[str], Field(default_factory=list,
-                                      description=f"{c.get('name') or c['key']}：{c.get('description') or ''}"))
-            for c in feature_classes
-        }) if feature_classes else dict[str, Any]
-        features = create_model("SideFeatures", a=(feature_type, Field(description="原句空间特征")),
-                                b=(feature_type, Field(description="替换句空间特征")))
-        schemas = create_model("SideSchema", a=(SchemaVerdict, Field(description="原句图式")),
-                               b=(SchemaVerdict, Field(description="替换句图式")))
+        feature_type: Any = create_model(
+            "SemanticFeatures", __config__=ClosedModel.model_config, **{
+                c["key"]: (list[str], Field(default_factory=list,
+                                          description=f"{c.get('name') or c['key']}：{c.get('description') or ''}"))
+                for c in feature_classes
+            }
+        ) if feature_classes else FeatureMap
+        features = create_model(
+            "SideFeatures", __config__=ClosedModel.model_config,
+            a=(feature_type, Field(description="原句空间特征")),
+            b=(feature_type, Field(description="替换句空间特征")),
+        )
+        schemas = create_model(
+            "SideSchema", __config__=ClosedModel.model_config,
+            a=(SchemaVerdict, Field(description="原句图式")),
+            b=(SchemaVerdict, Field(description="替换句图式")),
+        )
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message=r'Field name "schema" in "AllInOneVerdict" shadows an attribute in parent')
-            return create_model("AllInOneVerdict",
-                                features=(features, Field(description="第 1 步：两侧空间特征")),
-                                schema=(schemas, Field(description="第 2 步：两侧图式")),
-                                judgement=(JudgeVerdict, Field(description="第 3 步：句对同义关系")))
+            return create_model(
+                "AllInOneVerdict", __config__=ClosedModel.model_config,
+                features=(features, Field(description="第 1 步：两侧空间特征")),
+                schema=(schemas, Field(description="第 2 步：两侧图式")),
+                judgement=(JudgeVerdict, Field(description="第 3 步：句对同义关系")),
+            )
 
     def _render_system_prompt(self) -> str:
         classes = self.feature_classes
@@ -2824,6 +2850,15 @@ class AllInOneAgent(BaseAgent):
             return f"{head}只从下面这些里挑一个最接近的，名字原样照抄：\n{st.render_schema_candidates(candidates)}"
         return f"{head}这一类下还没有编号图式，请按「{prefix or '组名'} + 编号」的格式自行命名。"
 
+    def _preparation_note(self) -> str:
+        """句对准备状态的说明；评测路径可覆盖，生产默认逐字保持不变
+
+        这段话属于每条消息都会重复的固定说明，但它在 dynamic 段里：放在这里是为了让评测子类
+        只改措辞、不重写整条消息，避免再次出现「评测自己拼旧顺序」的漂移。要把它也移进
+        stable 段是另一种布局调整，会改变生产提示词逐字内容，不在本钩子的职责内。
+        """
+        return "两侧均已通过语法、空间自洽和空间义检查；本次只标注，不重复筛选。"
+
     def _content(self, sentence_a: str, sentence_b: str, focus_word_a: dict | None,
                  focus_word_b: dict | None) -> pc.PromptParts:
         """示例与候选名单在前，本条句对与关注词在后
@@ -2847,7 +2882,7 @@ class AllInOneAgent(BaseAgent):
                 pair_head_block(focus_word_a, focus_word_b, corpus_type=self.corpus_type),
                 f"原句：{sentence_a or ''}",
                 f"改写句：{sentence_b or ''}",
-                "两侧均已通过语法、空间自洽和空间义检查；本次只标注，不重复筛选。",
+                self._preparation_note(),
                 "请依次给出两侧空间特征（features）、两侧图式（schema）及同义关系（judgement）。",
             ) if part
         )

@@ -63,7 +63,9 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from pydantic import BaseModel, Field
+from pydantic import Field
+
+from structured_schema import ClosedModel
 
 import config
 import utils
@@ -130,7 +132,7 @@ _PROGRESS_LOCK = threading.Lock()
 """
 
 
-class ExtractionVerdict(BaseModel):
+class ExtractionVerdict(ClosedModel):
     """单条判定结果：空间可提取性、语法、空间自洽三项分开判（批处理里的每个 item 仍是这个形状）
 
     三项在**同一次调用**里给出，agent 链路直接读这份结果，不再各问一遍：
@@ -168,7 +170,7 @@ class BatchExtractionItem(ExtractionVerdict):
     )
 
 
-class BatchExtractionVerdict(BaseModel):
+class BatchExtractionVerdict(ClosedModel):
     """一次请求返回多条判定；条数与 item_id 必须和输入对得上"""
 
     results: list[BatchExtractionItem] = Field(

@@ -729,7 +729,7 @@ def _run_batch(spec, pipeline, outcome, *, workers, cache_path, poll_seconds,
 
         def add(self, agent, content):
             if self.replay_only:
-                raise bi.BatchPending(agent.NAME, bi.item_key(agent.NAME, content, agent.system_prompt))
+                raise bi.BatchPending(agent.NAME, bi.agent_item_key(agent, content))
             return super().add(agent, content)
 
         def _append_result(self, key, dumps, error):

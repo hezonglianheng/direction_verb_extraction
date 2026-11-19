@@ -26,8 +26,10 @@
     都不用跟着改。save 节点只在状态真正走完时触发，不会重复落盘。
 
 结果缓存与恢复：
-    每条结果按 (agent 名, system prompt, 完整 user message) 的哈希写进 sidecar
-    `.batch-cache.jsonl`。
+    每条结果按 (agent 名, system prompt, 完整 user message, 输出 schema 指纹) 的哈希写进
+    sidecar `.batch-cache.jsonl`。schema 指纹进键，是为了让结构化输出模型变化后旧结果
+    （尤其是旧 schema 被后端拒绝的失败项）不再被 `--batch-resume` 回放；同一 schema
+    的缓存仍可跨进程复用。
     同一次运行里它是跨波次的回放来源；加 `--batch-resume` 时也跨进程复用。
     batch 提交后另写 `.batch-jobs.json`：轮询超时不会丢 batch ID，下次可先收旧批，
     避免「不知道上次有没有受理」时重复提交、重复计费。
@@ -124,17 +126,57 @@ def current_session() -> "BatchSession | None":
     return _CURRENT_BATCH.get()
 
 
-def item_key(agent_name: str, content: str, system_prompt: str = "") -> str:
-    """一条请求的稳定键：agent 名 + system prompt + 完整 user message
+def schema_fingerprint(model: type[BaseModel] | None) -> str:
+    """结构化输出模型的稳定指纹；没有模型时返回空串
 
-    system prompt 也进键，是为了让 `--batch-resume` 在提示语/类别表改过之后不会把旧结果
-    回放进来：同一句话配不同系统提示语，本来就不是同一个问题。模型名由会话隔离（一个模型
-    一个 BatchSession），所以不重复放进键里。
+    用规范化的 JSON Schema（键排序、固定分隔符）求和，而不是类名或对象地址：
+    同一份业务契约必须得到同一个键，字段顺序或运行进程变化都不该影响续跑命中。
     """
-    digest = hashlib.sha256(
-        f"{agent_name}\0{system_prompt}\0{content}".encode("utf-8")
-    ).hexdigest()
+    if model is None:
+        return ""
+    schema = model.model_json_schema()
+    canonical = json.dumps(schema, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def agent_schema_key(agent) -> str:
+    """取 agent 当前结构化输出模型的指纹；没有输出模型的替身返回空串"""
+    key_fn = getattr(agent, "schema_key", None)
+    if callable(key_fn):
+        return str(key_fn())
+    model_fn = getattr(agent, "response_model", None)
+    return schema_fingerprint(model_fn()) if callable(model_fn) else ""
+
+
+def item_key(
+    agent_name: str, content: str, system_prompt: str = "", schema: str = ""
+) -> str:
+    """一条请求的稳定键：agent 名 + system prompt + 输出 schema 指纹 + 完整 user message
+
+    system prompt 与输出 schema 都进键，是为了让 `--batch-resume` 在提示语/类别表/
+    结构化输出模型改过之后不会把旧结果回放进来：同一句话配不同的业务契约，本来就不是
+    同一个问题。尤其是旧 schema 被后端拒绝后写下的失败项，若不换键就会在升级后续跑时
+    被永久复用。模型名由会话隔离（一个模型一个 BatchSession），所以不重复放进键里。
+
+    ``schema`` 为空时省略该段，三参调用仍与旧版逐字节同键（供没有输出模型的替身/
+    旧调用方使用）；真实 agent 都经 ``agent_item_key`` 传入非空指纹。
+    """
+    parts = [agent_name, system_prompt]
+    if schema:
+        parts.append(schema)
+    parts.append(content)
+    digest = hashlib.sha256("\0".join(parts).encode("utf-8")).hexdigest()
     return digest[:32]
+
+
+def agent_item_key(agent, content: str) -> str:
+    """按 agent 当前的 system prompt 与输出 schema 计算请求键（所有调用点共用）"""
+    return item_key(
+        str(getattr(agent, "NAME", type(agent).__name__)),
+        content,
+        str(getattr(agent, "system_prompt", "") or ""),
+        agent_schema_key(agent),
+    )
 
 
 @dataclass
@@ -1003,7 +1045,8 @@ class BatchSession:
                     "dumps": entry.get("dumps"),
                     "error": entry.get("error"),
                 }
-                self.cache_hits += 1
+                # 这里只装载，不记缓存命中：只有本次真正按 key 回放的 lookup 才算命中。
+                # 旧 schema 的结果仍会装载但永远匹配不上新 key，提前计数会把它们报成复用。
 
     def _check_or_write_meta(self) -> None:
         """校验/写入 sidecar 的模型身份，防止换模型后续跑串结果
@@ -1107,7 +1150,7 @@ class BatchSession:
 
     def lookup(self, agent, content: str) -> tuple[dict | None, str | None] | None:
         """回放一条已有结果；没有返回 None（与「有结果但失败」区分开）"""
-        key = item_key(agent.NAME, content, getattr(agent, "system_prompt", ""))
+        key = agent_item_key(agent, content)
         with self._lock:
             hit = self.results.get(key)
         if hit is None:
@@ -1117,7 +1160,7 @@ class BatchSession:
 
     def add(self, agent, content: str) -> str:
         """登记一条待发请求（同一 key 只登记一次）；超整批预算时按异常抛出"""
-        key = item_key(agent.NAME, content, getattr(agent, "system_prompt", ""))
+        key = agent_item_key(agent, content)
         if key in self.results or key in self.pending:
             return key
         # 预算在登记时就扣（候选作用域 + 整批），口径见 BaseAgent.reserve_batch_request
@@ -1143,7 +1186,7 @@ class BatchSession:
         它不占 batch 名额，也不进 pending；只是让后续波次和 --batch-resume 能按同一
         key 回放，避免下游 batch 超时后把这条同步请求重跑一遍。
         """
-        key = item_key(agent.NAME, content, getattr(agent, "system_prompt", ""))
+        key = agent_item_key(agent, content)
         if key not in self.results:
             self._append_result(key, dumps, None)
 
@@ -1153,7 +1196,7 @@ class BatchSession:
         只在同步回退路径调用：原生批量的请求由 add 扣一次；回退首发不该再扣一次，
         否则候选预算为 1 时会在「登记后接口 404」这种路径上直接报预算耗尽。
         """
-        key = item_key(agent.NAME, content, getattr(agent, "system_prompt", ""))
+        key = agent_item_key(agent, content)
         if key in self._reserved:
             self._reserved.discard(key)
             return True
