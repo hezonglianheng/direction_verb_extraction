@@ -12,6 +12,11 @@ step 0：直接同义判断（默认）；1/2：一次完整标注，禁用/启�
     python evaluate --step 3 --corpus results/direction_annotated.jsonl --corpus-type direction --models deepseek-flash qwen3.8-max
     python -m evaluate --step 4 --corpus results/location_annotated.jsonl --print-prompt
 
+原始 SpaCE 句对（context1/context2/judge）先转成评测用 JSONL：
+
+    python -m evaluate.import_sentence_pairs config_files/sample_sentence_pairs.json \\
+        --output results/evaluate/sample_sentence_pairs.jsonl
+
 每个模型独立写 ``results/evaluate/<模型名>_step<N>_<YYYYMMDDTHHMMSSZ>.json``；
 时间戳为 UTC（ISO 8601 基本格式，精确到秒），同一天可多次运行。默认另写同名
 ``.details.jsonl`` 逐条预测（``--no-details`` 可关）。模型之间并行、单模型内部
