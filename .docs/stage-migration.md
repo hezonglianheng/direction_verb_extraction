@@ -95,7 +95,14 @@ python annotate --graph pair --corpus results/location_pairs.jsonl --corpus-type
 | 显式覆盖补发 | `--allow-retry` / `--no-allow-retry` | 同左 | 同左 |
 | 传输重试/超时/退避 | 按模型配置 | 按模型配置 | 按模型配置 |
 
-共同参数还包括 `--model` / `--models`、`--workers` / `--model-workers`、`--offset`、`--limit-mode sequential|random|proportional|aligned`、`--seed`、`--reference-file`、`--max-requests` / `--batch-max-requests`、`--batch auto|native|off`（默认 auto）、`--batch-cache` / `--batch-resume`、`--no-pairs-csv`、`--overwrite`。`random`/`proportional` 需要显式 `--limit` 与 `--seed` 才可复现；`proportional` 按无向关注词对分层（`上-下` 与 `下-上` 同层）；`aligned` 用 `--reference-file` 读取一份 annotate 结果文件中的全部句对，省略 `--limit` 时不受图默认值截断。三种抽样模式流式读取，`aligned` 只为 reference 句对身份保留索引。all_in_one 现支持 `--models`；投票沿用完整代表记录，不跨模型拼接特征或图式，平票/缺票转复核。同步 `requests` 为逻辑调用，`actual_requests` 为观测到的同步模型开始，原生 Batch 项数/批次数另计，旧 `pair_llm_calls` 不代表真实请求数。
+`--model` 和 `--models` 互斥，名称都取自 `model_config/api_keys.json`：
+
+- `--model A` 或 `--models A`：只用 A 标注，不投票。最终 JSONL 就是 A 的标注，不另建 `.models/` 目录。
+- `--models A B`（两个及以上不同配置名）：每个模型独立标注同一批输入，按 `voting_weight` 逐条加权投票。最终 JSONL 写投票结果，沿用代表模型的完整记录，不跨模型拼接特征或图式；平票或缺票转人工复核。
+
+直接运行 `python annotate` 时，两种模式都优先使用 `--out-file`。未指定时，在 `--out-dir`（默认项目根目录下的 `results/<图前缀>/`，例如 `results/spatial_pairs/`）生成 `<图前缀>_<时间戳>.jsonl`。例如 `--models A B --out-file results/vote.jsonl` 将投票结果写入 `results/vote.jsonl`，A、B 的原始结果分别写入 `results/vote.models/00_A.jsonl` 和 `results/vote.models/01_B.jsonl`。
+
+共同参数还包括 `--workers` / `--model-workers`、`--offset`、`--limit-mode sequential|random|proportional|aligned`、`--seed`、`--reference-file`、`--max-requests` / `--batch-max-requests`、`--batch auto|native|off`（默认 auto）、`--batch-cache` / `--batch-resume`、`--no-pairs-csv`、`--overwrite`。`random`/`proportional` 需要显式 `--limit` 与 `--seed` 才可复现；`proportional` 按无向关注词对分层（`上-下` 与 `下-上` 同层）；`aligned` 用 `--reference-file` 读取一份 annotate 结果文件中的全部句对，省略 `--limit` 时不受图默认值截断。三种抽样模式流式读取，`aligned` 只为 reference 句对身份保留索引。同步 `requests` 为逻辑调用，`actual_requests` 为观测到的同步模型开始，原生 Batch 项数/批次数另计，旧 `pair_llm_calls` 不代表真实请求数。
 
 `python -m annotate` 与目录命令等价；旧 `--engine staged`（默认 pair）、`--engine all-in-one` 及 `python -m annotate.all_in_one` 仍有效，all-in-one 旧入口只是共同 runner 的转发层。显式冲突的 engine/graph 及重复的不同 graph/engine 选择会报错，重复相同值允许。`--feature-deep` 仅用于 pair/single，在 all_in_one 报错；正式标注拒绝 `--alter-rules`，应传给 replace。旧 `--all-candidates`、`--no-syntax`、正式图中的 `--batch-inference` 只兼容并提示，不再展开候选或准备句法。
 

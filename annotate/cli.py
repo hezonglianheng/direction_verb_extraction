@@ -28,15 +28,18 @@ EPILOG = """
     python annotate --limit 200 --limit-mode proportional --seed 0
     python annotate --reference-file results/location_annotated.jsonl
     python annotate --no-llm --batch off --limit 5
-    python annotate --models model-a model-b --workers 4
+    python annotate --model model-a --out-file results/single.jsonl
+    python annotate --models model-a model-b --out-file results/vote.jsonl --workers 4
     python annotate --batch native --batch-resume --batch-cache results/run.batch-cache.jsonl
     python annotate --list-graphs
     python annotate --engine all-in-one --limit 1
     python annotate --graph all_in_one --models model-a model-b
     python annotate --graph pair --print-prompt
 
---models 保留模型独立执行与加权投票，缺票及平票转人工复核。--batch auto 优先使用原生 Batch，
-不可用时明确回退同步；native 不允许回退。批处理仅包含特征、图式和判定波次，查表优先级不变。
+投票示例中，results/vote.jsonl 是最终结果；各模型的原始结果是
+results/vote.models/00_model-a.jsonl 和 results/vote.models/01_model-b.jsonl。
+--batch auto 优先使用原生 Batch，不可用时明确回退同步；native 不允许回退。
+批处理仅包含特征、图式和判定波次，查表优先级不变。
 完整命令与服务器迁移注意事项见 .docs/stage-migration.md。
 """
 
@@ -144,10 +147,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="仅 alter_check 诊断图使用；正式 pair/synonym 标注不替换，须将此参数传给 python replace",
     )
-    parser.add_argument("--out-dir", default=None, help="输出目录（默认 results/<图的 prefix>）")
+    parser.add_argument(
+        "--out-dir", default=None,
+        help="最终结果目录，两种模式都默认使用项目根目录下的 results/<图前缀>/。"
+        "未给 --out-file 时，文件名为 <图前缀>_<时间戳>.jsonl",
+    )
     parser.add_argument(
         "--out-file", default=None,
-        help="直接指定输出文件（默认按时间戳生成）；与 --out-dir 同时给出时以本参数为准",
+        help="直接指定最终 JSONL 路径，优先于 --out-dir。单模型时写该模型的标注，投票时写汇总结果",
     )
     parser.add_argument(
         "--overwrite",
@@ -214,19 +221,21 @@ def build_parser() -> argparse.ArgumentParser:
         "三种抽样模式下先跳过再抽样，aligned 按匹配到的源记录顺序跳过",
     )
     model_group = parser.add_mutually_exclusive_group()
-    model_group.add_argument("--model", default=DEFAULT_MODEL,
-                             help=f"model_config/api_keys.json 里的配置名（单模型模式），默认 {DEFAULT_MODEL}")
+    model_group.add_argument(
+        "--model", default=DEFAULT_MODEL, metavar="配置名",
+        help=f"单模型标注：使用 model_config/api_keys.json 中的一个配置（默认 {DEFAULT_MODEL}）。"
+        "该模型的标注直接写入最终 JSONL，不投票，也不创建 .models/ 子目录。与 --models 互斥",
+    )
     model_group.add_argument(
         "--models",
         nargs="+",
         default=None,
         metavar="配置名",
-        help="多模型投票模式：指定 model_config/api_keys.json 里的多个配置名。"
-        "每个模型独立跑完整张图（各自的 agent、缓存与原始结果），再按 voting_weight "
-        "对每条候选做加权简单多数；平票记为 discarded。只给一个名字时等价于 --model。"
-        "单个模型失败不会作废整轮：它的票按缺票计入并转人工复核，其余模型照常投票；"
-        "只有全部模型都失败才报错。多模型时不能与 --no-llm 同用（投票必须有模型判定，"
-        "--print-prompt 预览除外）",
+        help="只给一个配置名时，--models A 等价于 --model A。给两个及以上不同配置名时，"
+        "各模型对同一批输入独立跑完所选图，再按 voting_weight 逐条加权投票。"
+        "最终 JSONL 写投票结果；各模型的原始 JSONL 按参数顺序另存于同目录的 <最终文件主名>.models/。"
+        "平票或无有效票记为 discarded，缺票转人工复核；个别模型失败前已写出的记录仍参与投票，"
+        "全部模型运行失败才中止。投票不能与 --no-llm 同用（--print-prompt 预览除外）",
     )
     parser.add_argument(
         "--model-workers",
