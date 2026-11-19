@@ -39,7 +39,12 @@ class ModelOnlySchemaAgent(sa.SchemaAgent):
 
 
 class ModelOnlyJudgeAgent(sa.JudgeAgent):
-    """不能调用父类 run：它的 judgement_situation 也会隐式查判定表。"""
+    """不能调用父类 run：它的 judgement_situation 也会隐式查判定表。
+
+    消息仍复用父类 ``_content``：示例进稳定段、当前句对与上游判断进动态段，
+    Claude 才能在示例末尾拿到断点。这里只把 situation 换成不查表的固定说明，
+    输出措辞与旧版逐字一致（父类会补句号）。
+    """
 
     def run(
         self,
@@ -57,18 +62,10 @@ class ModelOnlyJudgeAgent(sa.JudgeAgent):
             return local
         schema_a, schema_b = schema_a or {}, schema_b or {}
         examples = pe.judge_example_block(self.example_groups, schema_a.get("name"), schema_b.get("name"))
-        example_section = f"{examples}\n\n" if examples else ""
-        content = (
-            f"{sa.pair_head_block(focus_word, focus_word_b, corpus_type=self.corpus_type)}\n"
-            f"原句：{sentence_a}\n"
-            f"原句 schema：{schema_a.get('name')}（来源 {schema_a.get('source')}）\n"
-            f"原句语义特征：{json.dumps(features_a or {}, ensure_ascii=False)}\n"
-            f"改写句：{sentence_b}\n"
-            f"改写句 schema：{schema_b.get('name')}（来源 {schema_b.get('source')}）\n"
-            f"改写句语义特征：{json.dumps(features_b or {}, ensure_ascii=False)}\n"
-            "判定表情况：评测禁用判定查表，直接采用模型结论。\n"
-            f"{example_section}"
-            "请判断这两句话的意义是否相同。"
+        content = self._content(
+            sentence_a, sentence_b, schema_a, schema_b, features_a, features_b,
+            focus_word, focus_word_b,
+            "评测禁用判定查表，直接采用模型结论", examples,
         )
         try:
             verdict = self._invoke(content)
@@ -78,26 +75,14 @@ class ModelOnlyJudgeAgent(sa.JudgeAgent):
 
 
 class EvaluationAllInOneAgent(sa.AllInOneAgent):
-    """只调整评测消息：不声称句对已通过未验证的准备检查，查表解析仍沿用父类。"""
+    """只调整评测说明：不声称句对已通过未验证的准备检查，查表解析仍沿用父类。
 
-    def _content(
-        self, sentence_a: str, sentence_b: str, focus_word_a: dict | None, focus_word_b: dict | None
-    ) -> str:
-        parts = [
-            sa.pair_head_block(focus_word_a, focus_word_b, corpus_type=self.corpus_type),
-            f"原句：{sentence_a or ''}", f"改写句：{sentence_b or ''}",
-            "本次只标注，不重复筛选。",
-        ]
-        for stage in ("feature", "schema"):
-            title = "空间特征" if stage == "feature" else "空间图式"
-            for label, focus in (("原句", focus_word_a), ("改写句", focus_word_b)):
-                block = pe.example_block(self.example_groups[stage], focus, stage)
-                if block:
-                    parts.append(f"{label}的{title}示例（只供本侧本步骤参考）：\n{block}")
-        for label, focus in (("原句", focus_word_a), ("改写句", focus_word_b)):
-            parts.append(self._candidates_block(label, focus))
-        parts.append("请依次给出两侧空间特征（features）、两侧图式（schema）及同义关系（judgement）。")
-        return "\n\n".join(part for part in parts if part)
+    示例、两侧 schema 候选、句子和收尾指令全部复用父类 ``_content``，因此稳定段
+    与生产路径同源；这里只替换准备说明这一句，不再另拼一条旧顺序的消息。
+    """
+
+    def _preparation_note(self) -> str:
+        return "本次只标注，不重复筛选。"
 
 
 class ModelOnlyAllInOneAgent(EvaluationAllInOneAgent):
