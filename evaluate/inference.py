@@ -22,6 +22,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import file_paths
 import retry
+import temperature_policy as tp
 import utils
 from evaluate.data import EvalSample
 
@@ -259,7 +260,7 @@ def public_generation(cfg: dict) -> dict:
 
     configured = cfg.get("disable_thinking")
     source = "default" if configured is None else "explicit_empty" if configured == {} else "override"
-    fields, unpublished = _flatten_generation(disable_thinking_kwargs(cfg))
+    fields, unpublished = _flatten_generation(tp.strip_temperature(disable_thinking_kwargs(cfg)))
     return {
         **fields,
         "thinking_policy_source": source,
@@ -299,7 +300,6 @@ def public_model_info(
              cfg.get("model") or cfg.get("model_name") or "")
     provider = (batch.provider if use_native and batch.provider else
                 cfg.get("model_provider") or cfg.get("provider") or "")
-    temperature = float((batch.temperature if use_native else cfg.get("temperature", 0)) or 0)
     # 同步链路与原生请求都会在基础 kwargs 之后合并额外调用参数；复现摘要取最终值。
     if use_native:
         override = batch.extra
@@ -307,11 +307,16 @@ def public_model_info(
         from agents import disable_thinking_kwargs
 
         override = disable_thinking_kwargs(cfg)
+    # 报告只展示“实际发送”的温度：总开关关闭时一律 None；开启时取与请求相同的
+    # 单一来源（同步=顶层配置，原生=BatchProfile），不在这里重复告警。
+    temperature: float | None = None
+    if tp.enabled():
+        if use_native and batch is not None:
+            temperature = batch.temperature
+        else:
+            temperature = tp.coerce(cfg.get("temperature"))
     if isinstance(override.get("model"), str) and override["model"].strip():
         model = override["model"]
-    if isinstance(override.get("temperature"), (int, float)) and not isinstance(
-            override["temperature"], bool):
-        temperature = float(override["temperature"])
     # 只有同步构造会合并 model_provider；native extra 仅是请求体字段，
     # 不能把 payload 里的 provider 当成实际传输后端。
     if not use_native and isinstance(override.get("model_provider"), str):
@@ -325,6 +330,7 @@ def public_model_info(
         "model_name": str(model),
         "endpoint": redact_url(cfg.get("base_url")),
         "temperature": temperature,
+        "temperature_enabled": tp.enabled(),
         "proxy_mode": spec.proxy_mode,
         "request": public_request_policy(spec.policy),
         "batch": {
@@ -340,7 +346,8 @@ def _batch_profile_identity(profile) -> str:
     return _digest({
         "model_key": profile.model_key, "provider": profile.provider, "model": profile.model,
         "base_url": profile.base_url, "protocol": profile.protocol,
-        "temperature": profile.temperature, "completion_window": profile.completion_window,
+        "temperature": profile.temperature, "temperature_enabled": tp.enabled(),
+        "completion_window": profile.completion_window,
         "extra": profile.extra, "enabled": profile.enabled,
         "proxy_mode": profile.proxy_mode, "proxy_url": profile.proxy_url,
     })
@@ -356,6 +363,7 @@ def safe_batch_meta(profile, cfg: dict | None = None) -> dict:
         "endpoint": redact_url(profile.base_url),
         "protocol": profile.protocol,
         "temperature": profile.temperature,
+        "temperature_enabled": tp.enabled(),
         "completion_window": profile.completion_window,
         "enabled": bool(profile.enabled),
         "disabled_reason": sanitize_text(profile.disabled_reason, cfg),
@@ -386,11 +394,18 @@ def private_model_identity(spec: ModelSpec) -> str:
             "model_key": spec.batch.model_key, "provider": spec.batch.provider,
             "model": spec.batch.model, "base_url": spec.batch.base_url,
             "protocol": spec.batch.protocol, "temperature": spec.batch.temperature,
+            "temperature_enabled": tp.enabled(),
             "completion_window": spec.batch.completion_window,
             "extra": spec.batch.extra, "enabled": spec.batch.enabled,
             "proxy_mode": spec.batch.proxy_mode, "proxy_url": spec.batch.proxy_url,
         }
-    return _digest({"cfg": cfg, "policy": spec.policy, "proxy_mode": spec.proxy_mode, "batch": batch})
+    return _digest({
+        "cfg": cfg,
+        "policy": spec.policy,
+        "proxy_mode": spec.proxy_mode,
+        "temperature_enabled": tp.enabled(),
+        "batch": batch,
+    })
 
 
 def pipeline_provenance(pipeline, spec: ModelSpec) -> dict:

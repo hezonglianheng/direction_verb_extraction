@@ -39,6 +39,10 @@
 
 要点：
 
+- **温度默认不传**：`config.LLM_TEMPERATURE_ENABLED` 默认 `False`，示例里的
+  `"temperature": 0`（以及 `disable_thinking` 里的同名字段）都不会发给接口。
+  需要按配置调温时把它改为 `True`；此时配置缺 `temperature` 会在 stderr 告警一次
+  并省略该字段，不会补默认值。
 - **地址只写一处**：`base_url` 就是本地小模型地址，例如
   `http://127.0.0.1:8000/v1`。健康检查地址由它自动推导为
   `http://127.0.0.1:8000/health`；也可以用 `local_service.health_url` 显式指定。

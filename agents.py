@@ -22,6 +22,7 @@ from deepagents import create_deep_agent
 
 import config
 import retry
+import temperature_policy as tp
 from annotate import prompt_cache
 
 call_with_retry = retry.call_with_retry
@@ -444,11 +445,11 @@ def get_model(model_name: str, disable_thinking: bool = False):
         "model_provider": model_cfg.get("model_provider") or model_cfg["provider"],
         "base_url": model_cfg["base_url"],
         "api_key": model_cfg["api_key"],
-        "temperature": model_cfg.get("temperature", 0),
         # 超时由这一层显式给；重试统一收在 retry.call_with_retry，SDK 层置 0。
         "timeout": policy["timeout"],
         "max_retries": 0,
     }
+    extra_kwargs: dict = {}
     if disable_thinking:
         # 只有「provider 未知且配置没写 disable_thinking」才报错。已知 provider
         # 的默认值可以是空字典（OpenRouter 即如此，表示不补参数），不能把空
@@ -458,7 +459,13 @@ def get_model(model_name: str, disable_thinking: bool = False):
                 f"不知道 provider '{kwargs['model_provider']}' 该怎么关思考模式，"
                 f"请在 {_MODEL_CONFIG_PATH} 的 {model_name} 配置里加 \"disable_thinking\" 字段。"
             )
-        kwargs.update(disable_thinking_kwargs(model_cfg))
+        extra_kwargs = disable_thinking_kwargs(model_cfg)
+        # 间接容器里的 temperature 不能绕过总开关；先清掉再合并其余参数。
+        kwargs.update(tp.strip_temperature(extra_kwargs))
+
+    # 关闭时显式传 None 而不是省略：langchain 会给 o1 自动补 temperature=1，
+    # 只有 None 能让各 provider 都不把该字段写进请求体（见 temperature_policy）。
+    kwargs["temperature"] = tp.resolve(model_cfg, model_key=model_name)
 
     # OpenRouter 的两处 provider 差异在这里统一适配：timeout 用毫秒，
     # 并显式关掉 SDK 的隐藏重试（见 _openrouter_client_kwargs）。

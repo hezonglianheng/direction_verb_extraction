@@ -46,6 +46,7 @@ from typing import Iterable
 
 import config
 import file_paths
+import temperature_policy as tp
 from corpus_metadata import normalize_corpus_type
 from evaluate import data, metrics
 from evaluate.inference import (
@@ -308,6 +309,7 @@ def _fallback_model_info(spec: ModelSpec, error: str) -> dict:
         "model_name": None,
         "endpoint": None,
         "temperature": None,
+        "temperature_enabled": tp.enabled(),
         "proxy_mode": spec.proxy_mode,
         "request": {},
         "batch": {"enabled": False, "protocol": None, "endpoint": None, "disabled_reason": ""},

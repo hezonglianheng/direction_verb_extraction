@@ -62,6 +62,7 @@ from pydantic import BaseModel
 import agents as agent_factory
 import config
 import retry
+import temperature_policy as tp
 from annotate import prompt_cache as pc
 from annotate import token_usage as tu
 from file_paths import resolve_cache_path, sidecar_paths
@@ -188,7 +189,12 @@ class BatchProfile:
     model: str
     base_url: str
     api_key: str
-    temperature: float = 0.0
+    temperature: float | None = None
+    """实际要发送的温度；None 表示不发送该字段（总开关关闭或配置缺失/非法）。
+
+    默认不再补 0：0 是一个真实的采样值，把它当成“没配置”的占位会让关闭开关时
+    仍然发出 temperature=0。
+    """
     completion_window: str = "24h"
     protocol: str = "openai"
     """批量协议：openai = 上传 JSONL 文件再建批；openrouter = 直接内联 requests 数组
@@ -228,6 +234,7 @@ class BatchProfile:
             "base_url": _fingerprint_base_url(self.base_url),
             "protocol": self.protocol,
             "temperature": self.temperature,
+            "temperature_enabled": tp.enabled(),
             "completion_window": self.completion_window,
             "extra": json.dumps(self.extra, ensure_ascii=False, sort_keys=True),
         }
@@ -359,19 +366,19 @@ def batch_profile(model_key: str) -> BatchProfile:
             f"模型 {model_key!r} 用 OpenRouter 批量接口时 completion_window 只能是 24h，"
             f"收到 {completion!r}"
         )
-    extra = _flatten_extra(agent_factory.disable_thinking_kwargs(cfg))
+    raw_extra = agent_factory.disable_thinking_kwargs(cfg)
     return BatchProfile(
         model_key=model_key,
         provider=provider,
         model=model,
         base_url=base_url.rstrip("/"),
         api_key=api_key,
-        temperature=float(cfg.get("temperature", 0) or 0),
+        temperature=tp.resolve(cfg, model_key=model_key),
         completion_window=completion,
         protocol=protocol,
         enabled=enabled,
         disabled_reason=reason,
-        extra=extra,
+        extra=_flatten_extra(tp.strip_temperature(raw_extra)),
         proxy_mode=proxy_mode,
         proxy_url=proxy_url,
         # Batch 可能把模型换成 batch.model，缓存家族必须按真正送批的那个标识判断。
@@ -427,8 +434,10 @@ class BatchItem:
                 {"role": "system", "content": pc.system_blocks(self.system_prompt, profile.cache_family)},
                 {"role": "user", "content": pc.user_content(self.content, profile.cache_family)},
             ],
-            "temperature": profile.temperature,
         }
+        # 总开关关闭时任何来源都不写；开启时只写已经解析出的有效数值。
+        if tp.enabled() and profile.temperature is not None:
+            body["temperature"] = profile.temperature
         if self.response_model is not None:
             schema = self.response_model.model_json_schema()
             body["tools"] = [
@@ -442,7 +451,7 @@ class BatchItem:
                 }
             ]
             body["tool_choice"] = {"type": "function", "function": {"name": TOOL_NAME}}
-        body.update(profile.extra)
+        body.update(tp.strip_temperature(profile.extra))
         return body
 
     def parse_response(self, body: dict, *, record_usage: bool = True) -> dict:

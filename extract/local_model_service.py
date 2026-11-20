@@ -35,6 +35,9 @@
     不会启动或关闭任何进程。`base_url` 是唯一的请求地址来源；如果 `local_service` 里
     也写了 `base_url`，必须与它一致，避免“服务起在 A 地址、模型连到 B 地址”。
 
+    温度：`config.LLM_TEMPERATURE_ENABLED` 默认 False，上面示例里的 `temperature`
+    不会发给接口；需要按配置调温时把该开关改为 True（见 temperature_policy.py）。
+
 生命周期：
     `for_model(...)` 是推荐入口。只有本次程序真正拉起服务时才登记 atexit，并在
     上下文结束时停止；如果启动前服务就已经在运行（用户手动起的），只连接、不关闭。

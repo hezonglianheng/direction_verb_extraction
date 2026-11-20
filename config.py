@@ -140,6 +140,20 @@ LLM_RETRY_BACKOFF_MAX_SECONDS = 60.0
 LLM_RETRY_JITTER_SECONDS = 0.5
 """每次退避额外叠加的随机抖动上限，避免多个模型/候选同时重试把限流打得更死"""
 
+# ---- 温度参数（见 temperature_policy.py）----
+LLM_TEMPERATURE_ENABLED = False
+"""是否把模型配置里的 temperature 传给接口（全局总开关）
+
+False（默认）：同步链路、原生 Batch 与批处理回退都不发送 ``temperature``；
+模型配置（含 ``disable_thinking`` 的 extra_body/model_kwargs）写了也一律忽略，
+用于跨厂商统一口径，避免不同模型对默认值/固定值/不支持字段的差异污染实验。
+
+True：模型配置里有可解析的 ``temperature`` 就发送（0 保留）；缺失或非法时向
+stderr 告警一次并省略该字段，请求照常继续，不补任何默认值。
+
+这是唯一的开关，不提供模型级或命令行覆盖：所有阶段（含 pipeline 子进程）
+都从本文件读取，避免同一次跑批里两条链路口径不一致。"""
+
 # ---- 批量推理（见 batch_inference.py）----
 BATCH_MODE = "auto"
 """批量推理的默认模式：auto / native / off（命令行 --batch 可覆盖）
