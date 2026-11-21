@@ -455,6 +455,52 @@ def prepared_init_states(records: list[dict], agents, output_file: str) -> list[
     ]
 
 
+def _state_focus_word(state: dict, key: str) -> str:
+    """取调度用的关注词：优先 state，其次 record；只读，不触发任何模型或查表。"""
+    focus = state.get(key)
+    if not isinstance(focus, dict):
+        record = state.get("record") or {}
+        focus = record.get(key) if isinstance(record, dict) else None
+    if not isinstance(focus, dict):
+        return ""
+    word = focus.get("word")
+    return word if isinstance(word, str) else ""
+
+
+def cache_order_key(state: dict) -> tuple:
+    """按稳定前缀的主要来源（两侧关注词）排序，原顺序作稳定兜底。
+
+    feature 示例只随关注词精确变化；schema 示例与候选随关注词所属词条变化。
+    把同一关注词的记录连续提交，能让同一条 5 分钟缓存前缀在冷启动后连续命中。
+    judge 的示例还依赖模型生成的 schema 对，初始状态阶段无法预知，因此这里只做
+    能确定的部分，不改图、不提前推断下游结果。
+    """
+    record = state.get("record") if isinstance(state.get("record"), dict) else {}
+    candidate = record.get("candidate") if isinstance(record.get("candidate"), dict) else {}
+    line_no = record.get("line_no")
+    candidate_index = record.get("candidate_index", candidate.get("candidate_index", 0))
+    return (
+        _state_focus_word(state, "focus_word"),
+        _state_focus_word(state, "focus_word_b"),
+        line_no if isinstance(line_no, int) else -1,
+        candidate_index if isinstance(candidate_index, int) else 0,
+    )
+
+
+def order_states_for_cache(states: list[dict]) -> list[dict]:
+    """稳定排序后的调度视图；不修改原始列表，也不改变最终落盘顺序。
+
+    ResultWriter.finish() 会按 (line_no, candidate.index) 重排正式结果，因此调度
+    顺序与最终 JSONL/CSV 顺序解耦。排序只影响请求发送次序，不改变状态集合。
+    """
+    return [
+        state
+        for _, state in sorted(
+            enumerate(states), key=lambda pair: (cache_order_key(pair[1]), pair[0])
+        )
+    ]
+
+
 def prepared_pair_node(state: dict) -> dict:
     """读取已在替换阶段检查好的句对，筛选结论只作来源证据，不再请求 LLM。"""
     record = state["record"]

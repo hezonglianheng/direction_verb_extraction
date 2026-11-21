@@ -46,7 +46,9 @@ from typing import Iterable
 
 import config
 import file_paths
+import sync_cache
 import temperature_policy as tp
+from annotate.material_paths import annotation_material_paths
 from corpus_metadata import normalize_corpus_type
 from evaluate import data, metrics
 from evaluate.inference import (
@@ -81,6 +83,7 @@ class ModelPlan:
     report_path: Path
     details_path: Path | None
     cache_path: Path | None
+    sync_path: Path | None = None
 
 
 @dataclass
@@ -158,6 +161,18 @@ def add_batch_args(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=config.BATCH_CHUNK_SIZE,
         help=f"一个原生 batch 最多包含多少条请求（默认 {config.BATCH_CHUNK_SIZE}）",
+    )
+    group.add_argument(
+        "--sync-cache",
+        default=None,
+        help="可选的同步成功节点结果 sidecar 路径（默认不写）。与 --batch-cache 分开，"
+        "只保存已通过业务校验的成功结果；配合 --sync-resume 可在中断后只补缺失节点。"
+        "原生 Batch 成功结果不会写入本 sidecar，请继续用 --batch-resume",
+    )
+    group.add_argument(
+        "--sync-resume",
+        action="store_true",
+        help="复用 --sync-cache 的旧成功结果并继续本轮；必须显式指定 --sync-cache",
     )
 
 
@@ -237,6 +252,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "--batch-resume 必须显式指定 --batch-cache 的旧缓存路径；"
             "每次运行生成新时间戳，不能用新默认缓存代替续跑"
         )
+    if args.sync_resume and not args.sync_cache:
+        parser.error("--sync-resume 必须显式指定 --sync-cache 的旧缓存路径")
     try:
         args.corpus_type = _corpus_type(args.corpus_type)
     except argparse.ArgumentTypeError as exc:
@@ -388,7 +405,16 @@ def _build_plans(models: list[str], out_dir: Path, args: argparse.Namespace, run
                 model_key=stem if args.batch_cache and multi_model else None,
                 multi_model=bool(args.batch_cache) and multi_model,
             )
-        plans.append(ModelPlan(model, report_path, details_path, cache_path))
+        sync_path = None
+        sync_cache_arg = getattr(args, "sync_cache", None)
+        if sync_cache_arg:
+            sync_path = file_paths.resolve_cache_path(
+                sync_cache_arg,
+                report_path,
+                model_key=stem if multi_model else None,
+                multi_model=multi_model,
+            )
+        plans.append(ModelPlan(model, report_path, details_path, cache_path, sync_path))
     return plans
 
 
@@ -402,6 +428,8 @@ def _outputs(plans: list[ModelPlan]) -> tuple[list[Path], list[Path]]:
         if plan.cache_path is not None:
             sidecars.extend(cache_sidecar_paths(plan.cache_path))
             sidecars.append(Path(f"{plan.cache_path}.lock"))
+        if plan.sync_path is not None:
+            sidecars.extend(sync_cache.sidecar_paths(plan.sync_path))
     return outputs, sidecars
 
 
@@ -640,6 +668,7 @@ def _build_report(
         "failures_by_reason": dict(failure_reasons.most_common()),
         "batch": _batch_execution(outcome.batch if outcome is not None else None),
         "batch_error": outcome.batch_error if outcome is not None else None,
+        "sync_cache": outcome.sync_cache if outcome is not None else None,
         "sync_retries": outcome.sync_retries if outcome is not None else 0,
         "model_elapsed_seconds": outcome.elapsed_seconds if outcome is not None else None,
         "run": {
@@ -651,6 +680,7 @@ def _build_report(
             "report": str(plan.report_path),
             "details": str(plan.details_path) if plan.details_path is not None else None,
             "batch_cache": str(plan.cache_path) if plan.cache_path is not None else None,
+            "sync_cache": str(plan.sync_path) if plan.sync_path is not None else None,
         },
         "evaluation_note": EVALUATION_NOTE,
         "error": error,
@@ -731,6 +761,8 @@ def _run_one(
             timeout_seconds=args.batch_timeout_seconds,
             chunk_size=args.batch_chunk_size,
             resume=args.batch_resume,
+            sync_cache_path=plan.sync_path,
+            sync_resume=bool(getattr(args, "sync_resume", False)),
             log=log,
         )
 
@@ -808,6 +840,7 @@ def _run_one(
                 "report": str(plan.report_path),
                 "details": str(plan.details_path) if plan.details_path is not None else None,
                 "batch_cache": str(plan.cache_path) if plan.cache_path is not None else None,
+                "sync_cache": str(plan.sync_path) if plan.sync_path is not None else None,
             },
             "evaluation_note": EVALUATION_NOTE,
             "error": error,
@@ -903,7 +936,10 @@ def main(argv: list[str] | None = None) -> int:
 
     output_paths, sidecars = _outputs(plans)
     input_files = file_paths.collect_jsonl_inputs(args.corpus, output_paths=output_paths + sidecars)
-    _validate_paths(input_files, plans, args.overwrite)
+    # 同步 sidecar 也会写文件：把评测实际读取的配置表/示例/提示语一并当作只读输入，
+    # 防止 --sync-cache 指到它们时被当成缓存清空。报告里的输入清单仍只列语料。
+    _validate_paths(
+        [*input_files, *annotation_material_paths(args.corpus_type)], plans, args.overwrite)
     _reserve_outputs(plans, args.overwrite)
     dataset = data.collect_samples(input_files)
     selected, selection = _select(dataset, args.offset, args.limit)

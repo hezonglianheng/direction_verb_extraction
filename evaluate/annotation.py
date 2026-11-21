@@ -67,11 +67,18 @@ class ModelOnlyJudgeAgent(sa.JudgeAgent):
             focus_word, focus_word_b,
             "评测禁用判定查表，直接采用模型结论", examples,
         )
-        try:
-            verdict = self._invoke(content)
-        except Exception as exc:
-            return tables.judgement_from_model(local, None, error=f"调用失败：{exc!r}")
-        return tables.judgement_from_model(local, verdict.model_dump())
+        stored = self._sync_cache_lookup(content)
+        if stored is not None and stored.get("source") == "llm":
+            return stored
+        with self._track_sync_execution() as marker:
+            try:
+                verdict = self._invoke(content)
+            except Exception as exc:
+                return tables.judgement_from_model(local, None, error=f"调用失败：{exc!r}")
+        result = tables.judgement_from_model(local, verdict.model_dump())
+        if marker["used"] and result.get("source") == "llm":
+            self._sync_cache_put(content, result)
+        return result
 
 
 class EvaluationAllInOneAgent(sa.AllInOneAgent):

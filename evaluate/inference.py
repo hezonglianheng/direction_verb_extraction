@@ -17,11 +17,13 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 from urllib.parse import urlsplit, urlunsplit
 
+import config
 import file_paths
 import retry
+import sync_cache
 import temperature_policy as tp
 import utils
 from evaluate.data import EvalSample
@@ -68,6 +70,7 @@ class ModelOutcome:
     elapsed_seconds: float = 0.0
     pipeline: dict = field(default_factory=dict)
     agent_stats: dict = field(default_factory=dict)
+    sync_cache: dict | None = None
 
 
 def _sha256(text: str) -> str:
@@ -89,23 +92,15 @@ def _error(kind: str, message: str) -> dict:
 
 
 def sanitize_text(text: str, cfg: dict | None = None) -> str:
-    """日志/缓存/报告统一脱敏：API key、Bearer、URL 账号与查询参数。"""
+    """日志/缓存/报告统一脱敏：API key、嵌套认证值、Bearer、URL 账号与查询参数。"""
     cfg = cfg or {}
     text = str(text or "")
-    secret = str(cfg.get("api_key") or "")
-    if len(secret) >= 4:
-        text = text.replace(secret, "***")
+    secrets = sync_cache.sensitive_values(cfg)
     proxy = cfg.get("proxy")
     if isinstance(proxy, str) and "://" in proxy:
         text = text.replace(proxy, redact_url(proxy))
-    text = re.sub(r"(?i)(authorization\s*:\s*bearer\s+)\S+", r"\1***", text)
-    text = re.sub(r"(?i)\bbearer\s+\S+", "Bearer ***", text)
-    text = re.sub(r"\bsk-[A-Za-z0-9_-]{8,}", "sk-***", text)
-    # URL 里的账号/密码（含 http/socks5 代理）与查询参数（token/api_key 常在这里）。
-    text = re.sub(r"(?i)((?:https?|socks5h?)://)[^/@\s'\"]+@", r"\1***@", text)
-    text = re.sub(
-        r"(?i)((?:https?|socks5h?)://[^\s'\"<>]+)\?[^\s'\"<>]*", r"\1?***", text
-    )
+    # 与 sync sidecar 共用同一套 URL/Bearer/sk-/已知秘密脱敏，避免两套正则漂移。
+    text = sync_cache.redact_text(text, secrets)
     text = re.sub(r"(?i)\b(api[_-]?key|token|secret)=([^&\s,;]+)", r"\1=***", text)
     return text
 
@@ -488,6 +483,37 @@ def _sync_structured_output(spec: ModelSpec) -> str:
         return "unknown"
 
 
+def sync_model_identity(spec: ModelSpec, agents) -> dict:
+    """同步 sidecar 的身份：不掺入 Batch 或本地服务启停配置。
+
+    身份保留脱敏后的详细配置结构（键名、非敏感值、生成参数、请求策略都能逐字段
+    对比），敏感值统一为 ``<redacted>``，base_url 去掉账号与查询参数。因此换密钥
+    不会让旧结果失效；换模型、端点、温度、结构化输出策略或提示材料会拒绝续跑。
+    """
+    from agents import disable_thinking_kwargs
+
+    cfg = spec.cfg
+    return {
+        "schema_version": sync_cache.SCHEMA_VERSION,
+        "model": {
+            "model_key": spec.key,
+            "model": cfg.get("model") or cfg.get("model_name"),
+            "provider": cfg.get("model_provider") or cfg.get("provider"),
+            "base_url": sync_cache.redact_url(cfg.get("base_url")),
+            "temperature": tp.resolve(cfg, model_key=spec.key),
+            "generation": sync_cache.redact(disable_thinking_kwargs(cfg)),
+            "structured_output": _sync_structured_output(spec),
+            "prompt_cache": cfg.get("prompt_cache"),
+        },
+        "temperature_enabled": tp.enabled(),
+        "prompt_cache_enabled": bool(config.PROMPT_CACHE_ENABLED),
+        "configuration": sync_cache.redact_config(cfg),
+        "policy": sync_cache.redact(spec.policy),
+        "proxy_mode": spec.proxy_mode,
+        "materials": sync_cache.materials_fingerprint(agents),
+    }
+
+
 def public_reproducibility(
     spec: ModelSpec, pipeline: dict | None, *, batch_mode: str, workers: int,
     poll_seconds: float, timeout_seconds: float, chunk_size: int, outcome,
@@ -549,6 +575,32 @@ def prepare_requests(samples: list[EvalSample], pipeline) -> RequestPlan:
         requests.setdefault(key, RequestSpec(key, state))
         sample_to_request[sample.key] = key
     return RequestPlan(requests, sample_to_request)
+
+
+def _focus_word(state: dict, key: str) -> str:
+    focus = state.get(key) if isinstance(state, dict) else None
+    word = focus.get("word") if isinstance(focus, dict) else None
+    return word if isinstance(word, str) else ""
+
+
+def ordered_requests(items: Iterable[RequestSpec]) -> list[RequestSpec]:
+    """按两侧关注词稳定排序的调度视图；不改变逻辑键、去重与最终预测映射。
+
+    evaluate step 0 的 SynonymAgent 没有 user 稳定段，排序通常保持原序；step 1/2
+    的 all_in_one 与 step 3/4 的 feature/schema 则会按关注词复用示例前缀。真正让
+    同前缀请求不要同时冷启动的，是 BaseAgent._invoke_sync 的前缀门控；这里只负责
+    让同组请求在队列里连续出现。
+    """
+    indexed = list(enumerate(items))
+    indexed.sort(
+        key=lambda pair: (
+            _focus_word(pair[1].state, "focus_word"),
+            _focus_word(pair[1].state, "focus_word_b"),
+            pair[0],
+            pair[1].key,
+        )
+    )
+    return [item for _, item in indexed]
 
 
 def _request_sample(item: RequestSpec) -> EvalSample:
@@ -667,7 +719,10 @@ def _validate_cache_identity(cache_path, metadata, spec, *, resume, private_iden
 
 
 def _run_sync(pipeline, outcome, *, workers, cfg, items=None, session=None, scopes=None):
-    todo = list(outcome.plan.requests.values()) if items is None else list(items)
+    todo = (
+        ordered_requests(outcome.plan.requests.values())
+        if items is None else list(items)
+    )
 
     def work(item):
         def invoke():
@@ -773,7 +828,10 @@ def _run_batch(spec, pipeline, outcome, *, workers, cache_path, poll_seconds,
         persist_lifecycle()
     if session.client is not None:
         session.client = SubmissionGuard(session.client)
-    states = [{"key": item.key} for item in outcome.plan.requests.values()]
+    states = [
+        {"key": item.key}
+        for item in ordered_requests(outcome.plan.requests.values())
+    ]
     scopes = {state["key"]: pipeline.agents.new_budget_scope() for state in states}
 
     def invoke(state):
@@ -808,7 +866,10 @@ def _run_batch(spec, pipeline, outcome, *, workers, cache_path, poll_seconds,
             before = sum(agent.stats()["requests"] for agent in pipeline.agents.values())
             _run_sync(
                 pipeline, outcome, workers=workers, cfg=spec.cfg, session=session, scopes=scopes,
-                items=(item for key, item in outcome.plan.requests.items() if key not in outcome.predictions),
+                items=ordered_requests(
+                    item for key, item in outcome.plan.requests.items()
+                    if key not in outcome.predictions
+                ),
             )
             session.fallback_items = sum(agent.stats()["requests"] for agent in pipeline.agents.values()) - before
         else:
@@ -849,6 +910,8 @@ def run_model(
     timeout_seconds: float,
     chunk_size: int,
     resume: bool,
+    sync_cache_path: str | Path | None = None,
+    sync_resume: bool = False,
     log: Callable[[str], None] = print,
 ) -> ModelOutcome:
     """每个模型独立 pipeline；五档同步/Batch 共用 Task 1 的完整业务节点。"""
@@ -868,27 +931,46 @@ def run_model(
     if resume and not use_batch:
         raise ValueError("Batch 续跑需要启用的原生批处理配置")
 
-    if use_batch:
-        if cache_path is None:
-            raise ValueError("批处理需要 cache_path")
-        _run_batch(
-            spec,
-            pipeline,
-            outcome,
-            workers=workers,
-            cache_path=cache_path,
-            poll_seconds=poll_seconds,
-            timeout_seconds=timeout_seconds,
-            chunk_size=chunk_size,
-            resume=resume,
-            allow_sync_fallback=batch_mode == "auto",
-            log=log,
+    sync_store = None
+    if sync_cache_path is not None:
+        sync_store = sync_cache.SyncResultStore(
+            sync_cache_path,
+            sync_model_identity(spec, pipeline.agents),
+            resume=sync_resume,
+            logger=lambda message: log(sanitize_text(message, spec.cfg)),
+            # 成功回复也可能在 reason 里回显 URL/凭据；与 Batch sidecar 同口径，
+            # 先脱敏再落盘，而不是等结果进入报告时才处理。
+            sanitize=lambda value: _sanitize_value(value, spec.cfg),
         )
-    else:
-        if batch_mode != "off" and plan.requests:
-            description = spec.batch.describe() if spec.batch is not None else "当前模型没有原生批量入口"
-            log(sanitize_text(f"批处理：{description}（回退同步执行）", spec.cfg))
-        _run_sync(pipeline, outcome, workers=workers, cfg=spec.cfg)
+        for agent in pipeline.agents.values():
+            agent.sync_store = sync_store
+        outcome.sync_cache = sync_store.summary()
+    try:
+        if use_batch:
+            if cache_path is None:
+                raise ValueError("批处理需要 cache_path")
+            _run_batch(
+                spec,
+                pipeline,
+                outcome,
+                workers=workers,
+                cache_path=cache_path,
+                poll_seconds=poll_seconds,
+                timeout_seconds=timeout_seconds,
+                chunk_size=chunk_size,
+                resume=resume,
+                allow_sync_fallback=batch_mode == "auto",
+                log=log,
+            )
+        else:
+            if batch_mode != "off" and plan.requests:
+                description = spec.batch.describe() if spec.batch is not None else "当前模型没有原生批量入口"
+                log(sanitize_text(f"批处理：{description}（回退同步执行）", spec.cfg))
+            _run_sync(pipeline, outcome, workers=workers, cfg=spec.cfg)
+    finally:
+        if sync_store is not None:
+            outcome.sync_cache = sync_store.summary()
+            sync_store.close()
 
     outcome.agent_stats = _sanitize_value(
         {name: agent.stats() for name, agent in pipeline.agents.items()}, spec.cfg)

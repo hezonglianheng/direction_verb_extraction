@@ -285,6 +285,18 @@ def build_parser() -> argparse.ArgumentParser:
         "见 ResultWriter.finish），供 Excel 查看；列序见 spatial_tools.PAIR_CSV_COLUMNS。"
         "正式 pair/synonym/all_in_one 图均可导出；single/alter_check 诊断图不导出",
     )
+    parser.add_argument(
+        "--sync-cache",
+        default=None,
+        help="可选的同步成功节点结果 sidecar 路径（默认不写）。只保存已通过业务校验的成功结果，"
+        "模型/提示词/输出 schema/配置表变化时拒绝复用；配合 --sync-resume 可在中断后只补缺失节点。"
+        "原生 Batch 结果仍由 --batch-cache 管理，不会写入本 sidecar",
+    )
+    parser.add_argument(
+        "--sync-resume",
+        action="store_true",
+        help="复用 --sync-cache 的旧成功结果并继续本轮；必须显式指定 --sync-cache",
+    )
     return parser
 
 
@@ -335,6 +347,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--print-prompt 只支持正式 pair/synonym/all_in_one 图；诊断图的动态执行不能离线预览")
     if args.graph not in FORMAL_GRAPHS and (args.all_candidates or args.no_syntax):
         parser.error("--all-candidates / --no-syntax 仅为正式标注的旧命令兼容参数，不适用于诊断图")
+    if args.sync_resume and not args.sync_cache:
+        parser.error("--sync-resume 必须显式指定 --sync-cache 的旧缓存路径")
     return args
 
 

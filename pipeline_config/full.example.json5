@@ -139,6 +139,9 @@
     batch_poll_seconds: 30.0,
     batch_timeout_seconds: 86400.0,
     batch_chunk_size: 5000,
+    // 可选：纯同步成功节点结果 sidecar；null = 不写。续跑时必须显式给同一个路径。
+    sync_cache: null,
+    sync_resume: false,
 
     // 以下两项是流水线全局参数，只能用命令行；这里写 null 表示不启用模块内配置。
     corpus_type: null,

@@ -211,6 +211,12 @@ class _InvocationMetrics:
 
 _CURRENT_INVOCATION_METRICS = contextvars.ContextVar("spatial_agent_invocation_metrics", default=None)
 
+# 一次业务调用是否真正进入了同步链路。Batch 命中只回放结果，不会翻转这个标记；
+# 同步 sidecar 只允许写入 used=True 的结果，避免把原生 Batch 的答案混进同步缓存。
+_SYNC_EXECUTION: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "spatial_agent_sync_execution", default=None
+)
+
 
 class _ModelStartProbe(BaseCallbackHandler):
     """首个模型开始使用已预留名额，内部后续调用在开始之前另约预算。
@@ -1061,6 +1067,12 @@ class BaseAgent:
     只记成功的那几种 source，失败的不入缓存（一次接口抖动被缓存住，同一条语料的候选会成片
     记成同一个错；留着失败按候选重试，代价只是失败的那几个多问一次）。见 _cache_put。
     """
+    SYNC_CACHEABLE_SOURCES: tuple[str, ...] | None = None
+    """可写入跨进程 sidecar 的 source；None = 沿用 CACHEABLE_SOURCES。
+
+    JudgeAgent 的进程内缓存刻意留空（b 侧逐候选不同，收益为零），但它的 llm 判定
+    是 pair 图最贵的节点之一，跨进程续跑仍值得复用，所以单独覆盖为 ("llm",)。
+    """
 
     def __init__(
         self,
@@ -1146,6 +1158,8 @@ class BaseAgent:
             "roundtrips": 0,
             "failed": 0,
             "cache_hits": 0,
+            # 跨进程同步成功结果命中的次数（见 sync_cache.SyncResultStore）
+            "sync_cache_hits": 0,
             # A3：超预算而没发出的请求数。它与 failed 是两件事——failed 是发出去没成，
             # budget_exceeded 是**根本没发**；合起来看才知道「省下了多少」与「漏了多少」。
             "budget_exceeded": 0,
@@ -1179,8 +1193,10 @@ class BaseAgent:
             "reasoning_tokens": 0,
         }
         self._stats_lock = threading.Lock()
+        self.sync_store = None
+        """可选的跨进程成功结果缓存（sync_cache.SyncResultStore）；由跑批入口注入。"""
         self._cache_family_value: str | None = None
-        """提示词缓存家族（"anthropic" / "none"），首次发请求时按模型配置算一次"""
+        """提示词缓存家族（"anthropic" / "qwen" / "explicit" / "none"），首次发请求时按模型配置算一次"""
         self._schema_key_value: str | None = None
         """结构化输出 schema 指纹（见 batch_inference.item_key），首次需要请求键时算一次"""
 
@@ -1404,6 +1420,9 @@ class BaseAgent:
         attempt_no = 0
         scope = _CURRENT_BUDGET.get()
         metrics = self._invocation_metrics()
+        marker = _SYNC_EXECUTION.get()
+        if marker is not None:
+            marker["used"] = True
         sent_any = False
         last_error = None
 
@@ -1413,6 +1432,10 @@ class BaseAgent:
                 self._stats["internal_requests"] += int(internal)
             if metrics is not None:
                 metrics.add(requests=1)
+
+        gate_key = pc.warmup_key(
+            self.model_key, self.system_prompt, content, self._cache_family()
+        )
 
         def invoke_once():
             nonlocal attempt_no, sent_any, last_error
@@ -1424,10 +1447,19 @@ class BaseAgent:
             )
             payload = pc.user_content(content, self._cache_family())
             sent_any = True
-            try:
+
+            def call():
                 return self._model().invoke(
                     {"messages": [{"role": "user", "content": payload}]}, config={"callbacks": [probe]}
                 )
+
+            try:
+                # 只门控首个真实请求：缓存写入发生在响应之后，先让 leader 完成；
+                # 一旦首次尝试失败就立即放行等待者，后续重试/退避不再占着同前缀。
+                if attempt_no == 1 and gate_key:
+                    with pc.warmup_gate(gate_key):
+                        return call()
+                return call()
             except Exception as exc:
                 last_error = exc
                 raise
@@ -1510,16 +1542,81 @@ class BaseAgent:
         with self._verdict_lock:
             self._verdicts[content] = copy.deepcopy(result)
 
+    @contextmanager
+    def _track_sync_execution(self):
+        """标记本次业务调用是否真的走到了同步模型链路。
+
+        BatchSession 活跃时同步 sidecar 不参与读写；但 Batch 的同步回退仍会调用
+        `_invoke_sync`，那部分结果属于真正同步执行，可以在允许时写入。用 ContextVar
+        而不是实例布尔值，避免并发线程互相串标记。
+        """
+        marker = {"used": False}
+        token = _SYNC_EXECUTION.set(marker)
+        try:
+            yield marker
+        finally:
+            _SYNC_EXECUTION.reset(token)
+
+    def _sync_cache_key(self, content: str) -> str:
+        """跨进程 sidecar 的键；与 Batch 结果键共用同一套 agent/system/schema/content 口径。"""
+        return bi.agent_item_key(self, content)
+
+    def _sync_cache_lookup(self, content: str) -> dict | None:
+        store = getattr(self, "sync_store", None)
+        if store is None or bi.current_session() is not None:
+            # Batch 会话优先：先让 session.lookup 处理已受理/已回放的结果，
+            # 同步缓存不能在这里抢先返回，否则会跳过 Batch job 的续收。
+            return None
+        dumps = store.lookup(self._sync_cache_key(content))
+        if dumps is None:
+            return None
+        with self._stats_lock:
+            self._stats["sync_cache_hits"] += 1
+        return dumps
+
+    def _sync_cache_eligible(self, result: dict) -> bool:
+        """持久化前的业务成功判定；子类可收紧（见 FeatureAgent / AllInOneAgent）。"""
+        allowed = (
+            self.CACHEABLE_SOURCES
+            if self.SYNC_CACHEABLE_SOURCES is None
+            else self.SYNC_CACHEABLE_SOURCES
+        )
+        return result.get("source") in allowed
+
+    def _sync_cache_put(self, content: str, result: dict, *, force: bool = False) -> None:
+        """只把现有 CACHEABLE_SOURCES 认定的成功结果写进 sidecar；失败不落盘。
+
+        ``force`` 只给 AllInOne 这类在解析完成后自行判定成功的调用方使用。
+        """
+        store = getattr(self, "sync_store", None)
+        if store is None or (not force and not self._sync_cache_eligible(result)):
+            return
+        try:
+            store.put(self._sync_cache_key(content), result)
+        except Exception as exc:  # noqa: BLE001 —— sidecar 是可选降费设施，写失败不能中断标注
+            if not getattr(self, "_sync_cache_warned", False):
+                self._sync_cache_warned = True
+                warnings.warn(
+                    f"同步 sidecar 写入失败，续跑可能重复计费：{exc!r}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+
     def _cached_or_ask(self, content: str, ask):
         """查缓存 → 未命中则问一次并（按 source 决定是否）入缓存
 
         并发保护是两层的：查缓存走 _verdict_lock；未命中时先取该 message 的在途锁再问，
         锁内二次查缓存——同一条语料的多个候选同时首问时，只有一个线程真发请求。
+        进程内未命中时再查可选的跨进程 sidecar；sidecar 只存已通过业务校验的成功结果。
         """
         cached = self._cache_get(content)
         if cached is not None:
             self._note_cache_hit()
             return cached
+        stored = self._sync_cache_lookup(content)
+        if stored is not None:
+            self._cache_put(content, stored)
+            return stored
         with self._flight_guard:
             lock = self._flight.setdefault(content, threading.Lock())
         with lock:
@@ -1527,8 +1624,17 @@ class BaseAgent:
             if cached is not None:
                 self._note_cache_hit()
                 return cached
-            result = ask(content)
+            stored = self._sync_cache_lookup(content)
+            if stored is not None:
+                self._cache_put(content, stored)
+                return stored
+            with self._track_sync_execution() as marker:
+                result = ask(content)
             self._cache_put(content, result)
+            if marker["used"] or bi.current_session() is None:
+                # 纯同步运行没有 Batch 会话，结果天然是同步执行；Batch 会话内则
+                # 只有真正走过 _invoke_sync 的回退结果才写 sidecar，回放不算。
+                self._sync_cache_put(content, result)
             return result
 
     def _note_cache_hit(self) -> None:
@@ -1772,7 +1878,8 @@ class RealityAgent(BaseAgent):
                 skipped  没有句子/关注词、无从判断因而未发的数量
                 reused   直接复用了记录里 screening 判定、未发请求的数量
         """
-        stat = {"queries": len(queries), "unique": 0, "asked": 0, "failed": 0, "skipped": 0, "reused": 0}
+        stat = {"queries": len(queries), "unique": 0, "asked": 0, "failed": 0,
+                "skipped": 0, "reused": 0, "cache_reused": 0}
         contents: dict[str, None] = {}  # 去重且保序（dict 自 3.7 起保插入序）
         for sentence, focus_word in queries:
             if not sentence or not (focus_word or {}).get("word"):
@@ -1788,7 +1895,16 @@ class RealityAgent(BaseAgent):
         if not self.llm:
             self._log_agent_event("prefill_finished", **stat)
             return stat
-        todo = [content for content in contents if self._cache_get(content) is None]
+        todo = []
+        for content in contents:
+            if self._cache_get(content) is not None:
+                continue
+            stored = self._sync_cache_lookup(content)
+            if stored is not None:
+                self._cache_put(content, stored)
+                stat["cache_reused"] += 1
+                continue
+            todo.append(content)
         stat["asked"] = len(todo)
         if todo:
             # 先报「开始」再进线程池：下面的汇总行要等全部判完才打印，而单条请求
@@ -1799,6 +1915,7 @@ class RealityAgent(BaseAgent):
         with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
             for content, result in zip(todo, pool.map(self._ask, todo)):
                 self._cache_put(content, result)
+                self._sync_cache_put(content, result)
                 if result.get("source") != "llm":
                     stat["failed"] += 1
                 done += 1
@@ -2290,6 +2407,13 @@ class FeatureAgent(BaseAgent):
             "validation": validation,
         }
 
+    def _sync_cache_eligible(self, result: dict) -> bool:
+        """闭集越界/缺失的特征结果不能跨进程复用，否则续跑会跳过人工复核。"""
+        if not super()._sync_cache_eligible(result):
+            return False
+        validation = result.get("validation")
+        return not isinstance(validation, dict) or validation.get("ok") is True
+
     def run(self, sentence: str, focus_word: dict) -> dict:
         if not self.llm:
             return {"features": {}, "source": "no_llm", "reason": "未调用 LLM（--no-llm）"}
@@ -2623,6 +2747,8 @@ class JudgeAgent(BaseAgent):
     CONFIG_NOTE = "config_files/<语料类型>/judge_table.csv（类型见 --corpus-type，默认 localization）"
     PROMPT_FILES = (JUDGE_PROMPT_FILE,)
     VERDICT_MODEL = JudgeVerdict
+    SYNC_CACHEABLE_SOURCES = ("llm",)
+    """进程内不缓存（见 CACHEABLE_SOURCES），但跨进程 sidecar 可复用 llm 判定。"""
 
     def __init__(self, *, table: dict | None = None, examples_root: str | Path | None = None, **kwargs):
         super().__init__(**kwargs)
@@ -2662,11 +2788,20 @@ class JudgeAgent(BaseAgent):
             sentence_a, sentence_b, schema_a, schema_b, features_a, features_b,
             focus_word, focus_word_b, situation, examples,
         )
-        try:
-            verdict: JudgeVerdict = self._invoke(content)
-        except Exception as e:
-            return tables.judgement_from_model(local, None, error=f"调用失败：{e!r}")
-        return tables.judgement_from_model(local, verdict.model_dump())
+        # judge 不走 _cached_or_ask（b 侧逐候选不同，进程内去重收益为零），
+        # 但跨进程 sidecar 仍可在中断后续跑时复用同一条 llm 判定。
+        stored = self._sync_cache_lookup(content)
+        if stored is not None and stored.get("source") == "llm":
+            return copy.deepcopy(stored)
+        with self._track_sync_execution() as marker:
+            try:
+                verdict: JudgeVerdict = self._invoke(content)
+            except Exception as e:
+                return tables.judgement_from_model(local, None, error=f"调用失败：{e!r}")
+        result = tables.judgement_from_model(local, verdict.model_dump())
+        if marker["used"] and result.get("source") == "llm":
+            self._sync_cache_put(content, result)
+        return result
 
     def _content(
         self,
@@ -2768,6 +2903,8 @@ class AllInOneAgent(BaseAgent):
     CONFIG_NOTE = "config_files/<语料类型>/{feature_classes.json5,schema_table.json5,judge_table.csv}"
     DEFAULT_STRUCTURED_RETRY = False
     CACHEABLE_SOURCES = ("llm",)
+    SYNC_CACHEABLE_SOURCES = ()
+    """原始结构化结果要等 _resolve() 完成特征/图式/判定校验后才写侧车。"""
 
     def __init__(self, *, feature_classes: list[dict] | None = None, schema_table: dict | None = None,
                  judge_table: dict | None = None, examples_root: str | Path | None = None, **kwargs):
@@ -2924,19 +3061,47 @@ class AllInOneAgent(BaseAgent):
         return {"feature_results": feature_results, "schema": schemas, "judgement": judgement,
                 "source": source, "reason": reason}
 
+    def _sync_result_is_valid(self, result: dict) -> bool:
+        """完整标注的成功条件：两侧特征、图式与判定都通过现有解析校验。"""
+        if result.get("source") != "llm":
+            return False
+        features = result.get("feature_results") or {}
+        schemas = result.get("schema") or {}
+        judgement = result.get("judgement") or {}
+        for side in ("a", "b"):
+            validation = (features.get(side) or {}).get("validation") or {}
+            if validation.get("ok") is not True:
+                return False
+            schema = schemas.get(side) or {}
+            if schema.get("source") not in {"llm", "llm_free", "table"}:
+                return False
+            if not isinstance(schema.get("name"), str) or not schema["name"].strip():
+                return False
+        return (
+            judgement.get("source") in {"llm", "table"}
+            and isinstance(judgement.get("same_meaning"), bool)
+        )
+
     def run(self, sentence_a: str, sentence_b: str, focus_word_a: dict, focus_word_b: dict) -> dict:
         started = time.perf_counter()
         metrics = _InvocationMetrics(self)
         token = _CURRENT_INVOCATION_METRICS.set(metrics)
         dumps, error = None, None
+        content = None
         try:
             if self.llm:
                 try:
-                    dumps = self._cached_or_ask(self._content(sentence_a, sentence_b, focus_word_a, focus_word_b),
-                                                 self._ask)["raw"]
+                    content = self._content(sentence_a, sentence_b, focus_word_a, focus_word_b)
+                    dumps = self._cached_or_ask(content, self._ask)["raw"]
                 except Exception as exc:
                     error = f"调用失败：{exc!r}"
             result = self._resolve(dumps, focus_word_a, focus_word_b, error=error)
+            if (
+                content is not None and dumps is not None
+                and bi.current_session() is None
+                and self._sync_result_is_valid(result)
+            ):
+                self._sync_cache_put(content, {"raw": dumps, "source": "llm"}, force=True)
             result["meta"] = {
                 "model": self.model_key, "corpus_type": self.corpus_type,
                 **metrics.snapshot(),

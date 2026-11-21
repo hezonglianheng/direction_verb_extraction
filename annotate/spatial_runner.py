@@ -56,15 +56,18 @@ import agent_log
 import agents as agent_factory
 import batch_inference as bi
 import config
+import sync_cache
 from replace import corpus_pairs as cp
 import file_paths
 from annotate import limit_sampler as ls
+from annotate import material_paths
 from annotate import spatial_agents as sa
 from annotate import spatial_graphs as sg
 from annotate import spatial_tools as st
 from annotate import token_usage as tu
 from annotate import voting
 from annotate.cli_constants import DEFAULT_MODEL, FORMAL_GRAPHS
+import temperature_policy as tp
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CORPUS = _PROJECT_ROOT / "results" / st.CORPUS_TYPE_CORPORA[st.DEFAULT_CORPUS_TYPE]
@@ -504,12 +507,16 @@ def _print_agent_stats(stats: dict[str, dict]) -> None:
             part += f"／框架内部额外开始 {item['internal_requests']} 次"
         if item.get("batch_items") or item.get("batch_hits"):
             part += f"／批处理登记 {item.get('batch_items', 0)} 项、回放 {item.get('batch_hits', 0)} 次"
+        if item.get("sync_cache_hits"):
+            part += f"／跨进程同步缓存命中 {item['sync_cache_hits']} 次"
         parts.append(part + f"／本地结果复用 {item['cache_hits']} 次")
     total = sum(item.get("actual_requests", 0) for item in stats.values())
     failed = sum(item.get("failed", 0) for item in stats.values())
     hits = sum(item["cache_hits"] for item in stats.values())
+    disk_hits = sum(item.get("sync_cache_hits", 0) for item in stats.values())
     tail = f"，{failed} 次失败" if failed else ""
-    print(f"模型调用账（同步模型开始共 {total} 次{tail}，本地结果复用 {hits} 次；原生 Batch 另计）：" + "；".join(parts))
+    print(f"模型调用账（同步模型开始共 {total} 次{tail}，本地结果复用 {hits} 次"
+          f"／跨进程同步缓存命中 {disk_hits} 次；原生 Batch 另计）：" + "；".join(parts))
     total_usage = tu.totals(stats.values())
     if total_usage["usage_observed"] or total_usage["usage_missing"]:
         print(
@@ -642,6 +649,26 @@ def _reference_inputs(args) -> tuple[Path, ...]:
     return (Path(value),) if value else ()
 
 
+def _material_inputs(args, corpus_type: str) -> tuple[Path, ...]:
+    """标注实际读取的配置表、示例与提示语；诊断图的 --alter-rules 也在内。"""
+    paths = list(material_paths.annotation_material_paths(corpus_type))
+    alter_rules = getattr(args, "alter_rules", None)
+    if alter_rules:
+        paths.append(Path(alter_rules))
+    return tuple(paths)
+
+
+def _order_states_for_run(states: list[dict], agents) -> list[dict]:
+    """缓存友好排序；整批预算有限时保持原顺序，避免改变谁拿到唯一请求。"""
+    if not config.PROMPT_CACHE_ENABLED:
+        return states
+    first = next(iter(agents.values()), None)
+    budget = getattr(first, "batch_budget", None)
+    if budget is not None and getattr(budget, "max_requests", None) is not None:
+        return states
+    return sg.order_states_for_cache(states)
+
+
 def _build_overrides(args, spec: sg.GraphSpec) -> dict[str, dict]:
     """命令行里会影响 agent 构造的注入项（--alter-rules / --feature-deep）
 
@@ -728,6 +755,55 @@ def _batch_cache_path(args, out_path: str | Path, model_key: str) -> Path:
     )
 
 
+def _sync_cache_path(args, out_path: str | Path, model_key: str) -> Path | None:
+    """可选的同步成功结果 sidecar；未给 --sync-cache 时返回 None。"""
+    if not getattr(args, "sync_cache", None):
+        return None
+    multi_model = bool(getattr(args, "models", None) and len(args.models) > 1)
+    return bi.resolve_cache_path(
+        args.sync_cache,
+        out_path,
+        model_key=voting.safe_model_stem(model_key) if multi_model else model_key,
+        multi_model=multi_model,
+    )
+
+
+def _sync_identity(model_key: str, agents) -> dict:
+    """同步 sidecar 的模型身份：详细但脱敏的配置 + 提示词与配置表摘要。
+
+    保留完整配置结构与非敏感值，便于事后排查为什么拒绝续跑；api_key、认证头与
+    URL 账号/查询参数一律不落盘。Batch 与本地服务启停配置不属于同步请求身份。
+    """
+    cfg = agent_factory.load_model_config(model_key)
+    agent_list = list(agents.values())
+    policy = getattr(agent_list[0], "retry_policy", None) if agent_list else None
+    return {
+        "schema_version": sync_cache.SCHEMA_VERSION,
+        "model": {
+            "model_key": model_key,
+            "model": cfg.get("model") or cfg.get("model_name"),
+            "provider": cfg.get("model_provider") or cfg.get("provider"),
+            "base_url": sync_cache.redact_url(cfg.get("base_url")),
+            "temperature": tp.resolve(cfg, model_key=model_key),
+            "generation": sync_cache.redact(agent_factory.disable_thinking_kwargs(cfg)),
+            "structured_output": agent_factory.structured_output_mode(cfg, model_key),
+            "prompt_cache": cfg.get("prompt_cache"),
+        },
+        "temperature_enabled": tp.enabled(),
+        "prompt_cache_enabled": bool(config.PROMPT_CACHE_ENABLED),
+        "configuration": sync_cache.redact_config(cfg),
+        "policy": sync_cache.redact(policy),
+        "materials": sync_cache.materials_fingerprint(agents),
+    }
+
+
+def _sync_sanitizer(model_key: str):
+    """同步结果落盘前的脱敏器：配置里的秘密 + URL 账号/查询参数 + 常见密钥形态。"""
+    cfg = agent_factory.load_model_config(model_key)
+    secrets = sync_cache.sensitive_values(cfg)
+    return lambda value: sync_cache.sanitize_result(value, secrets)
+
+
 def _validate_multi_model_outputs(args, spec, corpus_path, out_path: Path, model_names: list[str]) -> None:
     """在日志/模型/文件创建之前，同表检查最终结果、所有原始结果及其附属路径。"""
     raw_paths = voting.model_output_paths(out_path, model_names)[1]
@@ -741,7 +817,15 @@ def _validate_multi_model_outputs(args, spec, corpus_path, out_path: Path, model
     if not args.no_llm and getattr(args, "batch", "off") != "off":
         for name, path in raw_paths.items():
             sidecars.extend(bi.sidecar_paths(_batch_cache_path(args, path, name)))
-    file_paths.validate_output_paths([corpus_path, *_reference_inputs(args)], main_outputs + sidecars)
+    if getattr(args, "sync_cache", None) and not args.no_llm:
+        for name, path in raw_paths.items():
+            sync_path = _sync_cache_path(args, path, name)
+            if sync_path is not None:
+                sidecars.extend(sync_cache.sidecar_paths(sync_path))
+    file_paths.validate_output_paths(
+        [corpus_path, *_reference_inputs(args), *_material_inputs(args, args.corpus_type)],
+        main_outputs + sidecars,
+    )
     for path in main_outputs + sidecars:
         if path.exists() and not path.is_file():
             raise ValueError(f"输出路径不是文件：{path}")
@@ -783,19 +867,36 @@ def _execute_run(
             workers=max(1, int(args.workers)),
         )
     csv_columns = spec.csv_columns if not args.no_pairs_csv else ()
-    writer = ResultWriter(
-        out_path,
-        counter_names=spec.counter_names,
-        tally=spec.tally,
-        corpus_type=corpus_type,
-        config_tables=_config_tables(agents),
-        # 成对信息 csv：三条正式图默认导出（--no-pairs-csv 关），列序由图给。
-        csv_columns=csv_columns,
-        model_name=model_key if not args.no_llm else None,
-        overwrite=args.overwrite,
-        progress_prefix="" if verbose else f"[{model_key}] ",
-    )
+    # 同步 sidecar 的身份/锁校验必须先于 ResultWriter：--overwrite --sync-resume
+    # 身份不匹配或锁冲突时，旧结果文件此刻还不能被截断。
+    sync_store = None
+    writer = None
     try:
+        sync_path = _sync_cache_path(args, out_path, model_key)
+        if sync_path is not None and not getattr(args, "no_llm", False):
+            sync_store = sync_cache.SyncResultStore(
+                sync_path,
+                _sync_identity(model_key, agents),
+                resume=bool(getattr(args, "sync_resume", False)),
+                logger=lambda message: print(f"[{model_key}] {message}", flush=True),
+                sanitize=_sync_sanitizer(model_key),
+            )
+            for agent in agents.values():
+                agent.sync_store = sync_store
+        writer = ResultWriter(
+            out_path,
+            counter_names=spec.counter_names,
+            tally=spec.tally,
+            corpus_type=corpus_type,
+            config_tables=_config_tables(agents),
+            # 成对信息 csv：三条正式图默认导出（--no-pairs-csv 关），列序由图给。
+            csv_columns=csv_columns,
+            model_name=model_key if not args.no_llm else None,
+            overwrite=args.overwrite,
+            progress_prefix="" if verbose else f"[{model_key}] ",
+        )
+        if sync_store is not None:
+            writer.extra_summary["sync_cache"] = sync_store.summary()
         graph = spec.build(agents, writer)
         if spec.name in FORMAL_GRAPHS:
             writer.extra_summary["annotation_mode"] = spec.name
@@ -898,8 +999,13 @@ def _execute_run(
         # 一条语料的每个目标词位置各能改出好几个待选句，每个待选句一个状态、一条记录，
         # 所以状态数一般多于语料条数
         states = spec.init_states(records, agents, str(out_path))
+        # 发送次序：同关注词的记录连续提交，让同一条稳定前缀在 5 分钟缓存窗口内
+        # 连续命中。最终落盘顺序仍由 ResultWriter.finish() 按行号/候选重排。
+        scheduled_states = _order_states_for_run(states, agents)
         if verbose:
             print(f"处理状态：{len(records)} 条输入 → {len(states)} 个状态（正式标注不再展开句对）")
+            if scheduled_states is not states:
+                print("缓存调度：按两侧关注词分组发送；最终输出顺序不变")
         # 转化链的两个分母（D5）补写到 writer 上、进汇总（与 reality_prefill / agent_stats 同一套路）
         writer.input_records = len(records)
         writer.expanded_states = len(states)
@@ -911,14 +1017,14 @@ def _execute_run(
                 print(f"批处理：{len(states)} 个状态进入波次执行（{strategy}）")
             # 批量波次会把同一条候选重放多次；候选预算必须跨波次保留同一份，
             # 否则每条候选每波都会拿到一份新预算，max_requests 形同虚设。
-            scopes = {id(state): agents.new_budget_scope() for state in states}
+            scopes = {id(state): agents.new_budget_scope() for state in scheduled_states}
 
             def run_batch_state(state):
                 with agents.use_budget_scope(scopes[id(state)]):
                     return graph.invoke(state, {"recursion_limit": 60})
 
             bi.run_waves(
-                states,
+                scheduled_states,
                 run_batch_state,
                 batch_session,
                 fallback_workers=max(1, args.workers),
@@ -941,7 +1047,7 @@ def _execute_run(
 
             with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
                 # 结果已在 save 节点落盘，这里只需驱动跑完；map 按输入顺序产出，异常会在此处抛出
-                for _ in pool.map(run_state, states):
+                for _ in pool.map(run_state, scheduled_states):
                     pass
 
         # 各 agent 的调用账（往返数、重试数与缓存命中数）：跑完才齐，收尾补写到 writer 上、进汇总
@@ -957,6 +1063,8 @@ def _execute_run(
                 "counting": "rounds=同步逻辑执行；requests=回调观测的同步模型开始；retried=开始数超出逻辑执行数部分，"
                             "不等于结构补发次数；原生 Batch 另见 batch；pair_llm_calls 仅旧诊断，不是请求数",
             }
+        if sync_store is not None:
+            writer.extra_summary["sync_cache"] = sync_store.summary()
         summary = writer.finish()
         if verbose:
             print(
@@ -979,18 +1087,24 @@ def _execute_run(
             )
         return {"summary": summary, "writer": writer, "states": states}
     finally:
-        writer._close()
+        if sync_store is not None:
+            sync_store.close()
+        if writer is not None:
+            writer._close()
 
 
 def _run_single_model(args, spec, corpus_type, corpus_path, records, out_path: Path, model_key: str) -> dict:
     """原有单模型路径：行为、输出文件与汇总形状保持不变"""
     csv_columns = spec.csv_columns if not args.no_pairs_csv else ()
     cache_path = _batch_cache_path(args, out_path, model_key)
-    sidecars = (
+    sidecars = list(
         bi.sidecar_paths(cache_path)
         if not args.no_llm and getattr(args, "batch", "off") != "off"
         else ()
     )
+    sync_path = _sync_cache_path(args, out_path, model_key) if not args.no_llm else None
+    if sync_path is not None:
+        sidecars.extend(sync_cache.validate_sidecar_paths(sync_path))
     # 先做无副作用的路径检查，再建模型/写任何文件：参数错了不该先花启动成本，
     # 更不能让 BatchSession 在检查前截断恰好被 --batch-cache 指到的语料。
     _validate_run_outputs(
@@ -999,7 +1113,7 @@ def _run_single_model(args, spec, corpus_type, corpus_path, records, out_path: P
         csv_columns=csv_columns,
         overwrite=args.overwrite,
         extra_outputs=sidecars,
-        extra_inputs=_reference_inputs(args),
+        extra_inputs=(*_reference_inputs(args), *_material_inputs(args, corpus_type)),
     )
     overrides = _build_overrides(args, spec)
     agents = _build_model_agents(args, spec, corpus_type, model_key, overrides)

@@ -10,9 +10,11 @@ import sys
 from pathlib import Path
 
 from file_paths import collect_jsonl_inputs, validate_output_paths, resolve_cache_path, same_file_path, sidecar_paths
+import sync_cache
 from annotate.cli_args import ConsistentSelection, resolve_graph_selection
 from annotate.cli_constants import FORMAL_GRAPHS
-from annotate.voting import model_output_paths
+from annotate.material_paths import annotation_material_paths
+from annotate.voting import model_output_paths, safe_model_stem
 from corpus_metadata import CORPUS_TYPE_DIRS, DEFAULT_CORPUS_TYPE, normalize_corpus_type
 from extract.vocab_paths import resolve_vocab_path
 from filter_funcs import LIMIT_MODES
@@ -107,6 +109,8 @@ ANNOTATE_FIELDS = {
     "batch": {"kind": "extra_value", "type": "choice", "choices": ("auto", "native", "off")},
     "batch_cache": {"kind": "extra_value", "type": "path"},
     "batch_resume": {"kind": "extra_flag"},
+    "sync_cache": {"kind": "extra_value", "type": "path"},
+    "sync_resume": {"kind": "extra_flag"},
     "batch_poll_seconds": {"kind": "extra_value", "type": "float"},
     "batch_timeout_seconds": {"kind": "extra_value", "type": "float"},
     "batch_chunk_size": {"kind": "extra_value", "type": "int"},
@@ -174,7 +178,7 @@ def _extra_args(value: str, stage: str) -> list[str]:
     planned = {
         "--batch-cache", "--batch", "--models", "--model", "--no-llm", "--no-pairs-csv",
         "--batch-resume", "--graph", "--reference-file", "--vocab_config_path",
-        "--alter-rules", "--print-prompt",
+        "--alter-rules", "--print-prompt", "--sync-cache", "--sync-resume",
     }
     for token in tokens:
         option = token.split("=", 1)[0]
@@ -191,6 +195,8 @@ def _annotation_options(tokens: list[str], engine):
     parser.add_argument("--batch-cache")
     parser.add_argument("--batch", choices=("auto", "native", "off"), default="auto")
     parser.add_argument("--batch-resume", action="store_true")
+    parser.add_argument("--sync-cache")
+    parser.add_argument("--sync-resume", action="store_true")
     parser.add_argument("--no-llm", action="store_true")
     parser.add_argument("--no-pairs-csv", action="store_true")
     parser.add_argument("--models", nargs="+")
@@ -705,6 +711,8 @@ def build_commands(args) -> list[tuple[str, list[str]]]:
     if "annotate" in selected:
         options, graph = _annotation_options(extras["annotate"], args.annotation_engine)
         _reject_diagnostic_graph(graph, source="--from-stage/--to-stage 选中的 annotate：")
+        if getattr(options, "sync_resume", False) and not getattr(options, "sync_cache", None):
+            raise ValueError("annotate 的 --sync-resume 必须同时指定 --sync-cache")
         preview = bool(options.print_prompt)
     inputs = []
     if start == 0:
@@ -727,6 +735,13 @@ def build_commands(args) -> list[tuple[str, list[str]]]:
         inputs = [first_input]
     # 配置文件本身，以及配置里显式声明的词表/替换规则，都是只读输入。
     inputs.extend(getattr(args, "_config_inputs", []))
+    if "annotate" in selected and not preview:
+        # 标注实际读取的配置表、示例与提示语同样是只读输入；否则 --sync-cache
+        # 指到这些文件时，预检会放行，真正运行再把它截断。
+        inputs.extend(annotation_material_paths(args.corpus_type))
+        alter_rules = _option_value(extras["annotate"], "--alter-rules")
+        if alter_rules:
+            inputs.append(Path(alter_rules).resolve())
     # 透传参数里的词表、替换规则和 reference 同样会在子阶段被读取；它们必须参加
     # 输入/输出别名检查，否则后续 Batch 缓存/jobs/meta 可能覆盖这些资源。
     # 词表按加载端优先级只保护实际读取的那一份，见 _vocab_input_paths。
@@ -776,6 +791,16 @@ def build_commands(args) -> list[tuple[str, list[str]]]:
             for model, result in cache_outputs:
                 cache = resolve_cache_path(options.batch_cache, result, model_key=model, multi_model=multi)
                 sidecars.extend(sidecar_paths(cache))
+        if options.sync_cache and not options.no_llm:
+            sync_outputs = raw.items() if multi else [(None, output)]
+            for model, result in sync_outputs:
+                sync_path = resolve_cache_path(
+                    options.sync_cache,
+                    result,
+                    model_key=safe_model_stem(model) if multi and model else model,
+                    multi_model=multi,
+                )
+                sidecars.extend(sync_cache.sidecar_paths(sync_path))
 
     outputs = [paths[stage] for stage in selected if not (stage == "annotate" and preview)]
     outputs.extend(extra_outputs)
