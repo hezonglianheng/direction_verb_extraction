@@ -22,9 +22,10 @@
         "explicit"        显式启用（用于已验证支持、但不在自动允许列表里的模型）；
         "off"/"implicit" 不注入任何缓存字段；
         false            同上。
-    自动识别只覆盖 Claude 与已确认的千问显式缓存模型；未列入的模型可显式写
-    ``"prompt_cache": "explicit"``，但不按「模型名含 qwen」全家族放行。
-    全局开关见 config.PROMPT_CACHE_ENABLED，它排在单个模型配置之前。
+    自动识别只覆盖 Claude 与 config.PROMPT_CACHE_QWEN_EXPLICIT_MODELS 里的千问
+    模型；未列入的模型可显式写 ``"prompt_cache": "explicit"``，但不按「模型名含
+    qwen」全家族放行。全局开关见 config.PROMPT_CACHE_ENABLED，它排在单个模型配置
+    之前。
 
 为什么不用字符串分隔符：
     PromptParts 直接是 str 的子类：既能在任何期望字符串的地方（本地结果缓存键、Batch 键、
@@ -50,29 +51,6 @@ EXPLICIT_FAMILIES = frozenset({"anthropic", "qwen", "explicit"})
 
 _DISABLED_VALUES = frozenset({"off", "none", "disabled", "implicit"})
 """显式关闭注入的取值；`implicit` 表示交给供应商自动缓存，也不注入断点"""
-
-_QWEN_EXPLICIT_MODELS = (
-    # 千问官方显式缓存支持列表里、当前可能实际送出的模型。刻意用精确前缀而不是
-    # 「模型名含 qwen」：本地 Qwen/Qwen3.8-27B、未验证的第三方 Qwen 端点和
-    # 不支持显式缓存的旧模型都不该收到 cache_control（网关拒绝时整条请求失败）。
-    "qwen3.8-max",
-    "qwen3.8-flash",
-    "qwen3.8-2.4t-a95b",
-    "qwen3.7-max",
-    "qwen3.7-plus",
-    "qwen3.7-flash",
-    "qwen3.6-plus",
-    "qwen3.6-flash",
-    "qwen3.5-plus",
-    "qwen3.5-flash",
-    "qwen-plus",
-)
-"""自动识别为显式缓存的 Qwen 模型。
-
-ZenMux 文档写 Qwen 最小 256 tokens，千问官方文档写 1024；这里按更保守的 1024
-理解，只负责决定**是否注入断点**。实际是否命中由供应商按真实 token 数判断。
-新增未列入的模型可显式写 ``"prompt_cache": "explicit"`` 强制启用。
-"""
 
 _FAMILY_CACHE: dict[str, str] = {}
 _FAMILY_LOCK = threading.Lock()
@@ -113,16 +91,26 @@ def _model_id(model_cfg: dict, model_override: str | None = None) -> str:
 
 
 def is_qwen_explicit_model(model_id: str) -> bool:
-    """模型标识是否属于千问显式缓存允许列表（按 ``/`` 或 ``:`` 后的模型名匹配）。
+    """模型标识是否属于千问显式缓存白名单（按 ``/`` 或 ``:`` 后的模型名匹配）。
+
+    白名单集中在 ``config.PROMPT_CACHE_QWEN_EXPLICIT_MODELS``，便于手动维护：
+    普通条目匹配本名或「本名-后缀」；末尾带 ``*`` 的条目按前缀匹配（如
+    ``qwen4*`` 覆盖 qwen4-max、qwen4-max-preview、qwen4.1-max 等）。
 
     不直接用子串：``local-qwen3.8-max`` 这类本地方案也可能带 cache 字段而被网关拒绝。
-    允许列表只覆盖官方明确支持显式缓存的模型；新模型用 ``prompt_cache: explicit``。
+    白名单只覆盖官方明确支持显式缓存的模型；新模型用 ``prompt_cache: explicit``
+    或把本名/前缀加进白名单。
     """
     candidate = str(model_id or "").lower().rsplit("/", 1)[-1].rsplit(":", 1)[-1]
-    return any(
-        candidate == marker or candidate.startswith(marker + "-")
-        for marker in _QWEN_EXPLICIT_MODELS
-    )
+    for marker in config.PROMPT_CACHE_QWEN_EXPLICIT_MODELS:
+        marker = str(marker).lower()
+        if marker.endswith("*"):
+            prefix = marker[:-1]
+            if prefix and candidate.startswith(prefix):
+                return True
+        elif candidate == marker or candidate.startswith(marker + "-"):
+            return True
+    return False
 
 
 def family_for_config(model_cfg: dict, model_override: str | None = None) -> str:
@@ -135,8 +123,9 @@ def family_for_config(model_cfg: dict, model_override: str | None = None) -> str
                             允许列表里的新模型；
         ``"off"``/``"implicit"``/``false``  不注入任何断点。
 
-    自动识别只覆盖 Claude 与千问官方显式缓存列表里的模型；不按 ``provider`` 猜，
-    也不按「模型名含 qwen」放行——本地 Qwen 与未验证端点不保证接受该字段。
+    自动识别只覆盖 Claude 与 config.PROMPT_CACHE_QWEN_EXPLICIT_MODELS 里的千问
+    模型；不按 ``provider`` 猜，也不按「模型名含 qwen」放行——本地 Qwen 与未验证
+    端点不保证接受该字段。
     """
     if not config.PROMPT_CACHE_ENABLED:
         return "none"
@@ -184,7 +173,7 @@ def family_for_model_key(model_key: str) -> str:
 
 
 def user_content(content, family: str):
-    """构造发给模型的 user content：Claude 返回带断点的内容块，其余返回字符串
+    """构造发给模型的 user content：显式缓存家族返回带断点的内容块，其余返回字符串
 
     断点只加在稳定块末尾，动态块永不带缓存字段。稳定块为空时退回普通字符串——
     没有可复用的前缀却标一个断点，只会让供应商在每次请求上做一次无用的缓存查找。
@@ -202,7 +191,7 @@ def user_content(content, family: str):
 
 
 def system_blocks(system_prompt: str, family: str):
-    """构造 system content：Claude 返回带断点的文本块，其余返回原字符串
+    """构造 system content：显式缓存家族返回带断点的文本块，其余返回原字符串
 
     system 与 user 稳定块是两个更新频率不同的断点：改示例组时 system 缓存仍然有效，
     改 system 时示例缓存作废。Anthropic 与 ZenMux 都明确说明断点本身不额外收费，

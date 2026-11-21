@@ -224,17 +224,47 @@ PROMPT_CACHE_WARMUP_TTL_SECONDS = 300.0
 PROMPT_CACHE_ENABLED = True
 """是否允许按模型家族注入显式缓存断点（全局总开关）
 
-True 时 Claude 与已确认的千问显式缓存模型会收到 `cache_control`；其他模型按各自的
-自动缓存策略走，不补字段。
+True 时 Claude 与 `PROMPT_CACHE_QWEN_EXPLICIT_MODELS` 里的千问模型会收到
+`cache_control`；其他模型按各自的自动缓存策略走，不补字段。
 False 时**所有模型都不注入**，用于对照实验或网关不接受该字段时回滚——这是排在单个模型
 配置之前的总开关。统计不受它影响，token 账仍然继续采集。单个模型可在 api_keys.json 里用
-"prompt_cache": "auto" / "off" / "implicit" 在本开关为 True 时进一步收窄。
+"prompt_cache" 覆盖自动判断："auto" 按模型标识识别，"explicit" 强制启用，
+"off"/"implicit" 关闭。
 
 范围说明：本开关管的是本项目自己加的块级断点（system 末块 + user 稳定段末块）。deepagents
 自带的 Anthropic 缓存中间件只在模型是 ChatAnthropic 时生效；本项目 ZenMux 的 Claude 与
 GPT/Gemini 都走 provider="openai"（ChatOpenAI 兼容接口），该中间件不注入。若将来改用
 provider="anthropic"，框架会自行加 tools/system/顶层断点，本开关管不到它，断点总数也会
 接近 Anthropic 的 4 个上限。"""
+
+PROMPT_CACHE_QWEN_EXPLICIT_MODELS = (
+    # 千问官方显式缓存支持列表里、当前可能实际送出的模型。普通条目匹配本名及
+    # 「本名-后缀」；末尾带 ``*`` 的条目按前缀匹配（例如 ``qwen4*`` 覆盖
+    # qwen4-max、qwen4-max-preview、qwen4.1-max 等整代模型）。
+    # 新增模型直接在这里加：普通模型追加本名，整代前缀追加 ``前缀*``。
+    "qwen4*",
+    "qwen3.8-max",
+    "qwen3.8-flash",
+    "qwen3.8-2.4t-a95b",
+    "qwen3.7-max",
+    "qwen3.7-plus",
+    "qwen3.7-flash",
+    "qwen3.6-plus",
+    "qwen3.6-flash",
+    "qwen3.5-plus",
+    "qwen3.5-flash",
+    "qwen-plus",
+)
+"""自动识别为显式缓存的 Qwen 模型白名单（见 annotate/prompt_cache.py）
+
+普通条目匹配模型名本身，或「模型名-后缀」；末尾带 ``*`` 的条目按前缀匹配。
+刻意不用「模型名含 qwen」：本地 Qwen/Qwen3.8-27B、未验证的第三方 Qwen 端点和
+不支持显式缓存的旧模型都不该收到 cache_control（网关拒绝时整条请求失败）。
+
+ZenMux 文档写 Qwen 最小 256 tokens，千问官方文档写 1024；这里按更保守的 1024
+理解，只负责决定**是否注入断点**。实际是否命中由供应商按真实 token 数判断。
+新增未列入的模型可显式写 ``"prompt_cache": "explicit"`` 强制启用，或直接加到
+本白名单里。"""
 
 # FILTER_WORKERS = 0
 FILTER_WORKERS = 1
