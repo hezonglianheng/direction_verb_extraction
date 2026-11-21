@@ -1,6 +1,6 @@
 # encoding: utf8
 
-"""提示词缓存：把 user message 切成「稳定前缀」与「本条动态内容」，并只为 Claude 加显式断点。
+"""提示词缓存：把 user message 切成「稳定前缀」与「本条动态内容」，按模型家族加显式断点。
 
 为什么要有这一层：
     各 agent 拼出来的 user message 既有跨记录稳定的部分（按关注词选出的示例、图式候选表），
@@ -8,10 +8,10 @@
     个 token 起完全相同**的前缀，因此稳定部分必须排在前面，README 里的「静态→动态」顺序才
     真的成立。
 
-    Claude 需要在稳定前缀末尾显式标注缓存断点（`cache_control`）。其他模型要么自动缓存，
-    要么完全不支持这个字段：DeepSeek 的 Anthropic 兼容端点会**忽略** `cache_control`，
-    Gemini 4 系列不支持显式缓存。所以字段绝对不能无差别地发给所有模型——本模块按模型家族
-    决定是否注入，非 Claude 一律返回普通字符串。
+    Claude 与千问（ZenMux / 千问官方显式缓存）需要在稳定前缀末尾显式标注缓存断点
+    （`cache_control`）。其他模型要么自动缓存（OpenAI / Gemini / DeepSeek / Kimi / GLM），
+    要么完全不支持这个字段；字段不能无差别发给所有模型。本模块按实际送出的模型标识
+    决定是否注入，非显式家族一律返回普通字符串。
 
 怎么判断模型家族：
     只看真正发给网关的模型标识（`batch.model` 覆盖值优先，其次 `model`、`model_name`），
@@ -19,9 +19,11 @@
     本项目的 ZenMux 模型 `provider` 都写 `"openai"`，那只是客户端协议，底层可能是 Claude、
     GPT 或 Gemini。模型配置里可写 `"prompt_cache"` 关闭注入：
         "auto"（默认）   按实际送出的模型标识判断；
+        "explicit"        显式启用（用于已验证支持、但不在自动允许列表里的模型）；
         "off"/"implicit" 不注入任何缓存字段；
         false            同上。
-    不提供「强制注入」档位：把 `cache_control` 发给非 Claude 模型没有收益，还可能被网关拒绝。
+    自动识别只覆盖 Claude 与已确认的千问显式缓存模型；未列入的模型可显式写
+    ``"prompt_cache": "explicit"``，但不按「模型名含 qwen」全家族放行。
     全局开关见 config.PROMPT_CACHE_ENABLED，它排在单个模型配置之前。
 
 为什么不用字符串分隔符：
@@ -32,15 +34,45 @@
 
 from __future__ import annotations
 
+import hashlib
 import threading
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass
 
 import config
 
 CACHE_CONTROL: dict = {"type": "ephemeral"}
-"""Claude 5 分钟缓存的断点标记（与 ZenMux / Anthropic 文档一致）"""
+"""Claude / Qwen 5 分钟缓存的断点标记（与 ZenMux 文档一致）"""
+
+EXPLICIT_FAMILIES = frozenset({"anthropic", "qwen", "explicit"})
+"""需要显式 `cache_control` 的家族；其余家族保持纯字符串，不携带缓存字段。"""
 
 _DISABLED_VALUES = frozenset({"off", "none", "disabled", "implicit"})
 """显式关闭注入的取值；`implicit` 表示交给供应商自动缓存，也不注入断点"""
+
+_QWEN_EXPLICIT_MODELS = (
+    # 千问官方显式缓存支持列表里、当前可能实际送出的模型。刻意用精确前缀而不是
+    # 「模型名含 qwen」：本地 Qwen/Qwen3.8-27B、未验证的第三方 Qwen 端点和
+    # 不支持显式缓存的旧模型都不该收到 cache_control（网关拒绝时整条请求失败）。
+    "qwen3.8-max",
+    "qwen3.8-flash",
+    "qwen3.8-2.4t-a95b",
+    "qwen3.7-max",
+    "qwen3.7-plus",
+    "qwen3.7-flash",
+    "qwen3.6-plus",
+    "qwen3.6-flash",
+    "qwen3.5-plus",
+    "qwen3.5-flash",
+    "qwen-plus",
+)
+"""自动识别为显式缓存的 Qwen 模型。
+
+ZenMux 文档写 Qwen 最小 256 tokens，千问官方文档写 1024；这里按更保守的 1024
+理解，只负责决定**是否注入断点**。实际是否命中由供应商按真实 token 数判断。
+新增未列入的模型可显式写 ``"prompt_cache": "explicit"`` 强制启用。
+"""
 
 _FAMILY_CACHE: dict[str, str] = {}
 _FAMILY_LOCK = threading.Lock()
@@ -80,21 +112,54 @@ def _model_id(model_cfg: dict, model_override: str | None = None) -> str:
     return ""
 
 
-def family_for_config(model_cfg: dict, model_override: str | None = None) -> str:
-    """按模型配置判断缓存家族：``"anthropic"`` 或 ``"none"``
+def is_qwen_explicit_model(model_id: str) -> bool:
+    """模型标识是否属于千问显式缓存允许列表（按 ``/`` 或 ``:`` 后的模型名匹配）。
 
-    模型配置里的 ``prompt_cache`` 只用于**关闭**（``off``/``implicit``/``false``）；不提供
-    「强制注入」档位——把 `cache_control` 发给非 Claude 模型既没有收益，还可能被网关拒绝，
-    要支持同构网关请让模型标识里带上 claude，或另开显式能力字段。
+    不直接用子串：``local-qwen3.8-max`` 这类本地方案也可能带 cache 字段而被网关拒绝。
+    允许列表只覆盖官方明确支持显式缓存的模型；新模型用 ``prompt_cache: explicit``。
+    """
+    candidate = str(model_id or "").lower().rsplit("/", 1)[-1].rsplit(":", 1)[-1]
+    return any(
+        candidate == marker or candidate.startswith(marker + "-")
+        for marker in _QWEN_EXPLICIT_MODELS
+    )
+
+
+def family_for_config(model_cfg: dict, model_override: str | None = None) -> str:
+    """按模型配置判断缓存家族：``"anthropic"`` / ``"qwen"`` / ``"explicit"`` / ``"none"``
+
+    ``prompt_cache`` 可写：
+
+        ``"auto"``（默认）  按实际送出的模型标识自动识别；
+        ``"explicit"``      显式启用；用于已验证支持 `cache_control`、但不在自动
+                            允许列表里的新模型；
+        ``"off"``/``"implicit"``/``false``  不注入任何断点。
+
+    自动识别只覆盖 Claude 与千问官方显式缓存列表里的模型；不按 ``provider`` 猜，
+    也不按「模型名含 qwen」放行——本地 Qwen 与未验证端点不保证接受该字段。
     """
     if not config.PROMPT_CACHE_ENABLED:
         return "none"
     override = model_cfg.get("prompt_cache")
     if override is False:
         return "none"
-    if isinstance(override, str) and override.strip().lower() in _DISABLED_VALUES:
-        return "none"
-    return "anthropic" if "claude" in _model_id(model_cfg, model_override) else "none"
+    if isinstance(override, str):
+        value = override.strip().lower()
+        if value in _DISABLED_VALUES:
+            return "none"
+        if value == "explicit":
+            return "explicit"
+    model_id = _model_id(model_cfg, model_override)
+    if "claude" in model_id:
+        return "anthropic"
+    if is_qwen_explicit_model(model_id):
+        return "qwen"
+    return "none"
+
+
+def is_explicit(family: str) -> bool:
+    """该家族是否需要显式 `cache_control` 断点。"""
+    return family in EXPLICIT_FAMILIES
 
 
 def family_for_model_key(model_key: str) -> str:
@@ -125,7 +190,7 @@ def user_content(content, family: str):
     没有可复用的前缀却标一个断点，只会让供应商在每次请求上做一次无用的缓存查找。
     """
     text = str(content)
-    if family != "anthropic" or not isinstance(content, PromptParts):
+    if not is_explicit(family) or not isinstance(content, PromptParts):
         return text
     stable, dynamic = content.parts()
     if not stable.strip():
@@ -143,7 +208,7 @@ def system_blocks(system_prompt: str, family: str):
     改 system 时示例缓存作废。Anthropic 与 ZenMux 都明确说明断点本身不额外收费，
     费用只按实际写入/读取的内容计算（每个请求最多 4 个断点）。
     """
-    if family != "anthropic" or not isinstance(system_prompt, str) or not system_prompt.strip():
+    if not is_explicit(family) or not isinstance(system_prompt, str) or not system_prompt.strip():
         return system_prompt
     return [{"type": "text", "text": system_prompt, "cache_control": dict(CACHE_CONTROL)}]
 
@@ -156,3 +221,127 @@ def system_message(system_prompt: str, family: str):
 
         return SystemMessage(content=blocks)
     return blocks
+
+
+def warmup_key(model_key: str, system_prompt: str, content, family: str) -> str:
+    """同一模型、同一 system、同一稳定前缀的调度键；无可复用前缀时返回空串
+
+    供应商的缓存只在「从第 0 个 token 起逐字节相同」时命中，且缓存写入发生在
+    响应之后。并发首问如果一起发出去，会全部未命中并各写一份缓存。这个键只用于
+    让同一前缀的**首个真实请求**先完成，再放行其余请求；它不是结果缓存键，也不
+    参与业务去重。
+
+    普通字符串（例如 evaluate step 0 的 SynonymAgent）没有 PromptParts，此时退回
+    system-only 键：同一模型/同一 system 仍共享 `tools → system` 前缀。system 也
+    为空才返回空串，避免把所有无关请求串行化。
+    """
+    if not is_explicit(family):
+        # 关闭显式缓存的模型没有可写的远端前缀；退回 system-only 键只会把同一
+        # system 下互不相关的请求串行化，且 leader 失败时还会拖住其他 worker。
+        return ""
+    stable = ""
+    if isinstance(content, PromptParts):
+        stable = content.stable if content.stable.strip() else ""
+    if stable:
+        scope = "user\0" + stable
+    elif str(system_prompt or "").strip():
+        scope = "system"
+    else:
+        return ""
+    digest = hashlib.sha256(
+        f"{model_key}\0{family}\0{system_prompt}\0{scope}".encode("utf-8")
+    ).hexdigest()
+    return digest
+
+
+@dataclass
+class _PrefixState:
+    """一个稳定前缀的冷启动状态。event 未置位 = 首个请求尚未完成。"""
+
+    event: threading.Event
+    warmed_at: float = 0.0
+    success: bool = False
+    failed_until: float = 0.0
+
+
+class WarmupGate:
+    """同前缀冷启动门控：leader 先发，等响应回来后再放行其余请求。
+
+    只影响**首次**发同一前缀的并发请求，不把整批请求永久串行化。缓存 TTL 过后
+    重新发生一次冷启动，避免把「曾经写过缓存」误当成「现在仍然命中」。leader
+    失败后进入短暂冷却（最多 10 秒）：冷却期内等待者直接放行，避免端点级故障时
+    把 --workers N 退化成逐个串行重试；冷却结束后的第一个请求再尝试做 leader。
+    本地结果命中不会经过这里，因此不会刷新远端 TTL。
+    """
+
+    def __init__(self, ttl_seconds: float = 300.0, clock=time.monotonic):
+        self.ttl_seconds = max(0.0, float(ttl_seconds))
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._states: dict[str, _PrefixState] = {}
+        self.waits = 0
+
+    @contextmanager
+    def acquire(self, key: str):
+        if not key:
+            yield
+            return
+        while True:
+            leader = False
+            ready = False
+            with self._lock:
+                state = self._states.get(key)
+                now = self._clock()
+                if state is None or (
+                    state.event.is_set()
+                    and (
+                        now - state.warmed_at >= self.ttl_seconds
+                        or (not state.success and now >= state.failed_until)
+                    )
+                ):
+                    state = _PrefixState(threading.Event())
+                    self._states[key] = state
+                    leader = True
+                elif state.event.is_set():
+                    # leader 刚失败时不要立刻把等待者逐个变成新 leader：端点级故障
+                    # （鉴权/宕机/持续 429）下那会把 --workers N 退化成串行重试。
+                    # 在短暂冷却期内直接放行，让请求并发失败或并发成功；冷却后再试。
+                    ready = state.success or now < state.failed_until
+                else:
+                    self.waits += 1
+            if ready:
+                yield
+                return
+            if leader:
+                try:
+                    yield
+                except BaseException:
+                    with self._lock:
+                        state.success = False
+                        state.warmed_at = self._clock()
+                        cooldown = max(1.0, min(self.ttl_seconds, 10.0))
+                        state.failed_until = state.warmed_at + cooldown
+                        state.event.set()
+                    raise
+                else:
+                    with self._lock:
+                        state.success = True
+                        state.warmed_at = self._clock()
+                        state.event.set()
+                    return
+            state.event.wait()
+
+    def reset(self) -> None:
+        with self._lock:
+            self._states.clear()
+            self.waits = 0
+
+
+_GATE = WarmupGate(config.PROMPT_CACHE_WARMUP_TTL_SECONDS)
+
+
+@contextmanager
+def warmup_gate(key: str):
+    """进程内共享的前缀冷启动门控（见 ``WarmupGate``）。"""
+    with _GATE.acquire(key):
+        yield

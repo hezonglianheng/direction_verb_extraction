@@ -367,6 +367,11 @@ def batch_profile(model_key: str) -> BatchProfile:
             f"收到 {completion!r}"
         )
     raw_extra = agent_factory.disable_thinking_kwargs(cfg)
+    cache_family = pc.family_for_config(cfg, model_override=model)
+    if cache_family in ("qwen", "explicit") and pc.is_qwen_explicit_model(model):
+        # 千问官方文档明确：Batch File 折扣不与上下文缓存折扣叠加。批处理请求里
+        # 不带 cache_control，避免一个不会生效的断点；同步回退仍按 agent 的家族注入。
+        cache_family = "none"
     return BatchProfile(
         model_key=model_key,
         provider=provider,
@@ -382,7 +387,7 @@ def batch_profile(model_key: str) -> BatchProfile:
         proxy_mode=proxy_mode,
         proxy_url=proxy_url,
         # Batch 可能把模型换成 batch.model，缓存家族必须按真正送批的那个标识判断。
-        cache_family=pc.family_for_config(cfg, model_override=model),
+        cache_family=cache_family,
     )
 
 
@@ -1246,6 +1251,22 @@ class BatchSession:
         todo = [item for item in items if item.key not in self.results]
         if not todo:
             return 0
+        # 发送次序：同模型、同 system、同稳定前缀的请求连续提交。原生 Batch 的服务端
+        # 执行顺序不受客户端控制，这里只做尽力优化，不据此声称满足同步首问时序；
+        # custom_id、lookup/add 键与预算口径都不变。
+        todo = [
+            item
+            for _, item in sorted(
+                enumerate(todo),
+                key=lambda pair: (
+                    pc.warmup_key(
+                        self.profile.model_key, pair[1].system_prompt, pair[1].content,
+                        self.profile.cache_family,
+                    ),
+                    pair[0],
+                ),
+            )
+        ]
         # 有只能同步跑的项（deep feature 的工具回合）时，整个波次回退，避免一半批一半同步
         if any(not item.native for item in todo):
             self._enter_fallback("本波次含只能同步执行的请求（deep feature）")

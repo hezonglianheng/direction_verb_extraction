@@ -59,5 +59,20 @@
       "protocol": "openrouter",
       "completion_window": "24h"
     }
+  },
+  "qwen-explicit-cache": {
+    "model_name": "qwen3.8-max",
+    "provider": "openai",
+    "base_url": "https://maas.qianwenaiapi.com/compatible-mode/v1",
+    "api_key": "REPLACE_WITH_LOCAL_SECRET",
+    "temperature": 0,
+    "timeout": 120,
+    "max_retries": 6,
+    "prompt_cache": "auto",
+    "disable_thinking": {
+      "extra_body": {
+        "enable_thinking": false
+      }
+    }
   }
 }

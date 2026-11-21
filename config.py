@@ -213,10 +213,19 @@ BATCH_MAX_REQUESTS = 0
 留给人工复核。候选预算管「一条候选内别被重试放大」，这条管「候选乘记录别没有上限」。"""
 
 # ---- 提示词缓存（见 annotate/prompt_cache.py）----
+PROMPT_CACHE_WARMUP_TTL_SECONDS = 300.0
+"""同一稳定前缀的冷启动门控有效期（秒）
+
+供应商（ZenMux / Anthropic / 千问）的显式缓存默认 TTL 为 5 分钟，命中会重置。
+门控在同一前缀的首个请求完成后放行并发请求；超过本值后重新做一次冷启动，
+避免把「曾经写过缓存」误当成「现在仍然命中」。只影响调度，不改变请求内容。
+"""
+
 PROMPT_CACHE_ENABLED = True
 """是否允许按模型家族注入显式缓存断点（全局总开关）
 
-True 时只有 Claude 家族会收到 `cache_control`；其他模型按各自的自动缓存策略走，不补字段。
+True 时 Claude 与已确认的千问显式缓存模型会收到 `cache_control`；其他模型按各自的
+自动缓存策略走，不补字段。
 False 时**所有模型都不注入**，用于对照实验或网关不接受该字段时回滚——这是排在单个模型
 配置之前的总开关。统计不受它影响，token 账仍然继续采集。单个模型可在 api_keys.json 里用
 "prompt_cache": "auto" / "off" / "implicit" 在本开关为 True 时进一步收窄。

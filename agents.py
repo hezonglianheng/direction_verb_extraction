@@ -491,8 +491,9 @@ def get_agent(model_name: str, tools: list, system_prompt: str, response_format=
     Args:
         model_name (str): 模型名称
         tools (list): 工具列表，每个工具是一个 langchain Tool 对象
-        system_prompt (str): 系统提示语，用于指导模型的行为。Claude 家族会在其末尾
-            加一个显式缓存断点（见 annotate/prompt_cache.py），其余模型保持原字符串。
+        system_prompt (str): 系统提示语，用于指导模型的行为。Claude 与已确认的千问
+            显式缓存模型会在其末尾加一个缓存断点（见 annotate/prompt_cache.py），
+            其余模型保持原字符串。
         response_format: 结构化输出策略，如 ToolStrategy(SomeModel)。传入时会自动关闭
             思考模式（见 get_model）；不传则保留模型的默认行为。
 
@@ -504,7 +505,7 @@ def get_agent(model_name: str, tools: list, system_prompt: str, response_format=
     response_format = _structured_output_for(model_name, response_format)
     model = get_model(model_name, disable_thinking=response_format is not None)
     # system 与 user 的稳定段各是一个断点：示例组变化时 system 缓存仍有效，反之亦然。
-    # 非 Claude 家族返回原字符串，不携带任何缓存字段。
+    # 非显式缓存家族返回原字符串，不携带任何缓存字段。
     family = prompt_cache.family_for_model_key(model_name)
     return create_agent(
         model=model,
