@@ -8,9 +8,27 @@
 
 比较对象是 ``results/extract_result`` 下同名的
 ``location_corpus_with_locative_split_*.screening_verdicts.csv``（或原始 ``.jsonl``）。
-一行 CSV / 一个三态 verdict 表示模型对某个方位词候选的一次 true/false/unknown
-判定，其
+一行 CSV / 一个逐词 verdict 表示模型对某个方位词候选的一次判定，其
 ``(目标物, 参照物, 动词)`` 就是本项目所说的三元组。
+
+比较分三层，全部保留：
+
+1. **原始 extractable 三态**（兼容旧口径）：只看 ``extractable`` 的
+   true/false/unknown。这是旧报告里的“一致率”，单看它不能说明下游可用性。
+2. **严格逐词状态**：按生产 ``verdict_status`` 口径分成
+   ``true / false / error / limit / no_llm`` 五态。``error``、``limit``、``no_llm``
+   **分别独立**，绝不互算相同；只有 ``true`` 与 ``false`` 内部允许包含不同的底层
+   字段组合（例如 true 可以由不同理由/来源得到）。严格 true 要求
+   ``extractable``、``grammatical``、``spatial_coherent`` 全为 true，且来源不是
+   error/limit/no_llm。
+3. **整句状态与下游准入**（仅 JSONL）：按 ``screening_status`` 统计整句
+   true/false/error/limit/no_llm，并比较两侧“可进入判定工作流”的句集
+   （true 或 no_llm）。CSV 导出会漏掉 ``verdicts=[]`` 的 no_llm 句，无法还原
+   全量句级指标，因此 CSV 的句级指标记 ``N/A（需 JSONL）``。
+
+旧版 CSV 没有 ``extractable``、``grammatical``、``spatial_coherent``、
+``逐词判定来源`` 四列，无法反推严格状态：此时仍输出原始 extractable 一致率，
+严格指标记 ``N/A（缺列，请重新导出）``，不把缺列伪装成生产 ``error``。
 
 对齐口径（默认）::
 
@@ -40,6 +58,10 @@ true/false 判定。脚本**不再跳过**这些行，而是作为 ``unknown`` �
 是 ``一致率（相同/并集）``，分母是两侧 key 的并集
 ``common + only_left + only_right``，仅单侧项也进入分母；对角线写 ``—``，并集为 0
 时写 ``N/A (0/0)``。共同项中三态判定相等（含 ``unknown`` 对 ``unknown``）记为相同。
+
+严格口径另给“有效判定一致率”：分母只算两侧都是严格 true/false 的共同项，
+error/limit/no_llm 不进入分母；同时报告有效判定覆盖率，避免只看一个高一致率。
+句级另给“整句状态一致率”和“下游准入句集重合率”。
 
 脚本只读输入；差异本身不算失败，返回 0。只有至少一对的并集为 0（两侧都没有判定行）
 才返回 1；无法开始比较（少于两个文件、重复输入、格式混合、文件损坏、输出冲突）返回 2。
@@ -79,6 +101,25 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator, Sequence
+
+if __package__:
+    from .verdict_status import (
+        STRICT_EFFECTIVE,
+        STRICT_STATES,
+        judgement_eligible,
+        record_screening_status,
+        strict_verdict_state,
+    )
+else:
+    # 直接执行脚本时 Python 只把脚本目录放进 sys.path；状态镜像与脚本同目录。
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from verdict_status import (  # noqa: E402
+        STRICT_EFFECTIVE,
+        STRICT_STATES,
+        judgement_eligible,
+        record_screening_status,
+        strict_verdict_state,
+    )
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 RESULTS_DIR = ROOT_DIR / "results" / "extract_result"
@@ -121,6 +162,14 @@ CSV_REQUIRED = frozenset(
         "模型判定",
     }
 )
+CSV_STRICT_REQUIRED = frozenset(
+    {"extractable", "grammatical", "spatial_coherent", "逐词判定来源"}
+)
+"""新版导出用于复算严格状态的四列。
+
+四列全无 = 旧版 CSV，严格指标记 N/A；只出现一部分 = 导出被截断/手工改坏，
+直接报错，避免把“缺列”静默当成“字段缺失的 error”。
+"""
 
 DETAIL_COLUMNS = [
     "比较结果",
@@ -130,6 +179,7 @@ DETAIL_COLUMNS = [
     "原句",
     "方位词",
     "方位词字符偏移",
+    "重复序号",
     "左方位词下标",
     "右方位词下标",
     "左目标物",
@@ -140,6 +190,19 @@ DETAIL_COLUMNS = [
     "右动词",
     "左判定",
     "右判定",
+    "左严格状态",
+    "右严格状态",
+    "严格比较结果",
+    "左extractable",
+    "左grammatical",
+    "左spatial_coherent",
+    "右extractable",
+    "右grammatical",
+    "右spatial_coherent",
+    "左逐词来源",
+    "右逐词来源",
+    "左整句状态",
+    "右整句状态",
     "三元组是否变化",
     "左理由",
     "右理由",
@@ -148,25 +211,54 @@ DETAIL_COLUMNS = [
 LOCATIVE_COLUMNS = [
     "方位词",
     "共同",
-    "相同",
-    "不同",
-    "true→false",
-    "false→true",
-    "unknown→unknown",
-    "unknown≠bool",
+    "原始相同",
+    "原始不同",
+    "严格共同",
+    "严格相同",
+    "严格不同",
+    "有效共同",
+    "有效相同",
     "仅左",
     "仅右",
 ]
-LOCATIVE_ALIGNS = ["---"] + ["---:"] * 9
+LOCATIVE_ALIGNS = ["---"] + ["---:"] * 10
 
 
 def verdict_text(value: bool | None) -> str:
-    """三态判定的统一文本：true / false / unknown。"""
+    """原始 ``extractable`` 的三态文本：true / false / unknown。"""
     if value is True:
         return "true"
     if value is False:
         return "false"
     return "unknown"
+
+
+def strict_state_text(value: str | None) -> str:
+    """严格状态的展示文本；不可计算时用 ``n/a``。"""
+    return value if value else "n/a"
+
+
+def strict_state_label(value: str | None) -> str:
+    """严格状态的中文表头标签；只有 true/false 是有效判定。"""
+    if value is None:
+        return "n/a"
+    return {"true": "严格true", "false": "严格false"}.get(value, value)
+
+
+def is_effective_state(value: str | None) -> bool:
+    return value in STRICT_EFFECTIVE
+
+
+def _ratio_text(numerator: int, denominator: int, *, unavailable: str = "N/A (0/0)") -> str:
+    if not denominator:
+        return unavailable
+    return f"{numerator / denominator * 100:.2f}% ({numerator}/{denominator})"
+
+
+def _format_strict_counts(counts: Counter[str]) -> str:
+    if not counts:
+        return "n/a"
+    return ", ".join(f"{state}={counts.get(state, 0)}" for state in STRICT_STATES)
 
 
 @dataclass(frozen=True)
@@ -190,10 +282,28 @@ class VerdictRow:
     verdict: bool | None
     reason: str
     status: str
+    grammatical: bool | None = None
+    spatial_coherent: bool | None = None
+    verdict_source: str = ""
+    record_status: str = ""
+    strict_state: str | None = None
+    strict_available: bool = False
 
     @property
     def triple(self) -> tuple[str, str, str]:
         return (self.target, self.reference, self.verb)
+
+    @property
+    def raw_state(self) -> str:
+        return verdict_text(self.verdict)
+
+    @property
+    def strict_state_text(self) -> str:
+        return strict_state_text(self.strict_state)
+
+    @property
+    def effective(self) -> bool:
+        return is_effective_state(self.strict_state)
 
     @property
     def complete(self) -> bool:
@@ -268,6 +378,10 @@ class Comparison:
     only_right_keys: list[tuple]
     left_by_key: dict[tuple, VerdictRow]
     right_by_key: dict[tuple, VerdictRow]
+    left_sentences: dict[tuple[str, str, int], SentenceRecord] | None = None
+    right_sentences: dict[tuple[str, str, int], SentenceRecord] | None = None
+    left_strict_available: bool | None = None
+    right_strict_available: bool | None = None
 
     def __post_init__(self) -> None:
         self.left_total = len(self.left)
@@ -283,6 +397,7 @@ class Comparison:
         # 一致性矩阵的分母：两侧 key 的并集。仅单侧项也进入分母。
         self.union = self.common + self.only_left + self.only_right
 
+        # ---- 第一层：原始 extractable 三态（兼容旧口径） ----
         self.matrix: Counter[tuple[bool | None, bool | None]] = Counter()
         self.same = 0
         self.different = 0
@@ -293,6 +408,34 @@ class Comparison:
         self.triple_changed_same_verdict = 0
         self.triple_changed_diff_verdict = 0
         self.line_mismatch = 0
+
+        # ---- 第二层：逐词严格五态 ----
+        # 文件级可用性优先由读取器给出：空的旧版 CSV 没有行，不能靠 all([])
+        # 误判成“严格可用”。直接调用 compare_rows 时没有文件级标志，才退回逐行检查。
+        left_strict = (
+            self.left_strict_available
+            if self.left_strict_available is not None
+            else all(row.strict_available for row in self.left)
+        )
+        right_strict = (
+            self.right_strict_available
+            if self.right_strict_available is not None
+            else all(row.strict_available for row in self.right)
+        )
+        self.strict_available = bool(left_strict and right_strict)
+        self.strict_matrix: Counter[tuple[str, str]] = Counter()
+        self.strict_comparable = 0
+        self.strict_same = 0
+        self.strict_different = 0
+        self.common_effective = 0
+        self.same_effective = 0
+        self.left_strict_counts = Counter(
+            row.strict_state for row in self.left if row.strict_state
+        )
+        self.right_strict_counts = Counter(
+            row.strict_state for row in self.right if row.strict_state
+        )
+
         for key in self.common_keys:
             left = self.left_by_key[key]
             right = self.right_by_key[key]
@@ -317,6 +460,31 @@ class Comparison:
                     self.triple_changed_diff_verdict += 1
             if left.line_no != right.line_no:
                 self.line_mismatch += 1
+
+            if left.strict_state and right.strict_state:
+                self.strict_comparable += 1
+                self.strict_matrix[(left.strict_state, right.strict_state)] += 1
+                if left.strict_state == right.strict_state:
+                    self.strict_same += 1
+                else:
+                    self.strict_different += 1
+            if left.effective and right.effective:
+                self.common_effective += 1
+                if left.strict_state == right.strict_state:
+                    self.same_effective += 1
+
+        self.only_left_strict_counts = Counter(
+            self.left_by_key[key].strict_state
+            for key in self.only_left_keys
+            if self.left_by_key[key].strict_state
+        )
+        self.only_right_strict_counts = Counter(
+            self.right_by_key[key].strict_state
+            for key in self.only_right_keys
+            if self.right_by_key[key].strict_state
+        )
+        self.left_effective = sum(row.effective for row in self.left)
+        self.right_effective = sum(row.effective for row in self.right)
 
         self.only_left_true, self.only_left_false, self.only_left_unknown = _state_counts(
             [self.left_by_key[key] for key in self.only_left_keys]
@@ -396,17 +564,109 @@ class Comparison:
             self.same - self.same_in_duplicate_base + duplicate_same_max
         )
 
+        # ---- 第三层：整句状态与下游准入（仅 JSONL） ----
+        self.sentence_available = (
+            self.left_sentences is not None and self.right_sentences is not None
+        )
+        self.sentence_matrix: Counter[tuple[str, str]] = Counter()
+        self.sentence_common = 0
+        self.sentence_only_left = 0
+        self.sentence_only_right = 0
+        self.sentence_union = 0
+        self.sentence_same = 0
+        self.sentence_left_counts: Counter[str] = Counter()
+        self.sentence_right_counts: Counter[str] = Counter()
+        self.eligible_left = 0
+        self.eligible_right = 0
+        self.eligible_both = 0
+        self.eligible_left_only = 0
+        self.eligible_right_only = 0
+        self.eligible_union = 0
+        if self.sentence_available:
+            left_sentences = self.left_sentences or {}
+            right_sentences = self.right_sentences or {}
+            left_keys = set(left_sentences)
+            right_keys = set(right_sentences)
+            common_sentences = left_keys & right_keys
+            self.sentence_common = len(common_sentences)
+            self.sentence_only_left = len(left_keys - right_keys)
+            self.sentence_only_right = len(right_keys - left_keys)
+            self.sentence_union = len(left_keys | right_keys)
+            for key in common_sentences:
+                left_status = left_sentences[key].status
+                right_status = right_sentences[key].status
+                self.sentence_matrix[(left_status, right_status)] += 1
+                if left_status == right_status:
+                    self.sentence_same += 1
+            self.sentence_left_counts = Counter(
+                value.status for value in left_sentences.values()
+            )
+            self.sentence_right_counts = Counter(
+                value.status for value in right_sentences.values()
+            )
+            eligible_left_keys = {
+                key for key, value in left_sentences.items() if value.eligible
+            }
+            eligible_right_keys = {
+                key for key, value in right_sentences.items() if value.eligible
+            }
+            self.eligible_left = len(eligible_left_keys)
+            self.eligible_right = len(eligible_right_keys)
+            self.eligible_both = len(eligible_left_keys & eligible_right_keys)
+            self.eligible_left_only = len(eligible_left_keys - eligible_right_keys)
+            self.eligible_right_only = len(eligible_right_keys - eligible_left_keys)
+            self.eligible_union = len(eligible_left_keys | eligible_right_keys)
+
         self.by_locative = self._by_locative()
 
     @property
     def agreement(self) -> float | None:
-        """矩阵口径：相同 / 两侧并集；仅单侧项也进入分母。"""
+        """原始 extractable：相同 / 两侧并集；仅单侧项也进入分母。"""
         return self.same / self.union if self.union else None
 
     @property
     def common_agreement(self) -> float | None:
-        """诊断口径：相同 / 共同项，仅用于对照。"""
+        """原始 extractable：相同 / 共同项，仅用于对照。"""
         return self.same / self.common if self.common else None
+
+    @property
+    def strict_agreement(self) -> float | None:
+        """严格五态：相同 / 两侧并集；error/limit/no_llm 也参与分母。"""
+        if not self.strict_available:
+            return None
+        return self.strict_same / self.union if self.union else None
+
+    @property
+    def strict_common_agreement(self) -> float | None:
+        """严格五态：相同 / 可比较共同项。"""
+        if not self.strict_available or not self.strict_comparable:
+            return None
+        return self.strict_same / self.strict_comparable
+
+    @property
+    def effective_agreement(self) -> float | None:
+        """有效判定：两侧都为严格 true/false 的共同项内，状态相同的比例。"""
+        return self.same_effective / self.common_effective if self.common_effective else None
+
+    @property
+    def left_effective_coverage(self) -> float | None:
+        return self.left_effective / self.left_total if self.left_total else None
+
+    @property
+    def right_effective_coverage(self) -> float | None:
+        return self.right_effective / self.right_total if self.right_total else None
+
+    @property
+    def sentence_agreement(self) -> float | None:
+        if not self.sentence_available:
+            return None
+        return self.sentence_same / self.sentence_union if self.sentence_union else None
+
+    @property
+    def eligibility_overlap(self) -> float | None:
+        if not self.sentence_available:
+            return None
+        return self.eligible_both / self.eligible_union if self.eligible_union else None
 
     def _by_locative(self) -> list[dict[str, Any]]:
         stats: dict[str, Counter[str]] = {}
@@ -417,8 +677,10 @@ class Comparison:
             item["common"] += 1
             if left.verdict == right.verdict:
                 item["same"] += 1
+                item["raw_same"] += 1
             else:
                 item["different"] += 1
+                item["raw_different"] += 1
             if left.verdict is True and right.verdict is False:
                 item["tf"] += 1
             elif left.verdict is False and right.verdict is True:
@@ -427,6 +689,16 @@ class Comparison:
                 item["uu"] += 1
             elif left.verdict is None or right.verdict is None:
                 item["udiff"] += 1
+            if left.strict_state and right.strict_state:
+                item["strict_common"] += 1
+                if left.strict_state == right.strict_state:
+                    item["strict_same"] += 1
+                else:
+                    item["strict_different"] += 1
+            if left.effective and right.effective:
+                item["effective_common"] += 1
+                if left.strict_state == right.strict_state:
+                    item["effective_same"] += 1
         for key in self.only_left_keys:
             item = stats.setdefault(self.left_by_key[key].locative, Counter())
             item["only_left"] += 1
@@ -472,6 +744,19 @@ class LoadedFile:
     fmt: str
     label: str
     rows: list[VerdictRow]
+    strict_available: bool = False
+    sentences: dict[tuple[str, str, int], SentenceRecord] | None = None
+
+    def __post_init__(self) -> None:
+        self.strict_counts: Counter[str] = Counter(
+            row.strict_state for row in self.rows if row.strict_state
+        )
+        self.sentence_status_counts: Counter[str] = Counter(
+            value.status for value in (self.sentences or {}).values()
+        )
+        self.sentence_eligible_count = sum(
+            1 for value in (self.sentences or {}).values() if value.eligible
+        )
 
     @property
     def total(self) -> int:
@@ -490,6 +775,10 @@ class LoadedFile:
         return self.total - self.true_count - self.false_count
 
     @property
+    def effective_count(self) -> int:
+        return sum(row.effective for row in self.rows)
+
+    @property
     def complete_count(self) -> int:
         return sum(row.complete for row in self.rows)
 
@@ -498,6 +787,13 @@ class LoadedFile:
         return sum(
             1 for count in Counter(row.base for row in self.rows).values() if count > 1
         )
+
+    def strict_count(self, state: str) -> int:
+        return self.strict_counts.get(state, 0)
+
+    @property
+    def sentence_total(self) -> int:
+        return len(self.sentences) if self.sentences is not None else 0
 
 
 @dataclass
@@ -519,6 +815,21 @@ class PairSummary:
     order_ambiguous_common: int
     same_min_total: int
     same_max_total: int
+    strict_available: bool
+    strict_same: int
+    strict_different: int
+    strict_comparable: int
+    strict_transitions: dict[tuple[str, str], int]
+    common_effective: int
+    same_effective: int
+    sentence_available: bool
+    sentence_common: int
+    sentence_union: int
+    sentence_same: int
+    eligible_both: int
+    eligible_union: int
+    eligible_left_only: int
+    eligible_right_only: int
 
     @property
     def agreement(self) -> float | None:
@@ -526,9 +837,58 @@ class PairSummary:
 
     @property
     def agreement_text(self) -> str:
-        if not self.union:
+        """原始 extractable 一致率（兼容旧报告的名字）。"""
+        return _ratio_text(self.same, self.union)
+
+    @property
+    def strict_agreement(self) -> float | None:
+        if not self.strict_available:
+            return None
+        return self.strict_same / self.union if self.union else None
+
+    @property
+    def strict_agreement_text(self) -> str:
+        if not self.strict_available:
+            return "N/A（缺列，请重新导出）"
+        return _ratio_text(self.strict_same, self.union)
+
+    @property
+    def effective_agreement(self) -> float | None:
+        if not self.common_effective:
+            return None
+        return self.same_effective / self.common_effective
+
+    @property
+    def effective_agreement_text(self) -> str:
+        if not self.strict_available:
+            return "N/A（缺列，请重新导出）"
+        if not self.common_effective:
             return "N/A (0/0)"
-        return f"{self.agreement * 100:.2f}% ({self.same}/{self.union})"
+        return f"{self.effective_agreement * 100:.2f}% ({self.same_effective}/{self.common_effective})"
+
+    @property
+    def sentence_agreement(self) -> float | None:
+        if not self.sentence_available or not self.sentence_union:
+            return None
+        return self.sentence_same / self.sentence_union
+
+    @property
+    def sentence_agreement_text(self) -> str:
+        if not self.sentence_available:
+            return "N/A（需 JSONL）"
+        return _ratio_text(self.sentence_same, self.sentence_union)
+
+    @property
+    def eligibility_overlap(self) -> float | None:
+        if not self.sentence_available or not self.eligible_union:
+            return None
+        return self.eligible_both / self.eligible_union
+
+    @property
+    def eligibility_overlap_text(self) -> str:
+        if not self.sentence_available:
+            return "N/A（需 JSONL）"
+        return _ratio_text(self.eligible_both, self.eligible_union)
 
 
 def pair_summary_from_comparison(
@@ -550,6 +910,21 @@ def pair_summary_from_comparison(
         order_ambiguous_common=comparison.order_ambiguous_common,
         same_min_total=comparison.same_min_total,
         same_max_total=comparison.same_max_total,
+        strict_available=comparison.strict_available,
+        strict_same=comparison.strict_same,
+        strict_different=comparison.strict_different,
+        strict_comparable=comparison.strict_comparable,
+        strict_transitions=dict(comparison.strict_matrix),
+        common_effective=comparison.common_effective,
+        same_effective=comparison.same_effective,
+        sentence_available=comparison.sentence_available,
+        sentence_common=comparison.sentence_common,
+        sentence_union=comparison.sentence_union,
+        sentence_same=comparison.sentence_same,
+        eligible_both=comparison.eligible_both,
+        eligible_union=comparison.eligible_union,
+        eligible_left_only=comparison.eligible_left_only,
+        eligible_right_only=comparison.eligible_right_only,
     )
 
 
@@ -570,6 +945,22 @@ def _cell(value: Any) -> str:
     if isinstance(value, str):
         return value
     return str(value)
+
+
+def _bool_cell(value: Any) -> str:
+    """布尔字段写成小写 true/false；None 写空串，非布尔值明确标出。
+
+    JSONL 里可能混入字符串 "false" 之类的脏值。生产 ``verdict_status`` 不会把它
+    当成 False（最终归 error）；明细也不能按 Python 真值写成 true/false，否则会与
+    严格结论自相矛盾。
+    """
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if value is None:
+        return ""
+    return f"非布尔:{value!r}"
 
 
 def _offset_value(value: Any) -> int:
@@ -611,6 +1002,12 @@ def _make_row(
     verdict: bool | None,
     reason: Any = "",
     status: Any = "",
+    grammatical: bool | None = None,
+    spatial_coherent: bool | None = None,
+    verdict_source: Any = "",
+    record_status: Any = "",
+    strict_state: str | None = None,
+    strict_available: bool = False,
 ) -> VerdictRow:
     source = _cell(source_file)
     text = sentence_text(sentence)
@@ -633,6 +1030,12 @@ def _make_row(
         verdict=verdict,
         reason=_cell(reason),
         status=_cell(status),
+        grammatical=grammatical,
+        spatial_coherent=spatial_coherent,
+        verdict_source=_cell(verdict_source),
+        record_status=_cell(record_status) or _cell(status),
+        strict_state=strict_state,
+        strict_available=strict_available,
     )
 
 
@@ -652,12 +1055,32 @@ def _progress(stream, every: int, count: int, unit: str) -> None:
         print(f"已读取 {count} {unit}…", file=stream or sys.stderr, flush=True)
 
 
+def _csv_bool(value: Any, field: str, source: Path, line_no: int) -> bool | None:
+    """CSV 里的布尔字段：空串表示 None，只接受 true/false（大小写不敏感）。"""
+    text = _cell(value).strip().lower()
+    if not text:
+        return None
+    if text == "true":
+        return True
+    if text == "false":
+        return False
+    raise ValueError(
+        f"{source} 第 {line_no} 行「{field}」非法：{text!r}（只接受 true/false/空串）"
+    )
+
+
 def read_csv_rows(
     path: str | Path,
     *,
     progress_every: int = 50_000,
     progress_stream=None,
+    capabilities: dict | None = None,
 ) -> list[VerdictRow]:
+    """读新版或旧版逐词 CSV。
+
+    ``capabilities["strict_available"]`` 会写回严格状态是否可复算：
+    四列全有 = True；四列全无 = 旧版 False；只出现一部分直接报错。
+    """
     source = Path(path)
     if not source.is_file():
         raise FileNotFoundError(f"找不到输入文件：{source}")
@@ -675,7 +1098,26 @@ def read_csv_rows(
                     else ""
                 )
                 raise ValueError(f"{source} 缺列：{', '.join(missing)}{hint}")
+            strict_present = CSV_STRICT_REQUIRED & set(fieldnames)
+            if strict_present and strict_present != CSV_STRICT_REQUIRED:
+                missing_strict = sorted(CSV_STRICT_REQUIRED - strict_present)
+                raise ValueError(
+                    f"{source} 严格状态列不完整，缺：{', '.join(missing_strict)}；"
+                    "请用新版 export_extract_verdicts_csv.py 重新导出，"
+                    "或删除全部四个严格状态列后按旧版 CSV 比较"
+                )
+            strict_available = strict_present == CSV_STRICT_REQUIRED
+            if capabilities is not None:
+                capabilities["strict_available"] = strict_available
             for raw in reader:
+                # DictReader 对行尾缺失字段返回 None，对多余字段用 None 作键。
+                # 合法空单元格是空串；None 说明这一行的物理列数与表头不一致，
+                # 不能把它当成“来源缺失/字段缺失”继续算严格状态。
+                if None in raw or any(value is None for value in raw.values()):
+                    raise ValueError(
+                        f"{source} 第 {reader.line_num} 行字段数与表头不一致"
+                        "（行被截短或有多余列）"
+                    )
                 raw_verdict = _cell(raw.get("模型判定")).strip().lower()
                 if raw_verdict == "true":
                     verdict = True
@@ -707,6 +1149,41 @@ def read_csv_rows(
                         f"与「原句/方位词」不一致：offset={offset}, "
                         f"方位词={locative_value!r}"
                     )
+                grammatical = spatial_coherent = None
+                verdict_source = ""
+                strict_state = None
+                if strict_available:
+                    csv_extractable = _csv_bool(
+                        raw.get("extractable"),
+                        "extractable",
+                        source,
+                        reader.line_num,
+                    )
+                    if csv_extractable != verdict:
+                        raise ValueError(
+                            f"{source} 第 {reader.line_num} 行「extractable」与"
+                            f"「模型判定」不一致：{csv_extractable!r} != {verdict!r}"
+                        )
+                    grammatical = _csv_bool(
+                        raw.get("grammatical"), "grammatical", source, reader.line_num
+                    )
+                    spatial_coherent = _csv_bool(
+                        raw.get("spatial_coherent"),
+                        "spatial_coherent",
+                        source,
+                        reader.line_num,
+                    )
+                    # 不 strip：生产 verdict_status 按精确字符串判断 limit/error/no_llm，
+                    # " limit " 与 "limit" 不是同一状态；往返必须保真。
+                    verdict_source = _cell(raw.get("逐词判定来源"))
+                    strict_state = strict_verdict_state(
+                        {
+                            "extractable": verdict,
+                            "grammatical": grammatical,
+                            "spatial_coherent": spatial_coherent,
+                            "source": verdict_source or None,
+                        }
+                    )
                 rows.append(
                     _make_row(
                         line_no=raw.get("JSONL行号"),
@@ -721,6 +1198,12 @@ def read_csv_rows(
                         verdict=verdict,
                         reason=raw.get("判定理由"),
                         status=raw.get("整句筛选状态"),
+                        grammatical=grammatical,
+                        spatial_coherent=spatial_coherent,
+                        verdict_source=verdict_source,
+                        record_status=raw.get("整句筛选状态"),
+                        strict_state=strict_state,
+                        strict_available=strict_available,
                     )
                 )
                 _progress(progress_stream, progress_every, len(rows), "行判定")
@@ -805,7 +1288,7 @@ def _jsonl_verdict_rows(
         raise ValueError(
             f"{source} 第 {line_no} 行 candidate index 非法（不可哈希）：{exc}"
         ) from exc
-    status = screening.get("status")
+    record_status = record_screening_status(record)
     for verdict in verdicts:
         if not isinstance(verdict, dict):
             continue
@@ -836,6 +1319,7 @@ def _jsonl_verdict_rows(
             ) from exc
         if not isinstance(candidate, dict):
             candidate = {}
+        verdict_source = verdict.get("source")
         yield _make_row(
             line_no=line_no,
             source_file=record.get("source_file"),
@@ -848,8 +1332,22 @@ def _jsonl_verdict_rows(
             verb=_node_word(candidate.get("verb")),
             verdict=extractable_value,
             reason=verdict.get("reason"),
-            status=status,
+            status=record_status,
+            grammatical=verdict.get("grammatical"),
+            spatial_coherent=verdict.get("spatial_coherent"),
+            verdict_source=_cell(verdict_source),
+            record_status=record_status,
+            strict_state=strict_verdict_state(verdict),
+            strict_available=True,
         )
+
+
+@dataclass(frozen=True)
+class SentenceRecord:
+    """一条原句的整句状态；用于句级统计和下游准入比较。"""
+
+    status: str
+    eligible: bool
 
 
 def read_jsonl_rows(
@@ -857,13 +1355,20 @@ def read_jsonl_rows(
     *,
     progress_every: int = 50_000,
     progress_stream=None,
+    sentence_index: dict[tuple[str, str, int], SentenceRecord] | None = None,
 ) -> list[VerdictRow]:
-    """流式读取 JSONL；只保留判定投影，不把整份记录留在内存里。"""
+    """流式读取 JSONL；只保留判定投影，不把整份记录留在内存里。
+
+    传入 ``sentence_index`` 时同时收集**每条记录**（含 ``verdicts=[]`` 的 no_llm）
+    的整句状态与准入标志。句键是 ``(源文件, 原句, 同句出现序号)``，与逐词对齐
+    同一套“重复按出现顺序编号”的思路；同句重复时仍存在配对歧义。
+    """
     source = Path(path)
     if not source.is_file():
         raise FileNotFoundError(f"找不到输入文件：{source}")
     rows: list[VerdictRow] = []
     records = 0
+    sentence_seen: Counter[tuple[str, str]] = Counter()
     with source.open("r", encoding="utf-8") as handle:
         for line_no, line in enumerate(handle, 1):
             if not line.strip():
@@ -875,17 +1380,38 @@ def read_jsonl_rows(
             if not isinstance(record, dict):
                 raise ValueError(f"{source} 第 {line_no} 行不是 JSON 对象")
             records += 1
+            if sentence_index is not None:
+                text = sentence_text(record.get("sentence"))
+                document = _cell(record.get("source_file"))
+                base = (document, text)
+                occurrence = sentence_seen[base]
+                sentence_seen[base] += 1
+                sentence_index[(*base, occurrence)] = SentenceRecord(
+                    status=record_screening_status(record),
+                    eligible=judgement_eligible(record),
+                )
             rows.extend(_jsonl_verdict_rows(record, line_no, source))
             _progress(progress_stream, progress_every, records, "条记录")
     return assign_keys(rows)
 
 
 def compare_rows(
-    left: Sequence[VerdictRow], right: Sequence[VerdictRow]
+    left: Sequence[VerdictRow],
+    right: Sequence[VerdictRow],
+    *,
+    left_sentences: dict[tuple[str, str, int], SentenceRecord] | None = None,
+    right_sentences: dict[tuple[str, str, int], SentenceRecord] | None = None,
+    left_strict_available: bool | None = None,
+    right_strict_available: bool | None = None,
+    keyed: bool = False,
 ) -> Comparison:
-    # 允许调用方传入未编号的行（例如测试里直接构造的 VerdictRow）；已编号的行重算后不变。
-    left = assign_keys(list(left))
-    right = assign_keys(list(right))
+    # 读取器产出的行已经编号；keyed=True 时不再为每一对比较复制整份投影。
+    if not keyed:
+        left = assign_keys(list(left))
+        right = assign_keys(list(right))
+    else:
+        left = list(left)
+        right = list(right)
     left_by_key = {row.key: row for row in left}
     right_by_key = {row.key: row for row in right}
     if len(left_by_key) != len(left) or len(right_by_key) != len(right):
@@ -901,6 +1427,10 @@ def compare_rows(
         only_right_keys=only_right_keys,
         left_by_key=left_by_key,
         right_by_key=right_by_key,
+        left_sentences=left_sentences,
+        right_sentences=right_sentences,
+        left_strict_available=left_strict_available,
+        right_strict_available=right_strict_available,
     )
 
 
@@ -936,12 +1466,13 @@ def _locative_rows(comparison: Comparison) -> list[dict[str, Any]]:
         {
             "方位词": item["locative"],
             "共同": item.get("common", 0),
-            "相同": item.get("same", 0),
-            "不同": item.get("different", 0),
-            "true→false": item.get("tf", 0),
-            "false→true": item.get("ft", 0),
-            "unknown→unknown": item.get("uu", 0),
-            "unknown≠bool": item.get("udiff", 0),
+            "原始相同": item.get("raw_same", 0),
+            "原始不同": item.get("raw_different", 0),
+            "严格共同": item.get("strict_common", 0),
+            "严格相同": item.get("strict_same", 0),
+            "严格不同": item.get("strict_different", 0),
+            "有效共同": item.get("effective_common", 0),
+            "有效相同": item.get("effective_same", 0),
             "仅左": item.get("only_left", 0),
             "仅右": item.get("only_right", 0),
         }
@@ -955,16 +1486,19 @@ def format_summary(comparison: Comparison, left_path: Path, right_path: Path) ->
         f"左结果: {left_path}",
         f"右结果: {right_path}",
         "对齐口径: (源文件, 原句, 方位词, 方位词字符偏移, 同 base 序号)；"
-        "比较字段: 模型判定（true/false/unknown）",
+        "比较字段: 原始 extractable 三态 + 严格五态",
         "",
         f"左侧: 判定={c.left_total} "
-        f"(true={c.left_true}, false={c.left_false}, unknown={c.left_unknown})，"
+        f"(原始 true={c.left_true}, false={c.left_false}, unknown={c.left_unknown})，"
+        f"严格={_format_strict_counts(c.left_strict_counts)}，"
         f"完整三元组={c.left_complete}",
         f"右侧: 判定={c.right_total} "
-        f"(true={c.right_true}, false={c.right_false}, unknown={c.right_unknown})，"
+        f"(原始 true={c.right_true}, false={c.right_false}, unknown={c.right_unknown})，"
+        f"严格={_format_strict_counts(c.right_strict_counts)}，"
         f"完整三元组={c.right_complete}",
         "",
         f"共同判定项: {c.common}；两侧并集（矩阵分母）: {c.union}",
+        f"严格指标可用: {'是' if c.strict_available else '否（缺 strict 列，请重新导出）'}",
     ]
     if c.common:
         common_rate = (c.common_agreement or 0.0) * 100
@@ -986,6 +1520,45 @@ def format_summary(comparison: Comparison, left_path: Path, right_path: Path) ->
         )
     else:
         lines.append("  相同判断: N/A（没有可对齐的判定项）")
+
+    if c.strict_available:
+        lines.extend(
+            [
+                "",
+                f"严格逐词状态: 可比较={c.strict_comparable} "
+                f"(相同={c.strict_same}, 不同={c.strict_different})；"
+                f"并集口径 {_ratio_text(c.strict_same, c.union)}",
+                "严格状态转移（非零）:",
+            ]
+        )
+        transitions = [
+            f"    {left_state}→{right_state}: {count}"
+            for (left_state, right_state), count in sorted(c.strict_matrix.items())
+            if count
+        ]
+        lines.extend(transitions or ["    （无）"])
+        lines.extend(
+            [
+                f"有效判定一致率: {_ratio_text(c.same_effective, c.common_effective, unavailable='N/A (0/0)')}"
+                f"（共同有效项={c.common_effective}；error/limit/no_llm 不进入分母）",
+                f"有效判定覆盖率: 左={_ratio_text(c.left_effective, c.left_total, unavailable='N/A')}，"
+                f"右={_ratio_text(c.right_effective, c.right_total, unavailable='N/A')}",
+            ]
+        )
+    else:
+        lines.append("严格指标: N/A（缺 strict 列，请重新导出）")
+
+    if c.sentence_available:
+        lines.extend(
+            [
+                "",
+                f"整句状态: 共同={c.sentence_common} 并集={c.sentence_union} "
+                f"相同={c.sentence_same}；一致率 {_ratio_text(c.sentence_same, c.sentence_union)}",
+                f"下游准入句集: 双方={c.eligible_both}、仅左={c.eligible_left_only}、"
+                f"仅右={c.eligible_right_only}、并集={c.eligible_union}；"
+                f"重合率 {_ratio_text(c.eligible_both, c.eligible_union)}",
+            ]
+        )
 
     union_text = (
         "N/A (0/0)"
@@ -1025,7 +1598,7 @@ def _short(value: str, limit: int = 60) -> str:
 
 
 def _format_example(index: int, left: VerdictRow, right: VerdictRow | None) -> str:
-    left_verdict = left.verdict_text
+    left_verdict = f"{left.verdict_text}/{left.strict_state_text}"
     triple = " / ".join(part or "∅" for part in left.triple)
     head = (
         f"[{index}] 左行 {left.line_no} / 右行 "
@@ -1039,8 +1612,8 @@ def _format_example(index: int, left: VerdictRow, right: VerdictRow | None) -> s
     return (
         f"{head}\n"
         f"    左: {left_verdict} | {_short(left.reason)}\n"
-        f"    右: {right.verdict_text} | 三元组: {right_triple} | "
-        f"{_short(right.reason)}"
+        f"    右: {right.verdict_text}/{right.strict_state_text} | "
+        f"三元组: {right_triple} | {_short(right.reason)}"
     )
 
 
@@ -1078,6 +1651,14 @@ def _detail_row(comparison: Comparison, key: tuple, kind: str) -> dict[str, str]
     right = comparison.right_by_key.get(key)
     source = left or right
     assert source is not None
+    if left and right and left.strict_state and right.strict_state:
+        strict_kind = "相同" if left.strict_state == right.strict_state else "不同"
+    elif left and right:
+        strict_kind = "N/A"
+    elif left:
+        strict_kind = "仅左侧"
+    else:
+        strict_kind = "仅右侧"
     return {
         "比较结果": kind,
         "左侧行号": left.line_no if left else "",
@@ -1086,6 +1667,7 @@ def _detail_row(comparison: Comparison, key: tuple, kind: str) -> dict[str, str]
         "原句": source.sentence,
         "方位词": source.locative,
         "方位词字符偏移": str(source.locative_offset),
+        "重复序号": str(key[-1]),
         "左方位词下标": left.locative_index if left else "",
         "右方位词下标": right.locative_index if right else "",
         "左目标物": left.target if left else "",
@@ -1096,6 +1678,19 @@ def _detail_row(comparison: Comparison, key: tuple, kind: str) -> dict[str, str]
         "右动词": right.verb if right else "",
         "左判定": left.verdict_text if left else "",
         "右判定": right.verdict_text if right else "",
+        "左严格状态": left.strict_state_text if left else "",
+        "右严格状态": right.strict_state_text if right else "",
+        "严格比较结果": strict_kind,
+        "左extractable": _bool_cell(left.verdict) if left else "",
+        "左grammatical": _bool_cell(left.grammatical) if left else "",
+        "左spatial_coherent": _bool_cell(left.spatial_coherent) if left else "",
+        "右extractable": _bool_cell(right.verdict) if right else "",
+        "右grammatical": _bool_cell(right.grammatical) if right else "",
+        "右spatial_coherent": _bool_cell(right.spatial_coherent) if right else "",
+        "左逐词来源": left.verdict_source if left else "",
+        "右逐词来源": right.verdict_source if right else "",
+        "左整句状态": left.record_status if left else "",
+        "右整句状态": right.record_status if right else "",
         "三元组是否变化": (
             ("是" if left.triple != right.triple else "否") if left and right else ""
         ),
@@ -1339,7 +1934,9 @@ def load_input_files(
 ) -> list[LoadedFile]:
     files: list[LoadedFile] = []
     for index, path in enumerate(paths, 1):
-        rows, _ = load_rows(path, progress_every=progress_every)
+        rows, _, strict_available, sentences = load_rows(
+            path, progress_every=progress_every
+        )
         files.append(
             LoadedFile(
                 index=index,
@@ -1347,6 +1944,8 @@ def load_input_files(
                 fmt=fmt,
                 label=_file_label(path, index),
                 rows=rows,
+                strict_available=strict_available,
+                sentences=sentences,
             )
         )
     return files
@@ -1381,25 +1980,43 @@ def compare_all_pairs(
     for index, left in enumerate(files):
         for right in files[index + 1 :]:
             pair_no += 1
-            comparison = compare_rows(left.rows, right.rows)
+            comparison = compare_rows(
+                left.rows,
+                right.rows,
+                left_sentences=left.sentences,
+                right_sentences=right.sentences,
+                left_strict_available=left.strict_available,
+                right_strict_available=right.strict_available,
+                keyed=True,
+            )
             csv_name = pair_csv_name(left, right)
             write_pair_csv(comparison, staging_dir / csv_name)
             summary = pair_summary_from_comparison(
                 left, right, csv_name, comparison
             )
             summaries.append(summary)
+            # 及时释放本对的 Comparison（含左右行列表与两张 5x5 表），避免下一对
+            # 构造期间旧对象仍驻留，抬高多文件比较的峰值内存。
+            del comparison
             print(
                 f"[{pair_no}/{pair_total}] {left.label} vs {right.label}: "
-                f"共同={summary.common}, 并集={summary.union}, 相同={summary.same}, "
-                f"不同={summary.different}, 一致率={summary.agreement_text}",
+                f"共同={summary.common}, 并集={summary.union}, "
+                f"原始一致率={summary.agreement_text}, "
+                f"严格一致率={summary.strict_agreement_text}, "
+                f"有效判定={summary.effective_agreement_text}, "
+                f"句级={summary.sentence_agreement_text}, "
+                f"准入重合={summary.eligibility_overlap_text}",
                 file=progress_stream or sys.stdout,
             )
     return summaries
 
 
-def format_matrix_lines(
-    files: Sequence[LoadedFile], summaries: Sequence[PairSummary]
+def format_rate_matrix(
+    files: Sequence[LoadedFile],
+    summaries: Sequence[PairSummary],
+    value_attr: str,
 ) -> list[str]:
+    """按 ``PairSummary`` 的某个 ``*_text`` 属性生成文件间一致率矩阵。"""
     lookup = {
         (summary.left.index, summary.right.index): summary
         for summary in summaries
@@ -1416,9 +2033,16 @@ def format_matrix_lines(
                 cells.append("—")
                 continue
             summary = lookup.get((min(left.index, right.index), max(left.index, right.index)))
-            cells.append(summary.agreement_text if summary else "N/A")
+            cells.append(getattr(summary, value_attr) if summary else "N/A")
         lines.append("| " + " | ".join(_md_cell(cell) for cell in cells) + " |")
     return lines
+
+
+def format_matrix_lines(
+    files: Sequence[LoadedFile], summaries: Sequence[PairSummary]
+) -> list[str]:
+    """原始 extractable 一致率矩阵（兼容旧调用名）。"""
+    return format_rate_matrix(files, summaries, "agreement_text")
 
 
 def format_overall_markdown(
@@ -1427,40 +2051,151 @@ def format_overall_markdown(
     lines = [
         "# extract 方位词筛选结果总体对比",
         "",
+        "本报告分三层对比筛选结果：",
+        "",
+        "- **原始 extractable**：只看该词“是否空间可提取”的单项判断（与旧报告同口径，不代表能进入下游）。",
+        "- **严格逐词状态**：结合语法通顺、空间自洽和调用来源后的最终逐词状态；仅 `true` / `false` 为有效判定，`error`、`limit`、`no_llm` 各自独立。",
+        "- **整句与下游准入**（仅 JSONL）：整条语料只有未出错且通过（或未启用 LLM 的 `no_llm`）时，才允许进入后续 replace/标注。",
+        "",
         "## 输入文件",
+        "",
+        "以下标签（如 `01_...`）用于下文各对比表；`完整三元组` 指目标物、参照物、动词均非空；`同词位重复组` 指同一文件内相同 `(源文件, 原句, 方位词, 字符偏移)` 出现多次的组数。",
         "",
     ]
     lines.extend(
         _md_table(
             [
                 "编号",
+                "标签",
                 "文件",
                 "格式",
-                "判定数",
-                "true",
-                "false",
-                "unknown",
+                "逐词判定数",
                 "完整三元组",
-                "重复 base 组",
+                "同词位重复组",
             ],
             [
                 {
                     "编号": f"{item.index:02d}",
+                    "标签": item.label,
                     "文件": item.path,
                     "格式": item.fmt,
-                    "判定数": item.total,
-                    "true": item.true_count,
-                    "false": item.false_count,
-                    "unknown": item.unknown_count,
+                    "逐词判定数": item.total,
                     "完整三元组": item.complete_count,
-                    "重复 base 组": item.duplicate_groups,
+                    "同词位重复组": item.duplicate_groups,
                 }
                 for item in files
             ],
-            ["---", "---", "---", "---:"] + ["---:"] * 5,
+            ["---", "---", "---", "---", "---:", "---:", "---:"],
         )
     )
-    lines.extend(["", "## 两两对比汇总", ""])
+    lines.extend(
+        [
+            "",
+            "### 逐词状态分布",
+            "",
+            "`有效判定 = 严格true + 严格false`；`有效覆盖率 = 有效判定 / 逐词判定数`。",
+            "",
+        ]
+    )
+    lines.extend(
+        _md_table(
+            [
+                "标签",
+                "原始true",
+                "原始false",
+                "原始unknown",
+                "严格true",
+                "严格false",
+                "error",
+                "limit",
+                "no_llm",
+                "有效判定",
+                "有效覆盖率",
+            ],
+            [
+                {
+                    "标签": item.label,
+                    "原始true": item.true_count,
+                    "原始false": item.false_count,
+                    "原始unknown": item.unknown_count,
+                    "严格true": item.strict_count("true") if item.strict_available else "—",
+                    "严格false": item.strict_count("false") if item.strict_available else "—",
+                    "error": item.strict_count("error") if item.strict_available else "—",
+                    "limit": item.strict_count("limit") if item.strict_available else "—",
+                    "no_llm": item.strict_count("no_llm") if item.strict_available else "—",
+                    "有效判定": item.effective_count if item.strict_available else "—",
+                    "有效覆盖率": (
+                        _ratio_text(item.effective_count, item.total, unavailable="N/A")
+                        if item.strict_available
+                        else "—"
+                    ),
+                }
+                for item in files
+            ],
+            ["---"] + ["---:"] * 10,
+        )
+    )
+    lines.extend(
+        [
+            "",
+            "## 句级状态与下游准入",
+            "",
+            "按每条原句统计；`准入句` 指整句状态为 `true` 或 `no_llm`、可进入后续 replace/标注的句子（CSV 不含无逐词判定的记录，无法统计整句全量）。",
+            "",
+        ]
+    )
+    sentence_rows = []
+    for item in files:
+        if item.sentences is None:
+            sentence_rows.append(
+                {
+                    "编号": f"{item.index:02d}",
+                    "标签": item.label,
+                    "句数": "N/A（需 JSONL）",
+                    "true": "—",
+                    "false": "—",
+                    "error": "—",
+                    "limit": "—",
+                    "no_llm": "—",
+                    "准入句数": "—",
+                    "准入率": "—",
+                }
+            )
+            continue
+        sentence_rows.append(
+            {
+                "编号": f"{item.index:02d}",
+                "标签": item.label,
+                "句数": item.sentence_total,
+                "true": item.sentence_status_counts.get("true", 0),
+                "false": item.sentence_status_counts.get("false", 0),
+                "error": item.sentence_status_counts.get("error", 0),
+                "limit": item.sentence_status_counts.get("limit", 0),
+                "no_llm": item.sentence_status_counts.get("no_llm", 0),
+                "准入句数": item.sentence_eligible_count,
+                "准入率": _ratio_text(
+                    item.sentence_eligible_count,
+                    item.sentence_total,
+                    unavailable="N/A (0/0)",
+                ),
+            }
+        )
+    lines.extend(
+        _md_table(
+            ["编号", "标签", "句数", "true", "false", "error", "limit", "no_llm", "准入句数", "准入率"],
+            sentence_rows,
+            ["---", "---"] + ["---:"] * 8,
+        )
+    )
+    lines.extend(
+        [
+            "",
+            "## 两两对比：词级",
+            "",
+            "`共同` 为两侧按同一词位对齐的判定数；`并集 = 共同 + 仅左 + 仅右`；`有效共同` 仅包含两侧均为严格 `true`/`false` 的共同项。",
+            "",
+        ]
+    )
     lines.extend(
         _md_table(
             [
@@ -1469,9 +2204,13 @@ def format_overall_markdown(
                 "右",
                 "共同",
                 "并集",
-                "相同",
-                "不同",
-                "一致率",
+                "原始相同",
+                "原始一致率",
+                "严格相同",
+                "严格一致率",
+                "有效共同",
+                "有效相同",
+                "有效一致率",
                 "仅左",
                 "仅右",
                 "三元组变化",
@@ -1484,9 +2223,13 @@ def format_overall_markdown(
                     "右": summary.right.label,
                     "共同": summary.common,
                     "并集": summary.union,
-                    "相同": summary.same,
-                    "不同": summary.different,
-                    "一致率": summary.agreement_text,
+                    "原始相同": summary.same,
+                    "原始一致率": summary.agreement_text,
+                    "严格相同": summary.strict_same if summary.strict_available else "—",
+                    "严格一致率": summary.strict_agreement_text,
+                    "有效共同": summary.common_effective if summary.strict_available else "—",
+                    "有效相同": summary.same_effective if summary.strict_available else "—",
+                    "有效一致率": summary.effective_agreement_text,
                     "仅左": summary.only_left,
                     "仅右": summary.only_right,
                     "三元组变化": summary.triple_changed,
@@ -1494,22 +2237,156 @@ def format_overall_markdown(
                 }
                 for index, summary in enumerate(summaries, 1)
             ],
-            ["---", "---", "---"] + ["---:"] * 8 + ["---"],
+            ["---", "---", "---"] + ["---:"] * 12 + ["---"],
         )
     )
     lines.extend(
         [
             "",
-            "## 一致性矩阵",
+            "## 两两对比：句级",
             "",
-            "单元格为 `一致率（相同/并集）`；分母是两侧 key 的并集 "
-            "`共同 + 仅左 + 仅右`，仅单侧项也进入分母但不计入相同。"
-            "对角线不与自己比较，写 `—`；并集为 0 时写 `N/A (0/0)`。",
+            "按 `(源文件, 原句, 同句出现序号)` 对齐原句；`准入并集 = 双方准入 + 仅左准入 + 仅右准入`。",
             "",
         ]
     )
-    lines.extend(format_matrix_lines(files, summaries))
-    lines.extend(["", "## 重复 base 歧义警告", ""])
+    lines.extend(
+        _md_table(
+            [
+                "#",
+                "左",
+                "右",
+                "共同句",
+                "句并集",
+                "句状态相同",
+                "句状态一致率",
+                "双方准入",
+                "仅左准入",
+                "仅右准入",
+                "准入并集",
+                "准入重合率",
+            ],
+            [
+                {
+                    "#": index,
+                    "左": summary.left.label,
+                    "右": summary.right.label,
+                    "共同句": summary.sentence_common if summary.sentence_available else "—",
+                    "句并集": summary.sentence_union if summary.sentence_available else "—",
+                    "句状态相同": summary.sentence_same if summary.sentence_available else "—",
+                    "句状态一致率": summary.sentence_agreement_text,
+                    "双方准入": summary.eligible_both if summary.sentence_available else "—",
+                    "仅左准入": summary.eligible_left_only if summary.sentence_available else "—",
+                    "仅右准入": summary.eligible_right_only if summary.sentence_available else "—",
+                    "准入并集": summary.eligible_union if summary.sentence_available else "—",
+                    "准入重合率": summary.eligibility_overlap_text,
+                }
+                for index, summary in enumerate(summaries, 1)
+            ],
+            ["---", "---", "---"] + ["---:"] * 9,
+        )
+    )
+    lines.extend(
+        [
+            "",
+            "## 逐词严格状态转移（非零）",
+            "",
+            "仅统计两侧均存在且严格状态可计算的共同项；`error`、`limit`、`no_llm` 各自独立，不互算相同。",
+            "",
+        ]
+    )
+    transition_rows = []
+    for summary in summaries:
+        for left_state in STRICT_STATES:
+            for right_state in STRICT_STATES:
+                count = summary.strict_transitions.get((left_state, right_state), 0)
+                if count:
+                    transition_rows.append(
+                        {
+                            "对比": f"{summary.left.label} vs {summary.right.label}",
+                            "左状态": left_state,
+                            "右状态": right_state,
+                            "数量": count,
+                            "占共同项": (
+                                f"{count / summary.strict_comparable * 100:.2f}%"
+                                if summary.strict_comparable
+                                else "N/A"
+                            ),
+                        }
+                    )
+    if transition_rows:
+        lines.extend(
+            _md_table(
+                ["对比", "左状态", "右状态", "数量", "占共同项"],
+                transition_rows,
+                ["---", "---", "---", "---:", "---:"],
+            )
+        )
+    else:
+        lines.append("无可统计的严格状态转移（可能缺列或没有共同项）。")
+    lines.extend(
+        [
+            "",
+            "## 一致性矩阵",
+            "",
+            "对角线 `—` 表示不与自身比较；分母为 0 时记 `N/A (0/0)`；旧版 CSV 缺严格列时记 `N/A（缺列，请重新导出）`；CSV 不计算句级指标时记 `N/A（需 JSONL）`。",
+            "",
+            "### 原始 extractable 一致率",
+            "",
+            "口径：只看 `extractable` 是否一致（`相同数 / 两侧词键并集`；`unknown→unknown` 记为相同）。",
+            "",
+        ]
+    )
+    lines.extend(format_rate_matrix(files, summaries, "agreement_text"))
+    lines.extend(
+        [
+            "",
+            "### 严格逐词状态一致率",
+            "",
+            "口径：严格五态完全一致才算相同（`相同数 / 两侧词键并集`；`error`、`limit`、`no_llm` 各自独立，不互算相同）。",
+            "",
+        ]
+    )
+    lines.extend(format_rate_matrix(files, summaries, "strict_agreement_text"))
+    lines.extend(
+        [
+            "",
+            "### 有效判定一致率",
+            "",
+            "口径：只在双方都给出严格 `true`/`false` 的共同项内比较（`有效相同 / 有效共同`；未完成项不进入分母）。",
+            "",
+        ]
+    )
+    lines.extend(format_rate_matrix(files, summaries, "effective_agreement_text"))
+    lines.extend(
+        [
+            "",
+            "### 句级状态一致率",
+            "",
+            "口径：整句筛选状态是否一致（`相同句数 / 两侧句键并集`；仅 JSONL）。",
+            "",
+        ]
+    )
+    lines.extend(format_rate_matrix(files, summaries, "sentence_agreement_text"))
+    lines.extend(
+        [
+            "",
+            "### 下游准入句集重合率",
+            "",
+            "口径：双方都能进入下游的句子在至少一侧准入句子中的占比（`双方准入 / 准入并集`；准入指整句为 `true` 或 `no_llm`；仅 JSONL）。",
+            "",
+        ]
+    )
+    lines.extend(format_rate_matrix(files, summaries, "eligibility_overlap_text"))
+    lines.extend(
+        [
+            "",
+            "## 原始 extractable 重复 base 歧义警告",
+            "",
+            "同一源文件里，相同的 `(原句, 方位词, 字符偏移)` 在单文件内出现多次时，只能按出现顺序第 1 对第 1、第 2 对第 2 配对。",
+            "本节只量化**原始 extractable** 的相同数可能范围；严格五态与句级指标同样按出现顺序配对、存在相同歧义，但未单独计算其范围。",
+            "",
+        ]
+    )
     warnings = [
         summary
         for summary in summaries
@@ -1520,15 +2397,15 @@ def format_overall_markdown(
     if warnings:
         lines.extend(
             _md_table(
-                ["对比", "次数不等（两侧都有）", "顺序歧义组", "顺序歧义项", "相同判断范围"],
+                ["对比", "两侧次数不等组", "顺序歧义组", "顺序歧义项", "原始相同数可能范围"],
                 [
                     {
                         "对比": f"{item.left.label} vs {item.right.label}",
-                        "次数不等（两侧都有）": item.duplicate_unequal_both,
+                        "两侧次数不等组": item.duplicate_unequal_both,
                         "顺序歧义组": item.order_ambiguous_groups,
                         "顺序歧义项": item.order_ambiguous_common,
-                        "相同判断范围": f"[{item.same_min_total}, {item.same_max_total}]"
-                        f"（当前={item.same}）",
+                        "原始相同数可能范围": f"[{item.same_min_total}, {item.same_max_total}]"
+                        f"（按顺序={item.same}）",
                     }
                     for item in warnings
                 ],
@@ -1536,22 +2413,17 @@ def format_overall_markdown(
             )
         )
     else:
-        lines.append("未发现重复 base 配对歧义。")
+        lines.append("未发现原始 extractable 的重复词位配对歧义。")
     lines.extend(
         [
             "",
             "## 口径说明",
             "",
-            "- 对齐 key: `(源文件, 原句, 方位词, 方位词字符偏移, 同 base 序号)`。",
-            "- 比较字段: `模型判定` 的 true/false/unknown；三元组文本变化单独统计。",
-            "- `unknown` 是实际存在的 verdict 没拿到判定（典型 limit/error；"
-            "旧数据可能含逐词 no_llm），不是 false；它参与共同项、仅单侧和分母统计。",
-            "- 真实 `no_llm` 记录 `verdicts=[]`，不产生比较行；"
-            "`unknown` 不用于表示整条记录未启用 LLM。",
-            "- 共同项中 `unknown` 对 `unknown` 计为相同状态，"
-            "`unknown` 对 true/false 计为不同；因此这里的一致率是三态状态一致率。",
-            "- 两两 CSV 保留全部共同相同、共同不同、仅左侧、仅右侧明细。",
-            "- 差异本身不是错误；只有至少一对两侧并集为 0 时才返回 1。",
+            "- **对齐方式**：词级按 `(源文件, 原句, 方位词, 字符偏移, 同位置出现序号)` 对齐；句级按 `(源文件, 原句, 同句出现序号)` 对齐。JSONL 行号、三元组文本与整句状态均不参与词级对齐。",
+            "- **严格判定规则**：严格 `true` 要求 `extractable`、`grammatical`、`spatial_coherent` 全为 true 且来源不是 `error`/`limit`/`no_llm`；来源不是上述三类且三项中任一为 false 时为严格 `false`；其余（如缺少字段、类型异常）为 `error`。",
+            "- **三元组变化**：仅统计共同项中 `(目标物, 参照物, 动词)` 文本是否不同；混合真值句中被判 `false` 的词位三元组可能已被剪除。",
+            "- **无逐词判定的记录**：未启用 LLM 且没有逐词判定的 `no_llm` 句子只计入句级统计，不会伪造词级行。",
+            "- **旧版 CSV 与明细**：缺少严格四列的旧版 CSV 仍可输出原始一致率，严格指标记 `N/A（缺列，请重新导出）`；同目录下的两两明细 CSV 保留全部共同项和仅单侧项。",
             "",
         ]
     )
@@ -1570,31 +2442,49 @@ def print_terminal_summary(
     print(f"已加载 {len(files)} 个文件，完成 {len(summaries)} 对比较")
     print()
     print(
-        "| 编号 | 文件 | 判定数 | true | false | unknown | 完整三元组 | 重复 base 组 |"
+        "| 编号 | 文件 | 判定数 | 原始true | 原始false | 原始unknown | "
+        "严格true | 严格false | error | limit | no_llm | 有效判定 | 完整三元组 | 重复 base 组 |"
     )
-    print("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |")
+    print("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
     for item in files:
         print(
             f"| {item.index:02d} | {item.path} | {item.total} | "
             f"{item.true_count} | {item.false_count} | {item.unknown_count} | "
+            f"{item.strict_count('true') if item.strict_available else '—'} | "
+            f"{item.strict_count('false') if item.strict_available else '—'} | "
+            f"{item.strict_count('error') if item.strict_available else '—'} | "
+            f"{item.strict_count('limit') if item.strict_available else '—'} | "
+            f"{item.strict_count('no_llm') if item.strict_available else '—'} | "
+            f"{item.effective_count if item.strict_available else '—'} | "
             f"{item.complete_count} | {item.duplicate_groups} |"
         )
     print()
     print(
-        "| 对比 | 共同 | 并集 | 相同 | 不同 | 一致率 | 仅左 | 仅右 | 明细 CSV |"
+        "| 对比 | 共同 | 并集 | 原始一致率 | 严格一致率 | 有效一致率 | "
+        "句级一致率 | 准入重合率 | 仅左 | 仅右 | 明细 CSV |"
     )
-    print("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |")
+    print("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |")
     for summary in summaries:
         print(
             f"| {summary.left.label} vs {summary.right.label} | "
-            f"{summary.common} | {summary.union} | {summary.same} | "
-            f"{summary.different} | "
-            f"{summary.agreement_text} | {summary.only_left} | "
+            f"{summary.common} | {summary.union} | "
+            f"{summary.agreement_text} | {summary.strict_agreement_text} | "
+            f"{summary.effective_agreement_text} | {summary.sentence_agreement_text} | "
+            f"{summary.eligibility_overlap_text} | {summary.only_left} | "
             f"{summary.only_right} | {summary.csv_name} |"
         )
     print()
-    print("一致性矩阵:")
-    print("\n".join(format_matrix_lines(files, summaries)))
+    print("原始 extractable 一致率矩阵:")
+    print("\n".join(format_rate_matrix(files, summaries, "agreement_text")))
+    print()
+    print("严格逐词状态一致率矩阵:")
+    print("\n".join(format_rate_matrix(files, summaries, "strict_agreement_text")))
+    print()
+    print("有效判定一致率矩阵:")
+    print("\n".join(format_rate_matrix(files, summaries, "effective_agreement_text")))
+    print()
+    print("句级状态一致率矩阵:")
+    print("\n".join(format_rate_matrix(files, summaries, "sentence_agreement_text")))
     print()
     print(f"输出目录: {output_dir}")
     print(f"总体报告: {output_dir / SUMMARY_FILENAME}")
@@ -1614,17 +2504,35 @@ def load_rows(
     *,
     progress_every: int = 50_000,
     progress_stream=None,
-) -> tuple[list[VerdictRow], str]:
+) -> tuple[
+    list[VerdictRow],
+    str,
+    bool,
+    dict[tuple[str, str, int], SentenceRecord] | None,
+]:
+    """读一个输入文件，返回 ``(rows, fmt, strict_available, sentences)``。
+
+    ``sentences`` 只有 JSONL 才非 None；CSV 会漏掉 ``verdicts=[]`` 的记录，
+    无法还原全量句级指标，因此不能用词行反推句级统计。
+    """
     fmt = detect_format(path)
     if fmt == "csv":
+        capabilities: dict = {}
         rows = read_csv_rows(
-            path, progress_every=progress_every, progress_stream=progress_stream
+            path,
+            progress_every=progress_every,
+            progress_stream=progress_stream,
+            capabilities=capabilities,
         )
-    else:
-        rows = read_jsonl_rows(
-            path, progress_every=progress_every, progress_stream=progress_stream
-        )
-    return rows, fmt
+        return rows, fmt, bool(capabilities.get("strict_available")), None
+    sentences: dict[tuple[str, str, int], SentenceRecord] = {}
+    rows = read_jsonl_rows(
+        path,
+        progress_every=progress_every,
+        progress_stream=progress_stream,
+        sentence_index=sentences,
+    )
+    return rows, fmt, True, sentences
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

@@ -14,6 +14,13 @@ CSV 行。CSV 同时写出方位词在拼接原句中的字符偏移，供比较
 ``verdict.index == candidate.index`` 对应。混合判定的整句里，被判 false 的候选会被
 前序流程裁掉，或 grounding 本身失败（``candidates=[]``），此时角色留空，不猜测补全。
 
+除兼容列外，另导出可复算严格判定的字段：``extractable``、``grammatical``、
+``spatial_coherent``、``逐词判定来源``、``严格状态``、``整句准入``。``模型判定`` 保持
+原始 extractable 三态；``严格状态`` 是生产 ``verdict_status`` 的五态
+（true/false/error/limit/no_llm），error/limit/no_llm 分别独立。比较脚本不信任
+``严格状态`` 的文本，而是从四个原始字段复算；这四列缺任意一列都会被比较脚本拒绝
+（四列全无则按旧版 CSV 降级为“严格指标 N/A”）。
+
 一行对应一个方位词判定，因此同一句可能有多行。输出为 UTF-8 BOM 的 CSV，方便 Excel
 直接打开；不按句子或词形去重，保持输入顺序。
 
@@ -43,6 +50,20 @@ import sys
 import tempfile
 from typing import Any, Iterator
 
+if __package__:
+    from .verdict_status import (
+        judgement_eligible,
+        record_screening_status,
+        strict_verdict_state,
+    )
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from verdict_status import (  # noqa: E402
+        judgement_eligible,
+        record_screening_status,
+        strict_verdict_state,
+    )
+
 ROOT_DIR = Path(__file__).resolve().parents[2]
 RESULTS_DIR = ROOT_DIR / "results" / "extract_result"
 CORPUS_GLOB = "location_corpus_with_locative_split_*.jsonl"
@@ -61,6 +82,14 @@ CSV_COLUMNS = [
     "判定理由",
     "判定来源",
     "整句筛选状态",
+    # 以下六列让比较脚本能复算严格状态；缺这四列（或只出现一部分）的旧 CSV
+    # 不能反推严格判定，比较时会明确降级/报错。
+    "extractable",
+    "grammatical",
+    "spatial_coherent",
+    "逐词判定来源",
+    "严格状态",
+    "整句准入",
 ]
 
 
@@ -106,6 +135,15 @@ def _cell(value: Any) -> str:
     if isinstance(value, str):
         return value
     return str(value)
+
+
+def _bool_text(value: Any) -> str:
+    """布尔字段写小写 true/false；None 写空串，不伪装成 false。"""
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    return ""
 
 
 def _node_word(node: Any) -> str:
@@ -155,7 +193,9 @@ def _locative_offset(
     raise ValueError(f"{where} sentence 类型非法：{type(sentence).__name__}")
 
 
-def _verdict_rows(record: dict[str, Any], line_no: int) -> Iterator[dict[str, str]]:
+def _verdict_rows(
+    record: dict[str, Any], line_no: int, source: Path
+) -> Iterator[dict[str, str]]:
     """产出一条记录里所有逐词判定行（true/false/unknown）。"""
     screening = record.get("screening")
     if not isinstance(screening, dict):
@@ -176,7 +216,8 @@ def _verdict_rows(record: dict[str, Any], line_no: int) -> Iterator[dict[str, st
 
     sentence = sentence_text(record.get("sentence"))
     source_file = _cell(record.get("source_file"))
-    status = _cell(screening.get("status"))
+    status = record_screening_status(record)
+    eligible = judgement_eligible(record)
 
     for verdict in verdicts:
         if not isinstance(verdict, dict):
@@ -191,7 +232,12 @@ def _verdict_rows(record: dict[str, Any], line_no: int) -> Iterator[dict[str, st
         elif extractable is None:
             verdict_text = "unknown"
         else:
-            continue
+            # 静默跳过会让“严格状态统计”与真正写出的行数不一致；比较脚本对同一
+            # 输入也会报错。导出与比较保持同一口径：非法 extractable 直接失败。
+            raise ValueError(
+                f"{source} 第 {line_no} 行 verdict extractable 非法："
+                f"{extractable!r}（只接受 true/false/None）"
+            )
         index = verdict.get("index")
         try:
             candidate = candidates_by_index.get(index)
@@ -220,6 +266,13 @@ def _verdict_rows(record: dict[str, Any], line_no: int) -> Iterator[dict[str, st
             "判定理由": _cell(verdict.get("reason")),
             "判定来源": _cell(verdict.get("source") or screening.get("source")),
             "整句筛选状态": status,
+            "extractable": _bool_text(extractable),
+            "grammatical": _bool_text(verdict.get("grammatical")),
+            "spatial_coherent": _bool_text(verdict.get("spatial_coherent")),
+            # 不 strip：生产按精确来源字符串判断 limit/error/no_llm，往返必须保真。
+            "逐词判定来源": _cell(verdict.get("source")),
+            "严格状态": strict_verdict_state(verdict),
+            "整句准入": "true" if eligible else "false",
         }
 
 
@@ -285,26 +338,24 @@ def export_jsonl_to_csv(
                     stats["records"] += 1
 
                     screening = record.get("screening")
-                    status = screening.get("status") if isinstance(screening, dict) else None
-                    stats[f"record_status_{_cell(status) or 'missing'}"] += 1
+                    status = record_screening_status(record)
+                    stats[f"record_status_{status}"] += 1
+                    stats["record_eligible" if judgement_eligible(record) else "record_ineligible"] += 1
                     verdicts = screening.get("verdicts") if isinstance(screening, dict) else None
-                    if isinstance(verdicts, list):
-                        for verdict in verdicts:
-                            if not isinstance(verdict, dict):
-                                continue
-                            extractable = verdict.get("extractable")
-                            if extractable is True:
-                                stats["verdict_true"] += 1
-                            elif extractable is False:
-                                stats["verdict_false"] += 1
-                            else:
-                                stats["verdict_null"] += 1
+                    if not isinstance(verdicts, list) or not verdicts:
+                        stats["record_no_verdicts"] += 1
 
-                    for row in _verdict_rows(record, line_no):
+                    # 统计只从真正写出的行累加：非法 verdict 会直接报错，
+                    # 不会再出现“打印严格 false=1、实际写出 0 行”的错位。
+                    for row in _verdict_rows(record, line_no, source):
                         if not row["目标物"] or not row["参照物"]:
                             stats["rows_missing_role"] += 1
                         if row["模型判定"] == "unknown":
+                            stats["verdict_null"] += 1
                             stats["rows_unknown"] += 1
+                        else:
+                            stats[f"verdict_{row['模型判定']}"] += 1
+                        stats[f"strict_{row['严格状态']}"] += 1
                         writer.writerow(row)
                         stats["rows_written"] += 1
 
@@ -380,9 +431,12 @@ def main(argv: list[str] | None = None) -> int:
 
     print(
         f"已写出 {target}：{stats['rows_written']} 行 "
-        f"(true={stats.get('verdict_true', 0)}, false={stats.get('verdict_false', 0)}, "
-        f"unknown={stats.get('rows_unknown', 0)})；"
-        f"读取 {stats['records']} 条记录"
+        f"(原始 true={stats.get('verdict_true', 0)}, false={stats.get('verdict_false', 0)}, "
+        f"unknown={stats.get('rows_unknown', 0)}；"
+        f"严格 true={stats.get('strict_true', 0)}, false={stats.get('strict_false', 0)}, "
+        f"error={stats.get('strict_error', 0)}, limit={stats.get('strict_limit', 0)}, "
+        f"no_llm={stats.get('strict_no_llm', 0)})；"
+        f"读取 {stats['records']} 条记录，准入 {stats.get('record_eligible', 0)} 条"
     )
     return 0
 

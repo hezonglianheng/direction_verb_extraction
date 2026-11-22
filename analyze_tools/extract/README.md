@@ -11,8 +11,9 @@
 
 | 文件 | 用途 |
 | --- | --- |
-| `compare_extract_verdicts.py` | 对比 2 个或更多 extract 筛选结果，输出两两明细 CSV 和总体一致性矩阵 Markdown |
-| `export_extract_verdicts_csv.py` | 从 extract 结果 JSONL 导出逐方位词判定（true/false/unknown）CSV |
+| `compare_extract_verdicts.py` | 对比 2 个或更多 extract 筛选结果，输出原始/严格/句级三层一致率、矩阵和明细 CSV |
+| `export_extract_verdicts_csv.py` | 从 extract 结果 JSONL 导出逐方位词判定及可复算严格状态的 CSV |
+| `verdict_status.py` | 纯标准库的逐词/整句状态镜像；与生产 `sentence_screening` 有 parity 测试 |
 
 ---
 
@@ -64,11 +65,20 @@ analyze_results/compare_verdicts/<YYYYmmdd_HHMMSS>/
 每个 pair CSV 的列固定为：
 
 ```text
-比较结果, 左侧行号, 右侧行号, 源文件, 原句, 方位词,
-方位词字符偏移, 左方位词下标, 右方位词下标,
+比较结果, 左侧行号, 右侧行号, 源文件, 原句, 方位词, 方位词字符偏移, 重复序号,
+左方位词下标, 右方位词下标,
 左目标物, 左参照物, 左动词, 右目标物, 右参照物, 右动词,
-左判定, 右判定, 三元组是否变化, 左理由, 右理由
+左判定, 右判定, 左严格状态, 右严格状态, 严格比较结果,
+左extractable, 左grammatical, 左spatial_coherent,
+右extractable, 右grammatical, 右spatial_coherent,
+左逐词来源, 右逐词来源, 左整句状态, 右整句状态,
+三元组是否变化, 左理由, 右理由
 ```
+
+`比较结果` 只反映原始 extractable 三态；`严格比较结果` 反映严格五态。
+`左/右extractable`、`左/右grammatical`、`左/右spatial_coherent` 写小写
+true/false/空串；JSONL 中的非布尔脏值会写成 `非布尔:<repr>`，不会按 Python
+真值伪装成 true/false。
 
 行顺序为：共同相同/不同项（按左侧原始顺序）→ 仅左侧 → 仅右侧。CSV 使用 UTF-8 BOM，便于 Excel 直接打开。
 
@@ -76,23 +86,55 @@ analyze_results/compare_verdicts/<YYYYmmdd_HHMMSS>/
 
 包含：
 
-1. **输入文件表**：编号、路径、格式、判定数、true/false/unknown、完整三元组数、重复 base 组数；
-2. **两两对比汇总表**：共同、并集、相同、不同、一致率、仅左、仅右、三元组变化和明细 CSV 链接；
-3. **一致性矩阵**；
-4. **重复 base 歧义警告**；
-5. **口径说明**。
+1. **输入文件与逐词状态分布**：编号、标签、路径、格式、逐词判定数、完整三元组数、
+   同词位重复组数，以及原始 true/false/unknown 与严格 true/false/error/limit/no_llm、
+   有效判定与覆盖率；
+2. **句级状态与下游准入表**（仅 JSONL）：句数、整句 true/false/error/limit/no_llm、
+   准入句数与准入率；
+3. **两两对比：词级**：共同、并集、原始一致率、严格一致率、有效共同/有效相同/有效一致率、
+   仅左、仅右、三元组变化和明细 CSV 链接；
+4. **两两对比：句级**：共同句、句并集、句状态一致率、双方准入、仅左/仅右准入、
+   准入重合率；
+5. **逐词严格状态转移**（非零）：每一种 `左状态 → 右状态` 的数量及占共同项比例；
+6. **五组一致性矩阵**：原始 extractable、严格逐词状态、有效判定、句级状态、下游准入句集；
+7. **原始 extractable 重复 base 歧义警告**：只量化原始三态的相同数范围；
+   严格五态和句级使用同一套序号配对，存在同样歧义，但本表不量化；
+8. **口径说明**。
 
-一致性矩阵的单元格格式为：
+### 三层口径
 
-```text
-一致率（相同/并集）
-```
+1. **原始 extractable 三态**：只比较 `extractable` 的 true/false/unknown。这是旧报告
+   的“一致率”，保留用于对照，但 `extractable=true` 不代表下游可用。
+2. **严格逐词五态**：按生产 `verdict_status` 口径分成
+   `true / false / error / limit / no_llm`。`error` 是调用/输出异常或字段不完整，
+   `limit` 是额度未送，`no_llm` 是未启用 LLM；三者分别独立，绝不互算相同。
+   只有 `true` 和 `false` 是有效判定；严格 true 要求
+   `extractable`、`grammatical`、`spatial_coherent` 全为 true，且来源不是
+   error/limit/no_llm。
+3. **整句状态与下游准入**（仅 JSONL）：按 `screening_status` 统计整句五态，并按
+   “true 或 no_llm”比较下游准入句集。CSV 会漏掉 `verdicts=[]` 的 no_llm 句，
+   所以 CSV 的句级指标记 `N/A（需 JSONL）`，不用词行数代替句数。
 
-- 分母是两侧 key 的并集 `共同 + 仅左 + 仅右`，仅单侧项也进入分母；
-- `unknown`（没拿到 true/false 判定）参与共同项和分母统计，不会被当成 `false`；
-- 共同项中 `unknown` 对 `unknown` 计为“相同状态”，`unknown` 对 true/false 计为不同；因此这里的一致率是**三态状态一致率**，不只是有效模型判定一致率；
-- 对角线表示“不与自己比较”，写 `—`；
-- 两侧并集为 0 时写 `N/A (0/0)`，不会伪装成 0% 或 100%。
+### 一致率与分母
+
+- **原始一致率**：共同项中三态相同数 / 两侧 key 并集 `共同 + 仅左 + 仅右`；
+  `unknown→unknown` 记为原始状态相同。
+- **严格一致率**：共同项中五态相同数 / 同一并集；`error→error`、`limit→limit`、
+  `no_llm→no_llm` 只表示状态相同，不代表已得到有效判定。
+- **有效判定一致率**：只在两侧都是严格 true/false 的共同项内计算
+  `相同数 / 有效共同项`；error/limit/no_llm 不进入分母。另报两侧有效判定覆盖率，
+  避免只看一个高一致率。
+- **句级状态一致率**：共同句键中整句状态相同数 / 句键并集。
+- **准入重合率**：两侧都准入的句数 / 至少一侧准入的句数；另列仅左/仅右准入。
+- 对角线表示“不与自己比较”，写 `—`；分母为 0 时写 `N/A (0/0)`，
+  严格列不可用时写 `N/A（缺列，请重新导出）`，句级不可用时写 `N/A（需 JSONL）`。
+
+### 旧版 CSV
+
+旧版 CSV 没有 `extractable`、`grammatical`、`spatial_coherent`、`逐词判定来源`
+四列，无法反推严格状态。此时仍输出原始 extractable 一致率；严格指标记
+`N/A（缺列，请重新导出）`，不把缺列伪装成生产 `error`。只出现其中一部分列属于
+导出损坏，直接报错。新版导出脚本会写全这四列及展示用的 `严格状态`、`整句准入`。
 
 示例（数值仅示意格式，实际以当次并集分母为准）：
 
@@ -162,11 +204,18 @@ python analyze_tools/extract/compare_extract_verdicts.py \
 
 ### 资源与限制
 
-- 每个输入文件只加载一次；常驻内存约为所有输入判定投影之和。每个 pair 比较时还会临时复制左右两边的行对象并建立 key 索引，峰值约为“两侧投影 + 索引”的 2 倍左右，pair 结束后释放。
-- 输出磁盘和比较时间为 `O(N²)`：N 个文件生成 `N(N-1)/2` 个 pair CSV。
+- 每个输入文件只加载一次；常驻内存约为所有输入判定投影之和（JSONL 另含句级索引）。
+  读取器产出的行已经编号，pair 比较走 `keyed=True` 不再复制整份投影；每对结束显式
+  `del comparison`，避免下一对构造期间旧对象仍驻留。N 个文件仍会生成
+  `N(N-1)/2` 个 pair CSV，输出与时间为 `O(N²)`，但不额外复制 N 份行对象。
 - 全量明细 CSV 可能很大（三份真实结果约 166MB），但不做静默截断。
-- 仅比较 `模型判定` 的 true/false/unknown；理由、`grammatical`、`spatial_coherent` 等字段不在比较范围内。
-- 重复 base 的顺序配对歧义无法完全消除，需结合 `summary.md` 的警告解释一致率。
+- 全量明细 CSV 可能很大（三份真实结果约 166MB），但不做静默截断。
+- 原始指标只比较 `extractable` 的 true/false/unknown；严格指标另外读取
+  `grammatical`、`spatial_coherent` 与逐词来源，理由文本不参与一致率。
+- 句级指标只对 JSONL 计算；CSV 缺 `verdicts=[]` 的记录，不能反推句级全量。
+- 旧版 CSV 四列严格字段全缺时降级为“原始指标可用、严格指标 N/A”；只缺一部分会报错。
+- 重复 base 的顺序配对歧义无法完全消除；`summary.md` 的警告只量化原始 extractable
+  的相同数范围，严格五态和句级指标存在同样的配对歧义但未量化，解释时不能假定它们无歧义。
 
 ---
 
@@ -187,8 +236,21 @@ python analyze_tools/extract/compare_extract_verdicts.py \
 ```text
 JSONL行号, 原句, 源文件, 方位词, 方位词下标, 方位词字符偏移,
 目标物, 参照物, 动词,
-模型判定, 判定理由, 判定来源, 整句筛选状态
+模型判定, 判定理由, 判定来源, 整句筛选状态,
+extractable, grammatical, spatial_coherent, 逐词判定来源, 严格状态, 整句准入
 ```
+
+字段口径：
+
+- `模型判定` 仍是原始 `extractable` 三态 true/false/unknown；
+- `extractable`/`grammatical`/`spatial_coherent` 写小写 true/false，缺失写空串，
+  不把 null 伪装成 false；
+- `判定来源` 为兼容列，缺失时回退到整句 `screening.source`；
+- `逐词判定来源` 只写该 verdict 自己的 `source`，供比较脚本按生产
+  `verdict_status` 复算；
+- `严格状态` 是展示用的五态 true/false/error/limit/no_llm；比较脚本从四个原始字段
+  复算，不直接信任该列；
+- `整句准入` 按“整句 true 或 no_llm”写 true/false。
 
 输出为 UTF-8 BOM CSV，默认写到输入文件旁：
 
@@ -235,8 +297,8 @@ python analyze_tools/extract/export_extract_verdicts_csv.py \
 专项回归统一放在 `tests/`（沿用仓库现有忽略规则，默认不入库）：
 
 ```bash
-python -m unittest discover -s tests -p test_compare_screening_verdicts.py -v
-python -m unittest discover -s tests -p test_export_screening_verdicts_csv.py -v
+python -m unittest discover -s tests -p "test_extract_analysis.py" -v
+python -m unittest discover -s tests -p "test_cli_help.py" -v
 ```
 
 测试使用临时语料，覆盖迁移后的仓库根路径、导出/比较兼容、句对拒绝和输出保护。
