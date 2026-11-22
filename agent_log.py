@@ -8,8 +8,8 @@
     agent.run。两者都放 log/，但用途不同，字段也不该挤在同一张表里。
 
 一轮跑批会写两份同名的文件：
-    log/agent-log-YYYYMMDD-HHMMSS-ffffff.log     人读：一次执行一段，收尾带汇总
-    log/agent-log-YYYYMMDD-HHMMSS-ffffff.jsonl   机器读：一次执行一个 JSON 对象
+    log/annotate-log-YYYYMMDD-HHMMSS-ffffff.log     人读：一次执行一段，收尾带汇总
+    log/annotate-log-YYYYMMDD-HHMMSS-ffffff.jsonl   机器读：一次执行一个 JSON 对象
 
 两份文件用同一个时间戳，拿到任意一份都能找到另一份。JSONL 适合事后用 jq/脚本统计，
 .log 适合直接 tail 与人工翻看。
@@ -47,8 +47,8 @@ import config
 DEFAULT_LOG_DIR = Path(config._PROJECT_ROOT) / "log"
 """默认日志目录：项目根下的 log/，不依赖运行时 cwd。"""
 
-DEFAULT_PREFIX = "agent-log"
-"""日志文件名前缀；与 extraction_log 的 extract-log 区分。"""
+DEFAULT_PREFIX = "annotate-log"
+"""日志文件名前缀；annotate 日志统一以 annotate 开头，与 extract-log 区分。"""
 
 _MAX_TEXT_CHARS = 500
 """单条字符串在日志里的最大长度；超出的截断并注明省略了多少字符。"""

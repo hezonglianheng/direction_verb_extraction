@@ -25,6 +25,12 @@ LIMIT_MODES = (*SAMPLE_MODES, "aligned")
 DEFAULT_MODE = "sequential"
 DEFAULT_SEED = 0
 
+REFERENCE_LEVELS = ("record", "verdict")
+"""aligned reference 的采样单位：整条源记录 / 单个目标词 verdict。"""
+
+VERDICT_FOCUS_ORDER_KEY = "_verdict_focus_order"
+"""verdict 级裁剪记录携带的句内原目标词序号；PairPreparer 用它拼稳定 id，不落盘。"""
+
 PREVIEW_SIZE = 20
 """统计里最多保留多少个选中行号，避免 X 很大时统计本身变成大文件。"""
 

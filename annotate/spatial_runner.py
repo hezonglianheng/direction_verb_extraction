@@ -1168,7 +1168,7 @@ def _run_multi_model(
 ) -> dict:
     """多模型投票的日志外壳：建一份共享日志，跑完（或失败）都把汇总收尾。
 
-    每个模型的原始输出、投票结果都写在同一份 agent-log 里，记录用 model 字段与
+    每个模型的原始输出、投票结果都写在同一份 annotate-log 里，记录用 model 字段与
     stage_start 的 output_file 区分；这样一次 --models 只会留下一个时间戳、两份文件，
     不必在 log/ 里按模型再拼文件名。
     """

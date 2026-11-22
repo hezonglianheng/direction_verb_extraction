@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import time
 from datetime import datetime
@@ -42,9 +43,13 @@ def _render_limit_stats(stats: dict[str, Any]) -> list[str]:
         "version", "mode", "limit", "seed", "corpus_type", "scanned", "blank",
         "skipped_ineligible", "skipped_bad_record", "skipped_no_word",
         "candidates", "available", "selected", "stopped_early",
-        "reference_file", "reference_rows", "reference_blank", "reference_duplicates",
-        "reference_records", "matched_reference_records", "unmatched_reference_records",
-        "matched_source_records", "content_matches", "line_collisions", "limit_excluded",
+        "reference_file", "reference_level", "reference_rows", "reference_blank",
+        "reference_duplicates", "reference_records", "reference_verdicts",
+        "matched_reference_records", "matched_reference_verdicts",
+        "duplicate_matched_verdicts",
+        "unmatched_reference_records", "unmatched_reference_verdicts",
+        "matched_source_records", "expanded_records", "source_candidates",
+        "content_matches", "line_collisions", "limit_excluded",
     ):
         if key in stats and stats[key] is not None:
             lines.append(f"  {key}: {stats[key]}")
@@ -53,6 +58,24 @@ def _render_limit_stats(stats: dict[str, Any]) -> list[str]:
         lines.append("  对齐键统计:")
         for key, value in key_counts.items():
             lines.append(f"    {key}: {value}")
+    reason_counts = stats.get("unmatched_reason_counts")
+    if isinstance(reason_counts, dict) and reason_counts:
+        lines.append("  未对齐原因:")
+        for key, value in sorted(reason_counts.items()):
+            lines.append(f"    {key}: {value}")
+    status_counts = stats.get("unmatched_status_counts")
+    if isinstance(status_counts, dict) and status_counts:
+        lines.append("  未对齐状态:")
+        for key, value in sorted(status_counts.items()):
+            lines.append(f"    {key}: {value}")
+    details = stats.get("unmatched_details")
+    if isinstance(details, list) and details:
+        lines.append(f"  未对齐 reference 明细（共 {len(details)} 条）:")
+        for detail in details:
+            if isinstance(detail, dict):
+                lines.append("    " + json.dumps(detail, ensure_ascii=False, sort_keys=True))
+            else:
+                lines.append(f"    {detail}")
     line_nos = stats.get("selected_line_nos")
     if isinstance(line_nos, list) and line_nos:
         preview = "、".join(str(number) for number in line_nos)

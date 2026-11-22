@@ -14,7 +14,7 @@ from corpus_metadata import (
     PAIR_CORPORA,
     normalize_corpus_type,
 )
-from filter_funcs import DEFAULT_MODE, DEFAULT_SEED, LIMIT_MODES
+from filter_funcs import DEFAULT_MODE, DEFAULT_SEED, LIMIT_MODES, REFERENCE_LEVELS
 
 DESCRIPTION = (
     "语料替换阶段：原句及三元组 → 机械替换 → 检查替换句 → 一行一个句对。\n\n"
@@ -30,7 +30,10 @@ EPILOG = """用法：
     python -m replace --corpus ... --limit 500 --limit-mode proportional --seed 0
     python -m replace --corpus ... --reference-file filtered.jsonl      # 按已筛选文件逐条对回
 random/proportional 只额外读一遍语料做计数，不把 GB 级语料读进内存；同一 seed 可复现。
-aligned（--reference-file）按行号/句子内容严格对回同一份源语料，找不到或一对多会报错。"""
+aligned（--reference-file）按行号/句子内容严格对回同一份源语料；找不到或源语料状态不可用
+（false/error/limit 等）的 reference 行会跳过，并在结束时由控制台和日志汇总报告；一对多歧义仍报错。
+record 级跳过整条不可用记录；--reference-level verdict 时按单个目标词位置采样，只跳过不可用的
+目标 verdict，同一记录里其他可用 verdict 仍会保留，同一句的多个 verdict 会展开成多条记录。"""
 
 
 def _positive_int(value: str) -> int:
@@ -111,7 +114,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--limit", type=_positive_int, default=None,
         help="只把最多 X 条可用原句送入替换（X>0）；不传则处理全部语料。"
-             "可用原句指 true/no_llm 且句子形状合法的记录，坏记录与不可判定记录不占名额",
+             "可用原句指 true/no_llm 且句子形状合法的记录，坏记录与不可判定记录不占名额。"
+             "aligned + --reference-level verdict 时，X 表示最多展开多少个 verdict",
     )
     parser.add_argument(
         "--limit-mode", choices=LIMIT_MODES, default=None,
@@ -131,8 +135,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--reference-file", default=None,
         help="已筛选文件（JSONL）：按行号/句子内容把它逐条对回 --corpus。"
              "给出后自动进入 aligned 模式；--limit 可省略（全部对齐），给了则只取源文件顺序的前 X 条。"
-             "reference 中任何一条找不到或一对多都会报错；不能与 --seed 或"
+             "reference 中找不到或源语料状态不可用的行会跳过，并在结束时汇总；"
+             "同一个 verdict 一对多、一条源记录对多条 reference 等歧义仍报错。"
+             "verdict 级同一句的多个目标位置可以并存。不能与 --seed 或"
              "非 aligned 的 --limit-mode 同时使用",
+    )
+    parser.add_argument(
+        "--reference-level", choices=REFERENCE_LEVELS, default="record",
+        help="aligned reference 的采样单位：record=整条源记录（默认，保持旧行为）；"
+             "verdict=按单个目标词位置采样，并把源记录裁剪成只含该 verdict 的副本。"
+             "只在给出 --reference-file 时有效",
     )
     parser.add_argument(
         "--log-dir", default=None,
@@ -159,6 +171,8 @@ def parse_args(argv=None) -> argparse.Namespace:
         args.seed = DEFAULT_SEED
     elif args.limit_mode == "aligned":
         parser.error("--limit-mode aligned 必须同时给出 --reference-file")
+    elif args.reference_level != "record":
+        parser.error("--reference-level 只能在给出 --reference-file 时使用")
     elif args.limit is None:
         if args.limit_mode is not None or args.seed is not None:
             parser.error("--limit-mode 与 --seed 只能在给出 --limit 时使用")

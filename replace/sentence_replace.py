@@ -20,6 +20,7 @@ from replace import corpus_pairs as cp
 from replace import limit_sampler
 from replace import replacement_log
 from replace.cli import parse_args
+from filter_funcs import VERDICT_FOCUS_ORDER_KEY
 import file_paths
 from extract import local_model_service
 from extract import sentence_screening as ss
@@ -74,11 +75,24 @@ class PairPreparer:
                 self.counts["bad_record"] += 1
                 continue
             focuses = st.pick_focus_words(row)
+            forced_focus_order = row.get(VERDICT_FOCUS_ORDER_KEY)
+            if (
+                len(focuses) != 1
+                or isinstance(forced_focus_order, bool)
+                or not isinstance(forced_focus_order, int)
+                or forced_focus_order < 1
+            ):
+                forced_focus_order = None
             for focus_order, focus in enumerate(focuses, 1):
                 focus = copy.deepcopy(focus)
                 focus["kind"] = self.corpus_type
                 known = focus.get("screening")
-                original = {"row": row, "focus": focus, "verdict": known, "focus_order": focus_order}
+                original = {
+                    "row": row,
+                    "focus": focus,
+                    "verdict": known,
+                    "focus_order": forced_focus_order or focus_order,
+                }
                 originals.append(original)
                 if ss.verdict_status(known) not in ("true", "false"):
                     pending.append(self._item(st.join_slice(tokens), focus, row))
@@ -112,8 +126,12 @@ class PairPreparer:
                 if grounding_b is not None:
                     focus_b["grounding"] = grounding_b
                 check_a = copy.deepcopy(focus_a["screening"])
+                pair_row = {
+                    key: value for key, value in row.items()
+                    if key != VERDICT_FOCUS_ORDER_KEY
+                }
                 pair = {
-                    **copy.deepcopy(row), "pair_schema_version": cp.PAIR_SCHEMA_VERSION,
+                    **copy.deepcopy(pair_row), "pair_schema_version": cp.PAIR_SCHEMA_VERSION,
                     "corpus_type": self.corpus_type, "focus_word": focus_a, "focus_word_b": focus_b,
                     "candidate": {**copy.deepcopy(candidate), "index": candidate["candidate_index"],
                                   "total": candidate["candidate_total"]},
@@ -170,6 +188,7 @@ def run(args):
             reference_file=args.reference_file,
             limit=args.limit,
             corpus_type=args.corpus_type,
+            reference_level=getattr(args, "reference_level", "record"),
         )
     else:
         selection = limit_sampler.select_records(
@@ -206,6 +225,7 @@ def run(args):
                 emit()
     print(f"句对输出：{output}；统计：{dict(preparer.counts)}")
     limit_stats = selection.stats if selection is not None else None
+    pending_unmatched_details: list = []
     if limit_stats is not None:
         limit_text = "全部" if limit_stats["limit"] is None else limit_stats["limit"]
         print(
@@ -214,12 +234,42 @@ def run(args):
             f"种子={limit_stats['seed']}"
         )
         if limit_stats.get("mode") == "aligned":
+            level = limit_stats.get("reference_level", "record")
+            extra = ""
+            if level == "verdict":
+                extra = (
+                    f" verdict={limit_stats.get('reference_verdicts')}"
+                    f" 已对齐verdict={limit_stats.get('matched_reference_verdicts')}"
+                    f" 展开记录={limit_stats.get('expanded_records')}"
+                )
             print(
                 f"参考文件：{limit_stats.get('reference_file')} "
                 f"reference 记录={limit_stats.get('reference_records')} "
                 f"已对齐={limit_stats.get('matched_reference_records')} "
-                f"源记录={limit_stats.get('matched_source_records')}"
+                f"源记录={limit_stats.get('matched_source_records')} "
+                f"级别={level}{extra}"
             )
+            unmatched_details = limit_stats.get("unmatched_details") or []
+            if unmatched_details:
+                print(f"注意：{len(unmatched_details)} 条 reference 未能对齐，已跳过；明细如下：")
+                reasons = limit_stats.get("unmatched_reason_counts") or {}
+                if reasons:
+                    print(
+                        "  原因："
+                        + "，".join(f"{key}={value}" for key, value in sorted(reasons.items()))
+                    )
+                statuses = limit_stats.get("unmatched_status_counts") or {}
+                if statuses:
+                    print(
+                        "  状态分布："
+                        + "，".join(f"{key}={value}" for key, value in sorted(statuses.items()))
+                    )
+                for detail in unmatched_details[:10]:
+                    text = detail.get("text") if isinstance(detail, dict) else str(detail)
+                    print(f"  {text}")
+                if len(unmatched_details) > 10:
+                    pending_unmatched_details = unmatched_details[10:]
+                    print(f"  ...（其余 {len(pending_unmatched_details)} 条详见替换日志）")
         if limit_stats["skipped_no_word"]:
             print(
                 f"注意：{limit_stats['skipped_no_word']} 条可用记录取不到本类关注词，"
@@ -233,7 +283,7 @@ def run(args):
 
     stats_fn = getattr(preparer.screener, "stats", None)
     screening_stats = {preparer.corpus_type: stats_fn()} if callable(stats_fn) else {}
-    replacement_log.write_log(
+    log_path = replacement_log.write_log(
         corpus=str(source),
         output=str(output),
         corpus_type=args.corpus_type,
@@ -245,6 +295,13 @@ def run(args):
         started_at=started_at,
         finished_at=time.time(),
     )
+    if log_path is None and pending_unmatched_details:
+        print(
+            f"替换日志写入失败，补打其余 {len(pending_unmatched_details)} 条未对齐明细："
+        )
+        for detail in pending_unmatched_details:
+            text = detail.get("text") if isinstance(detail, dict) else str(detail)
+            print(f"  {text}")
 
 
 def main(argv=None):
