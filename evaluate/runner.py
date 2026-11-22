@@ -61,6 +61,7 @@ from evaluate.inference import (
     sanitize_exception,
     sanitize_text,
 )
+from evaluate.progress import ProgressManager
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUT_DIR = _PROJECT_ROOT / "results" / "evaluate"
@@ -230,6 +231,13 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="是否另写同名 .details.jsonl 逐条预测（默认写；--no-details 关闭）",
+    )
+    parser.add_argument(
+        "--progress",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="是否显示每个模型的推理进度（默认显示；--no-progress 关闭，"
+             "不影响报告和诊断日志）",
     )
     parser.add_argument("--prompt-dir", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--print-prompt", action="store_true",
@@ -739,9 +747,16 @@ def _run_one(
     selected: list[data.EvalSample],
     selection: dict,
     args: argparse.Namespace,
+    progress: ProgressManager | None = None,
 ) -> RunResult:
+    tracker = progress.start(spec.key) if progress is not None else None
+
     def log(message: str) -> None:
-        print(f"[{spec.key}] {sanitize_text(message, spec.cfg)}", flush=True)
+        text = f"[{spec.key}] {sanitize_text(message, spec.cfg)}"
+        if progress is not None:
+            progress.write(text)
+        else:
+            print(text, flush=True)
 
     started_wall = time.time()
     started_at = datetime.now().astimezone().isoformat(timespec="seconds")
@@ -764,6 +779,7 @@ def _run_one(
             sync_cache_path=plan.sync_path,
             sync_resume=bool(getattr(args, "sync_resume", False)),
             log=log,
+            on_progress=tracker.update if tracker is not None else None,
         )
 
     needs_cache_lock = (
@@ -780,6 +796,10 @@ def _run_one(
     except Exception as exc:  # noqa: BLE001 —— 一个模型失败不能拖垮其他模型
         error = sanitize_exception(exc, spec.cfg)
         log(f"失败：{error[:300]}")
+    finally:
+        # 进度只覆盖推理阶段；报告构造/明细写出的日志仍走同一个安全写出。
+        if tracker is not None:
+            tracker.close()
 
     finished_at = datetime.now().astimezone().isoformat(timespec="seconds")
     pipeline = outcome.pipeline if outcome is not None else None
@@ -870,50 +890,56 @@ def _run_one(
     return RunResult(model=spec.key, report_path=plan.report_path, report=report, error=error)
 
 
-def print_numbered(title: str, text: str) -> None:
-    print(f"\n===== {title}（共 {len(text.splitlines())} 行）=====")
+def print_numbered(title: str, text: str, write=print) -> None:
+    write(f"\n===== {title}（共 {len(text.splitlines())} 行）=====")
     for index, line in enumerate(text.splitlines(), 1):
-        print(f"{index:>4}| {line}")
+        write(f"{index:>4}| {line}")
 
 
-def _print_prompt(args: argparse.Namespace, sample: data.EvalSample) -> None:
+def _print_prompt(args: argparse.Namespace, sample: data.EvalSample, write=print) -> None:
     from evaluate.annotation import build_pipeline
+
+    def numbered(title: str, text: str) -> None:
+        print_numbered(title, text, write)
 
     pipeline = build_pipeline(
         args.step, (args.models or ["preview"])[0], args.corpus_type, llm=False)
     state = pipeline.initial_state(sample)
-    print_numbered("pipeline metadata（离线预览，不执行标注）",
-                   json.dumps(pipeline.metadata(), ensure_ascii=False, indent=2))
+    numbered("pipeline metadata（离线预览，不执行标注）",
+             json.dumps(pipeline.metadata(), ensure_ascii=False, indent=2))
     for name, agent in pipeline.agents.items():
-        print_numbered(f"{name} system prompt", agent.system_prompt)
-        print_numbered(f"{name} 提示语/配置路径", json.dumps({
+        numbered(f"{name} system prompt", agent.system_prompt)
+        numbered(f"{name} 提示语/配置路径", json.dumps({
             "templates": agent.prompt_paths,
             "config": getattr(agent, "table_paths", None) or getattr(agent, "table_path", ""),
         }, ensure_ascii=False, indent=2))
         if name in ("synonym", "all_in_one"):
             content = agent._content(
                 state["sentence_a"], state["sentence_b"], state["focus_word"], state["focus_word_b"])
-            print_numbered(f"{name} user message（输入第 {sample.input_line_no} 行）", content)
+            numbered(f"{name} user message（输入第 {sample.input_line_no} 行）", content)
         elif name == "feature":
             for side, focus_key in (("a", "focus_word"), ("b", "focus_word_b")):
-                print_numbered(f"feature user message（{side} 侧）",
-                               agent._content(state[f"sentence_{side}"], state[focus_key]))
+                numbered(f"feature user message（{side} 侧）",
+                         agent._content(state[f"sentence_{side}"], state[focus_key]))
         elif name == "schema":
-            print_numbered("schema 动态依赖",
-                           "两侧 user message 依赖本次 feature 生成的真实语义特征；"
-                           "按本侧关注词选择示例和图式候选。离线预览不构造上游输出，不渲染此消息。"
-                           + ("启用查表，命中时不调用模型。" if pipeline.allow_lookup
-                              else "禁用特征匹配查表，采用模型结论并校验。"))
+            numbered("schema 动态依赖",
+                     "两侧 user message 依赖本次 feature 生成的真实语义特征；"
+                     "按本侧关注词选择示例和图式候选。离线预览不构造上游输出，不渲染此消息。"
+                     + ("启用查表，命中时不调用模型。" if pipeline.allow_lookup
+                        else "禁用特征匹配查表，采用模型结论并校验。"))
         elif name == "judge":
-            print_numbered("judge 动态依赖",
-                           "user message 依赖两侧真实 feature/schema 结果，示例按生成的图式对动态选择。"
-                           "离线预览不构造上游输出，不渲染此消息。"
-                           + ("启用判定查表，命中时不调用模型。" if pipeline.allow_lookup
-                              else "禁用判定查表，采用模型结论并校验。"))
+            numbered("judge 动态依赖",
+                     "user message 依赖两侧真实 feature/schema 结果，示例按生成的图式对动态选择。"
+                     "离线预览不构造上游输出，不渲染此消息。"
+                     + ("启用判定查表，命中时不调用模型。" if pipeline.allow_lookup
+                        else "禁用判定查表，采用模型结论并校验。"))
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    # 所有终端输出（含预览、输入摘要和最终汇总）共用一套安全写出：
+    # 下游提前关闭管道时只停止输出，不改变报告和退出码。
+    progress = ProgressManager(enabled=getattr(args, "progress", True))
 
     if args.print_prompt:
         input_files = file_paths.collect_jsonl_inputs(args.corpus)
@@ -921,7 +947,8 @@ def main(argv: list[str] | None = None) -> int:
         selected, _ = _select(dataset, args.offset, args.limit)
         if not selected:
             raise ValueError("没有可评测样本（参考标签、句对或筛选条件不满足），无法预览提示词")
-        _print_prompt(args, selected[0])
+        _print_prompt(args, selected[0], progress.write)
+        progress.finalize()
         return 0
 
     models = _dedupe(args.models or [])
@@ -945,27 +972,28 @@ def main(argv: list[str] | None = None) -> int:
     selected, selection = _select(dataset, args.offset, args.limit)
     input_info = [_file_info(path) for path in input_files]
 
-    print(
+    progress.write(
         f"输入 {len(input_files)} 个文件，{dataset.records_read} 条记录；"
         f"可评测 {len(dataset.samples)} 条，选中 {len(selected)} 条，"
         f"跳过 {dataset.skipped_total()} 条"
     )
     if dataset.skipped:
         top = "，".join(f"{reason}={count}" for reason, count in dataset.skipped.most_common(6))
-        print(f"  跳过原因：{top}")
+        progress.write(f"  跳过原因：{top}")
     if args.batch == "off" and args.batch_cache:
-        print("提示：--batch off 时 --batch-cache 不会使用")
+        progress.write("提示：--batch off 时 --batch-cache 不会使用")
 
     model_workers = len(specs) if args.model_workers == 0 else min(args.model_workers, len(specs))
     results: list[RunResult] = []
     if model_workers <= 1:
         for spec, plan in zip(specs, plans):
-            results.append(_run_one(spec, plan, input_info, dataset, selected, selection, args))
+            results.append(_run_one(
+                spec, plan, input_info, dataset, selected, selection, args, progress))
     else:
         with ThreadPoolExecutor(max_workers=model_workers) as pool:
             futures = {
                 pool.submit(
-                    _run_one, spec, plan, input_info, dataset, selected, selection, args
+                    _run_one, spec, plan, input_info, dataset, selected, selection, args, progress
                 ): (spec, plan)
                 for spec, plan in zip(specs, plans)
             }
@@ -987,29 +1015,29 @@ def main(argv: list[str] | None = None) -> int:
     for model in models:
         result = by_model.get(model)
         if result is None:
-            print(f"[{model}] 没有返回结果", flush=True)
+            progress.write(f"[{model}] 没有返回结果")
             failed = True
             continue
         report = result.report
         if result.error:
             failed = True
-            print(f"[{model}] 失败：{result.error[:300]}；报告 {result.report_path}", flush=True)
+            progress.write(f"[{model}] 失败：{result.error[:300]}；报告 {result.report_path}")
             continue
         status = report.get("run_status")
         metric = report.get("metrics") or {}
         if status == "no_samples":
-            print(f"[{model}] 没有可评测样本；报告 {result.report_path}", flush=True)
+            progress.write(f"[{model}] 没有可评测样本；报告 {result.report_path}")
             continue
         if status in ("partial", "failed", "error"):
             failed = True
         accuracy = metric.get("accuracy")
         accuracy_text = "null" if accuracy is None else f"{accuracy:.4f}"
-        print(
+        progress.write(
             f"[{model}] {status}：accuracy={accuracy_text} "
             f"({metric.get('correct')}/{metric.get('total')}，失败 {metric.get('failed')})；"
-            f"报告 {result.report_path}",
-            flush=True,
+            f"报告 {result.report_path}"
         )
+    progress.finalize()
     return 1 if failed else 0
 
 

@@ -718,7 +718,26 @@ def _validate_cache_identity(cache_path, metadata, spec, *, resume, private_iden
     return actual
 
 
-def _run_sync(pipeline, outcome, *, workers, cfg, items=None, session=None, scopes=None):
+def _notify_progress(on_progress, done: int, total: int) -> None:
+    """进度回调是附属输出；回调异常不得改变推理、缓存或报告。"""
+    if on_progress is None:
+        return
+    try:
+        on_progress(done, total)
+    except Exception:
+        pass
+
+
+def _record_prediction(outcome, key, prediction, cfg, *, on_progress=None):
+    """统一记录预测并通知「本轮唯一请求」进度；重复键不重复计数。"""
+    is_new = key not in outcome.predictions
+    outcome.predictions[key] = _sanitize_value(prediction, cfg)
+    if is_new:
+        _notify_progress(on_progress, len(outcome.predictions), len(outcome.plan.requests))
+
+
+def _run_sync(pipeline, outcome, *, workers, cfg, items=None, session=None, scopes=None,
+              on_progress=None):
     todo = (
         ordered_requests(outcome.plan.requests.values())
         if items is None else list(items)
@@ -744,11 +763,12 @@ def _run_sync(pipeline, outcome, *, workers, cfg, items=None, session=None, scop
                 prediction = future.result()
             except Exception as exc:
                 prediction = _error("internal_error", sanitize_exception(exc, cfg))
-            outcome.predictions[key] = _sanitize_value(prediction, cfg)
+            _record_prediction(outcome, key, prediction, cfg, on_progress=on_progress)
 
 
 def _run_batch(spec, pipeline, outcome, *, workers, cache_path, poll_seconds,
-               timeout_seconds, chunk_size, resume, allow_sync_fallback, log):
+               timeout_seconds, chunk_size, resume, allow_sync_fallback, log,
+               on_progress=None):
     import batch_inference as bi
 
     private_identity = pipeline_private_identity(outcome.pipeline, spec)
@@ -841,7 +861,8 @@ def _run_batch(spec, pipeline, outcome, *, workers, cache_path, poll_seconds,
         return {"key": key, "prediction": prediction}
 
     def completed(state):
-        outcome.predictions[state["key"]] = _sanitize_value(state["prediction"], spec.cfg)
+        _record_prediction(outcome, state["key"], state["prediction"], spec.cfg,
+                           on_progress=on_progress)
 
     try:
         bi.run_waves(states, invoke, session, fallback_workers=workers, on_complete=completed)
@@ -870,6 +891,7 @@ def _run_batch(spec, pipeline, outcome, *, workers, cache_path, poll_seconds,
                     item for key, item in outcome.plan.requests.items()
                     if key not in outcome.predictions
                 ),
+                on_progress=on_progress,
             )
             session.fallback_items = sum(agent.stats()["requests"] for agent in pipeline.agents.values()) - before
         else:
@@ -890,6 +912,8 @@ def _run_batch(spec, pipeline, outcome, *, workers, cache_path, poll_seconds,
                 _batch_error_kind(outcome.batch_error) if outcome.batch_error else "batch_missing",
                 outcome.batch_error or "批量结果缺失；请使用 --batch-resume 继续收取",
             )
+    # 缺失项已补成明确错误；一次性把最终计数告诉进度，不必逐键抖动。
+    _notify_progress(on_progress, len(outcome.predictions), len(outcome.plan.requests))
     if not _sanitize_batch_cache(cache_path, spec.cfg):
         log("警告：无法读取 Batch 缓存，错误文本与结果可能尚未脱敏；请检查文件权限")
     outcome.batch = _sanitize_value(session.summary(), spec.cfg)
@@ -913,8 +937,14 @@ def run_model(
     sync_cache_path: str | Path | None = None,
     sync_resume: bool = False,
     log: Callable[[str], None] = print,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> ModelOutcome:
-    """每个模型独立 pipeline；五档同步/Batch 共用 Task 1 的完整业务节点。"""
+    """每个模型独立 pipeline；五档同步/Batch 共用 Task 1 的完整业务节点。
+
+    ``on_progress(done, total)`` 只报告去重后的逻辑请求进度；它是附属输出，
+    回调异常不影响推理。Batch 的提交/轮询不是句对完成，只有拿到最终预测
+    （含明确错误）才推进。
+    """
     from evaluate.annotation import build_pipeline
 
     started = time.perf_counter()
@@ -924,6 +954,8 @@ def run_model(
     plan = prepare_requests(samples, pipeline)
     outcome = ModelOutcome(plan=plan, predictions={}, unique_requests=len(plan.requests),
                            pipeline=pipeline_provenance(pipeline, spec))
+    total_requests = len(plan.requests)
+    _notify_progress(on_progress, 0, total_requests)
     use_batch = batch_mode in ("auto", "native") and spec.batch is not None and spec.batch.enabled
     if batch_mode == "native" and not use_batch:
         description = spec.batch.describe() if spec.batch is not None else "没有批处理配置"
@@ -961,16 +993,21 @@ def run_model(
                 resume=resume,
                 allow_sync_fallback=batch_mode == "auto",
                 log=log,
+                on_progress=on_progress,
             )
         else:
             if batch_mode != "off" and plan.requests:
                 description = spec.batch.describe() if spec.batch is not None else "当前模型没有原生批量入口"
                 log(sanitize_text(f"批处理：{description}（回退同步执行）", spec.cfg))
-            _run_sync(pipeline, outcome, workers=workers, cfg=spec.cfg)
+            _run_sync(pipeline, outcome, workers=workers, cfg=spec.cfg,
+                      on_progress=on_progress)
     finally:
         if sync_store is not None:
             outcome.sync_cache = sync_store.summary()
             sync_store.close()
+
+    # 所有路径（成功、回退、Batch 缺失补错）都在这里给最终绝对值。
+    _notify_progress(on_progress, len(outcome.predictions), total_requests)
 
     outcome.agent_stats = _sanitize_value(
         {name: agent.stats() for name, agent in pipeline.agents.items()}, spec.cfg)
