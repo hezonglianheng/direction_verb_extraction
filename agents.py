@@ -506,7 +506,8 @@ def get_agent(model_name: str, tools: list, system_prompt: str, response_format=
     model = get_model(model_name, disable_thinking=response_format is not None)
     # system 与 user 的稳定段各是一个断点：示例组变化时 system 缓存仍有效，反之亦然。
     # 非显式缓存家族返回原字符串，不携带任何缓存字段。
-    family = prompt_cache.family_for_model_key(model_name)
+    family = prompt_cache.family_for_model_key(
+        model_name, disable_thinking=response_format is not None)
     return create_agent(
         model=model,
         tools=list(tools),
@@ -548,7 +549,8 @@ def get_deep_agent(
     # 本项目的 ZenMux Claude 走 ChatOpenAI 兼容接口，因此不会重复注入。若改用
     # provider="anthropic"，框架会给 tools/system/顶层各加断点（总数接近 4 个上限），
     # 且不受 config.PROMPT_CACHE_ENABLED 控制——那是框架行为，改档位前要先实测。
-    family = prompt_cache.family_for_model_key(model_name)
+    family = prompt_cache.family_for_model_key(
+        model_name, disable_thinking=response_format is not None)
     return create_deep_agent(
         model=model,
         tools=list(tools),

@@ -1650,9 +1650,14 @@ class BaseAgent:
             self._stats["retries"] += 1
 
     def _cache_family(self) -> str:
-        """本 agent 的提示词缓存家族（只按实际模型标识判断，不看 provider）"""
+        """本 agent 的提示词缓存家族（只按实际模型标识判断，不看 provider）
+
+        标注链路的 agent 都用结构化输出（``response_format``），因此
+        ``disable_thinking`` 会生效，家族必须按可能被其覆盖后的模型判断。
+        """
         if self._cache_family_value is None:
-            self._cache_family_value = pc.family_for_model_key(self.model_key)
+            self._cache_family_value = pc.family_for_model_key(
+                self.model_key, disable_thinking=True)
         return self._cache_family_value
 
     def _note_usage(self, usage: dict | None) -> None:

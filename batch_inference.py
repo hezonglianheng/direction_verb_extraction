@@ -367,6 +367,14 @@ def batch_profile(model_key: str) -> BatchProfile:
             f"收到 {completion!r}"
         )
     raw_extra = agent_factory.disable_thinking_kwargs(cfg)
+    # 同步链路会把 disable_thinking 合并进调用参数，原生 Batch 也会把摊平后的
+    # extra 覆盖到请求体；其中 extra_body.model 同样能改变实际模型。先把参数摊平，
+    # 再把 model 从 extra 中取出（避免请求体用未规范化的旧值二次覆盖），得到一个
+    # 最终模型，供批次顶层、单项请求和缓存家族共同使用。
+    extra = _flatten_extra(tp.strip_temperature(raw_extra))
+    extra_model = extra.pop("model", None)
+    if isinstance(extra_model, str) and extra_model.strip():
+        model = extra_model.strip()
     cache_family = pc.family_for_config(cfg, model_override=model)
     if cache_family in ("qwen", "explicit") and pc.is_qwen_explicit_model(model):
         # 千问官方文档明确：Batch File 折扣不与上下文缓存折扣叠加。批处理请求里
@@ -383,10 +391,10 @@ def batch_profile(model_key: str) -> BatchProfile:
         protocol=protocol,
         enabled=enabled,
         disabled_reason=reason,
-        extra=_flatten_extra(tp.strip_temperature(raw_extra)),
+        extra=extra,
         proxy_mode=proxy_mode,
         proxy_url=proxy_url,
-        # Batch 可能把模型换成 batch.model，缓存家族必须按真正送批的那个标识判断。
+        # Batch 可能把模型换成 batch.model；缓存家族必须按真正送批的那个标识判断。
         cache_family=cache_family,
     )
 

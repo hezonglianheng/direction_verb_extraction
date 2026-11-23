@@ -52,7 +52,7 @@ EXPLICIT_FAMILIES = frozenset({"anthropic", "qwen", "explicit"})
 _DISABLED_VALUES = frozenset({"off", "none", "disabled", "implicit"})
 """显式关闭注入的取值；`implicit` 表示交给供应商自动缓存，也不注入断点"""
 
-_FAMILY_CACHE: dict[str, str] = {}
+_FAMILY_CACHE: dict[tuple[str, bool], str] = {}
 _FAMILY_LOCK = threading.Lock()
 
 
@@ -151,24 +151,45 @@ def is_explicit(family: str) -> bool:
     return family in EXPLICIT_FAMILIES
 
 
-def family_for_model_key(model_key: str) -> str:
-    """按 api_keys.json 的配置名判断缓存家族（结果按配置名缓存）
+def family_for_model_key(model_key: str, *, disable_thinking: bool = False) -> str:
+    """按 api_keys.json 的配置名判断缓存家族（结果按配置名 + 是否关思考缓存）
+
+    ``disable_thinking`` 为 True 时，它的 ``model`` 会在同步链路中覆盖实际送出的
+    模型标识，因此按覆盖后的标识判断；否则基础模型是 Claude、实际换成非显式缓存
+    模型时，请求仍会带上 ``cache_control`` 而被网关拒绝。两个开关状态分开缓存，
+    避免结构化输出与非结构化输出共用同一结论。
 
     读配置失败时返回 ``"none"`` 而不是抛错：缓存只是省钱手段，不能因为一份可选配置
     读不到就让整批标注起不来。真正的配置错误会在 ``agents.request_policy`` 那一步先报。
     """
+    cache_key = (model_key, bool(disable_thinking))
     with _FAMILY_LOCK:
-        cached = _FAMILY_CACHE.get(model_key)
+        cached = _FAMILY_CACHE.get(cache_key)
     if cached is not None:
         return cached
     try:
         import agents as agent_factory
 
-        family = family_for_config(agent_factory.load_model_config(model_key))
+        cfg = agent_factory.load_model_config(model_key)
+        override = None
+        extra = cfg.get("disable_thinking") if isinstance(cfg, dict) else None
+        if disable_thinking and isinstance(extra, dict):
+            # langchain 的 extra_body 会合并进请求体，嵌套的 model 同样能覆盖实际模型；
+            # 它比顶层同名字段更接近最终请求，优先采用。
+            candidates = []
+            body = extra.get("extra_body")
+            if isinstance(body, dict):
+                candidates.append(body.get("model"))
+            candidates.append(extra.get("model"))
+            for candidate in candidates:
+                if isinstance(candidate, str) and candidate.strip():
+                    override = candidate.strip()
+                    break
+        family = family_for_config(cfg, model_override=override)
     except Exception:  # noqa: BLE001 —— 见 docstring
         family = "none"
     with _FAMILY_LOCK:
-        _FAMILY_CACHE[model_key] = family
+        _FAMILY_CACHE[cache_key] = family
     return family
 
 
