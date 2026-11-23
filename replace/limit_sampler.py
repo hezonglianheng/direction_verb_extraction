@@ -1176,6 +1176,10 @@ def _iter_aligned(
                 entry = entries[index]
                 if not entry.allow_content_fallback:
                     continue
+                # 先按内容/来源/ID 校验，再判断是否已经匹配：同文但来源不同的记录
+                # 不能因为遍历顺序不同被误报成“多条同文记录”歧义。
+                if not _reference_entry_matches(entry, source_hash, source_document, source_sid):
+                    continue
                 if entry.matched and not verdict_level:
                     if entry.matched_by == "content":
                         raise ValueError(
@@ -1183,9 +1187,8 @@ def _iter_aligned(
                             f"只能靠句子内容对齐，但源语料 {path} 里有多条同文记录；无法逐条对应"
                         )
                     continue
-                if _reference_entry_matches(entry, source_hash, source_document, source_sid):
-                    matched.append(index)
-                    content_matched.add(index)
+                matched.append(index)
+                content_matched.add(index)
             if len(matched) > before:
                 stats["content_matches"] += 1
                 if matched_by is None:
