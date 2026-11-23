@@ -11,9 +11,9 @@ JSONL，参考标签取 ``judgement.same_meaning``，句对取 ``pair.a.sentence
 参考标签；不把参考 ``reason`` 注入模型提示（``evaluate`` 只把参考记录用于计分与明细）。
 每条输入生成唯一的 ``id``，避免原始 ``qid`` 重复时被评测入口当成重复记录跳过。
 
-用法：
+用法（原始句对文件需自备，不随仓库分发）：
 
-    python -m evaluate.import_sentence_pairs config_files/sample_sentence_pairs.json \
+    python -m evaluate.import_sentence_pairs <原始句对文件>.json \
         --output results/evaluate/sample_sentence_pairs.jsonl
     python -m evaluate --corpus results/evaluate/sample_sentence_pairs.jsonl --print-prompt
 """
@@ -24,6 +24,8 @@ import argparse
 import json
 from pathlib import Path
 from typing import Any, Iterable
+
+import file_paths
 
 _META_FIELDS = (
     "source",
@@ -48,7 +50,9 @@ def read_rows(path: str | Path) -> list[Any]:
             raise ValueError(f"{path}：JSON 顶层必须是数组")
         return rows
     rows = []
-    for line_no, line in enumerate(text.splitlines(), 1):
+    # 只按物理换行切分：JSON 字符串里允许出现 U+2028/U+2029，splitlines()
+    # 会把它们当成记录边界，从而把一条合法 JSONL 拆坏。
+    for line_no, line in enumerate(text.split("\n"), 1):
         if not line.strip():
             continue
         try:
@@ -97,10 +101,10 @@ def convert_rows(rows: Iterable[Any]) -> list[dict]:
 
 
 def write_jsonl(records: Iterable[dict], path: str | Path) -> int:
+    """原子写出 JSONL：中途失败时已有文件保持原样，不会留下半份结果"""
     target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
     count = 0
-    with target.open("w", encoding="utf-8") as handle:
+    with file_paths.atomic_write_text(target) as handle:
         for record in records:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
             count += 1
@@ -120,12 +124,30 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    rows = read_rows(args.input)
-    records = convert_rows(rows)
+    source = Path(args.input)
     output = Path(args.output)
+    # 输入与输出是同一文件（含硬链接/符号链接）时，转换会把原始字段不可逆地
+    # 覆盖掉；这条保护不受 --overwrite 影响。
+    file_paths.validate_output_paths([source], [output])
+    rows = read_rows(source)
+    records = convert_rows(rows)
     if output.exists() and not args.overwrite:
         raise SystemExit(f"输出文件已存在：{output}；请换一个路径或加 --overwrite")
-    count = write_jsonl(records, output)
+    if not args.overwrite:
+        # 用独占创建一次完成“不存在才占位”，避免 exists 检查与写入之间的竞态；
+        # 真正内容仍由 write_jsonl 原子替换。失败时清掉本次占位，不留下空文件。
+        try:
+            with file_paths.open_exclusive(output):
+                pass
+        except FileExistsError as exc:
+            raise SystemExit(f"{exc}；请换一个路径或加 --overwrite") from None
+        try:
+            count = write_jsonl(records, output)
+        except BaseException:
+            output.unlink(missing_ok=True)
+            raise
+    else:
+        count = write_jsonl(records, output)
     print(f"已转换 {count} 条 → {output}")
     return 0
 

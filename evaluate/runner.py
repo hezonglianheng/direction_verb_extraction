@@ -12,9 +12,10 @@ step 0：直接同义判断（默认）；1/2：一次完整标注，禁用/启�
     python evaluate --step 3 --corpus results/direction_annotated.jsonl --corpus-type direction --models deepseek-flash qwen3.8-max
     python -m evaluate --step 4 --corpus results/location_annotated.jsonl --print-prompt
 
-原始 SpaCE 句对（context1/context2/judge）先转成评测用 JSONL：
+原始 SpaCE 句对（context1/context2/judge）先转成评测用 JSONL（样例文件不随仓库
+分发，请把下面的路径换成你本地的原始句对文件）：
 
-    python -m evaluate.import_sentence_pairs config_files/sample_sentence_pairs.json \\
+    python -m evaluate.import_sentence_pairs <原始句对文件>.json \\
         --output results/evaluate/sample_sentence_pairs.jsonl
 
 每个模型独立写 ``results/evaluate/<模型名>_step<N>_<YYYYMMDDTHHMMSSZ>.json``；
