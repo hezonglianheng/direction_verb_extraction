@@ -44,7 +44,12 @@ def coerce(value) -> float | None:
     if isinstance(value, bool) or value is None:
         return None
     if isinstance(value, (int, float)):
-        number = float(value)
+        try:
+            number = float(value)
+        except (OverflowError, ValueError):
+            # 合法 JSON 大整数（如 10**400）转 float 会溢出；按非法值省略，
+            # 不能因为一个温度配置让整条请求失败。
+            return None
     elif isinstance(value, str) and value.strip():
         try:
             number = float(value.strip())
