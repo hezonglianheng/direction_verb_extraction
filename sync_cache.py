@@ -362,6 +362,8 @@ class SyncResultStore:
         self.hits = 0
         self.writes = 0
         self.invalid_lines = 0
+        self._write_failed = False
+        """写盘失败且无法回滚时置位：之后拒绝继续写，避免把新行接在半行后面。"""
         self._lock = threading.Lock()
         self._entries: dict[str, dict] = {}
         self._file_handle = None
@@ -514,7 +516,13 @@ class SyncResultStore:
             if not isinstance(entry, dict) or not isinstance(entry.get("key"), str):
                 self.invalid_lines += 1
                 continue
-            self._entries[entry["key"]] = {"dumps": entry.get("dumps")}
+            dumps = entry.get("dumps")
+            if not isinstance(dumps, dict):
+                # 没有成功结果的行不能占住键：否则 lookup 永远 miss，后续正确的
+                # put 又因为“键已存在”被跳过，缓存再也写不进去。
+                self.invalid_lines += 1
+                continue
+            self._entries[entry["key"]] = {"dumps": dumps}
             valid_lines.append(text)
         if truncated_tail:
             # 保持可用的原文件，直到修复稿完整写好；锁文件不会随数据文件替换。
@@ -549,11 +557,35 @@ class SyncResultStore:
         with self._lock:
             if key in self._entries:
                 return
+            if self._write_failed:
+                raise RuntimeError(
+                    f"同步缓存 {self.path} 上次写入失败且未能完整回滚；"
+                    "为避免继续损坏文件，本进程不再写入该缓存。请检查/删除该文件后重跑"
+                )
+            try:
+                size = self.path.stat().st_size if self.path.exists() else 0
+            except OSError:
+                # 连起始大小都读不到时无法安全回滚；保留原异常上下文并停用写入。
+                self._write_failed = True
+                raise
+            record = json.dumps({"key": key, "dumps": dumps}, ensure_ascii=False) + "\n"
+            try:
+                with self.path.open("a", encoding="utf-8") as handle:
+                    handle.write(record)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except BaseException:
+                # 写盘失败时不发布内存项，并尽量回滚可能写了一半的尾行；否则下一次
+                # put 会把新行接在半行后面，整份 sidecar 以后都无法续跑。
+                try:
+                    if size > 0:
+                        os.truncate(self.path, size)
+                    else:
+                        self.path.unlink(missing_ok=True)
+                except OSError:
+                    self._write_failed = True
+                raise
             self._entries[key] = {"dumps": copy.deepcopy(dumps)}
-            with self.path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps({"key": key, "dumps": dumps}, ensure_ascii=False) + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
             self.writes += 1
 
     def summary(self) -> dict:
