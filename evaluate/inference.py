@@ -159,7 +159,9 @@ def _sanitize_batch_cache(cache_path: str | Path, cfg: dict | None) -> bool:
     if not path.exists() or not path.is_file():
         return True
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        # 只按物理换行切分：JSON 字符串里允许出现 U+2028/U+2029，splitlines()
+        # 会把它们当成记录边界，从而把一条合法记录误判成损坏。
+        lines = path.read_text(encoding="utf-8").split("\n")
     except OSError:
         return False
     cleaned: list[str] = []

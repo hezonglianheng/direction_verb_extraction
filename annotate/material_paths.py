@@ -36,4 +36,10 @@ def annotation_material_paths(
     if extract_dir.is_dir():
         paths.extend(sorted(extract_dir.glob("screen_*.txt")))
 
+    # 模型配置文件同样是只读输入：`--batch-cache` / `--sync-cache` 指到它时必须
+    # 在截断前被识别出来（实际是否配置由 load_model_config 决定，这里只列现存文件）。
+    model_config = base / "model_config" / "api_keys.json"
+    if model_config.is_file():
+        paths.append(model_config)
+
     return tuple(dict.fromkeys(paths))

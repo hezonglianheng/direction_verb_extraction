@@ -879,7 +879,8 @@ class NativeBatchClient:
         errors: dict[str, str] = {}
         if job.output_file_id:
             content = self._request("GET", f"/files/{job.output_file_id}/content").text
-            for line in content.splitlines():
+            # 只按物理换行切分：合法响应正文可能含字面 U+2028/U+2029。
+            for line in content.split("\n"):
                 line = line.strip()
                 if not line:
                     continue
@@ -897,7 +898,7 @@ class NativeBatchClient:
                     errors[custom_id] = str(item["error"])
         if job.error_file_id:
             content = self._request("GET", f"/files/{job.error_file_id}/content").text
-            for line in content.splitlines():
+            for line in content.split("\n"):
                 line = line.strip()
                 if not line:
                     continue
@@ -1034,6 +1035,10 @@ class BatchSession:
         self.batches = 0
         self.disabled_reason = profile.disabled_reason
         self._lock = threading.Lock()
+        # 在任何截断、删除或覆写之前先确认整组 sidecar 属于本工具；校验结果复用，
+        # 避免检查与写入之间再解析一次 meta。身份也在此刻冻结。
+        self._expected_meta = self.profile.fingerprint()
+        self._meta = self._preflight_sidecars()
         self._load_results()
         if not self.resume:
             # 新一轮跑批不能留下旧模型的 job：否则先退出、再以 resume 启动时，
@@ -1046,21 +1051,137 @@ class BatchSession:
             self._load_jobs()
 
     # -- 持久化 ------------------------------------------------------------
+    _META_FIELDS = (
+        "model_key",
+        "provider",
+        "model",
+        "protocol",
+        "completion_window",
+    )
+    """两种合法 meta（BatchProfile.fingerprint 与 evaluate 的 safe_batch_meta）
+    都含有的稳定字段；base_url/endpoint 只要求存在其一。temperature/extra 等
+    后加字段不要求存在，避免旧缓存被误判成陌生文件。"""
+
+    def _read_meta(self) -> dict | None:
+        if not self._exists(self.meta_path):
+            return None
+        try:
+            meta = json.loads(self.meta_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raise ValueError(
+                f"批量 sidecar {self.meta_path} 不是可读的 JSON 身份文件；"
+                "为避免覆盖，拒绝续跑或重建。请检查/删除该文件后重试"
+            ) from None
+        if not isinstance(meta, dict):
+            raise ValueError(
+                f"批量 sidecar {self.meta_path} 不是 JSON 对象；"
+                "为避免覆盖，拒绝续跑或重建。请检查/删除该文件后重试"
+            )
+        return meta
+
+    @staticmethod
+    def _exists(path: Path) -> bool:
+        """只把 FileNotFoundError 当成不存在；权限/IO 错误继续向上抛，不能据此写文件"""
+        try:
+            path.stat()
+            return True
+        except FileNotFoundError:
+            return False
+
+    @classmethod
+    def _is_owned_meta(cls, meta: dict | None) -> bool:
+        if not isinstance(meta, dict):
+            return False
+        if not all(isinstance(meta.get(name), str) for name in cls._META_FIELDS):
+            return False
+        # evaluate 的 meta 用脱敏 endpoint，annotate/BatchProfile 用 base_url。
+        return isinstance(meta.get("base_url"), str) or isinstance(meta.get("endpoint"), str)
+
+    def _cache_size(self) -> int:
+        try:
+            return self.cache_path.stat().st_size
+        except FileNotFoundError:
+            return 0
+
+    def _preflight_sidecars(self) -> dict | None:
+        """确认 cache/jobs/meta 这一组文件可以安全截断、删除或覆写。
+
+        主缓存非空、已有 jobs 或已有 meta，任意一项存在都要求身份文件可识别；
+        否则可能是用户把 --batch-cache 指到了配置表、语料或普通文件。resume 模式
+        同样检查：不能先把陌生文件“认领”成本工具的缓存，再往里追加结果。
+        续跑的身份不一致也在任何修复/追加之前拒绝，避免先改文件再报错。
+        """
+        meta = self._read_meta()
+        if meta is None:
+            if self._cache_size() > 0 or self._exists(self.jobs_path):
+                raise ValueError(
+                    f"批量 sidecar {self.cache_path} 已有内容但没有可识别的身份文件"
+                    "（.meta.json）；拒绝截断或续跑。请换一个 --batch-cache 路径，"
+                    "或确认后手工删除该文件"
+                )
+            return None
+        if not self._is_owned_meta(meta):
+            raise ValueError(
+                f"批量 sidecar {self.meta_path} 不是本工具的身份文件；拒绝覆盖。"
+                "请换一个 --batch-cache 路径，或确认后手工删除该文件"
+            )
+        if self.resume and meta != self._expected_meta:
+            raise ValueError(
+                f"批量 sidecar {self.cache_path} 的模型身份与本次不一致，拒绝续跑：\n"
+                f"  上次 {meta}\n  本次 {self._expected_meta}\n"
+                "请换一个 --batch-cache，或删掉旧 sidecar 后重跑"
+            )
+        return meta
+
     def _load_results(self) -> None:
-        if not self.cache_path.exists():
+        try:
+            data = self.cache_path.read_bytes()
+        except FileNotFoundError:
             return
         if not self.resume:
-            # 新一轮跑批：旧 sidecar 不能混进本轮结果（与 ResultWriter 的覆盖政策同口径）
+            # 新一轮跑批：旧 sidecar 不能混进本轮结果（与 ResultWriter 的覆盖政策同口径）。
+            # 所有权已由 _preflight_sidecars 在任何写入前确认。
             self.cache_path.write_text("", encoding="utf-8")
             return
-        for line in self.cache_path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
+        # 按物理换行（字节 \n）解析：JSON 字符串里的 U+2028/U+2029 不是记录边界。
+        # 用字节偏移记录最后一个完整记录的位置，修复时只截断文件，不重写整份缓存。
+        parts = data.split(b"\n")
+        offset = 0
+        last_good_end = 0
+        repair_tail = False
+        for index, part in enumerate(parts):
+            last = index == len(parts) - 1
+            next_offset = offset + len(part) + (0 if last else 1)
+            if not part.strip():
+                offset = next_offset
                 continue
             try:
-                entry = json.loads(line)
+                text = part.decode("utf-8")
+            except UnicodeDecodeError:
+                if last:
+                    # 进程在追加中文结果时崩在半个多字节字符上：丢掉尾行。
+                    repair_tail = True
+                    break
+                raise ValueError(
+                    f"批量缓存 {self.cache_path} 第 {index + 1} 行不是完整 UTF-8，拒绝续跑"
+                ) from None
+            try:
+                entry = json.loads(text.strip())
             except json.JSONDecodeError:
-                continue
+                if last:
+                    # 中断留下的半行：丢到最后一个完整记录之后。
+                    repair_tail = True
+                    break
+                raise ValueError(
+                    f"批量缓存 {self.cache_path} 第 {index + 1} 行损坏，拒绝续跑"
+                ) from None
+            if not isinstance(entry, dict):
+                if last:
+                    repair_tail = True
+                    break
+                raise ValueError(
+                    f"批量缓存 {self.cache_path} 第 {index + 1} 行不是 JSON 对象，拒绝续跑"
+                )
             key = str(entry.get("key") or "")
             if key:
                 self.results[key] = {
@@ -1069,33 +1190,56 @@ class BatchSession:
                 }
                 # 这里只装载，不记缓存命中：只有本次真正按 key 回放的 lookup 才算命中。
                 # 旧 schema 的结果仍会装载但永远匹配不上新 key，提前计数会把它们报成复用。
+            offset = next_offset
+            last_good_end = next_offset
+        if repair_tail:
+            self._repair_cache_tail(data, last_good_end)
+        elif data and not data.endswith(b"\n"):
+            # 完整末行只补一个 LF：否则下一次追加会把它和新行黏成一条。
+            self._append_cache_newline(len(data))
+
+    def _ensure_cache_unchanged(self, handle, expected_size: int) -> None:
+        """修复/补 LF 前确认文件仍是本次读到的版本；并发追加时宁可报错也不覆盖。"""
+        if os.fstat(handle.fileno()).st_size != expected_size:
+            raise ValueError(
+                f"批量缓存 {self.cache_path} 在本次读取后被其他进程修改；"
+                "拒绝自动修复，请串行运行（同一 --batch-cache 不要并发续跑）"
+            )
+
+    def _repair_cache_tail(self, data: bytes, keep: int) -> None:
+        with self.cache_path.open("r+b") as handle:
+            self._ensure_cache_unchanged(handle, len(data))
+            handle.truncate(keep)
+            handle.seek(0, os.SEEK_END)
+            if keep > 0 and data[keep - 1:keep] != b"\n":
+                handle.write(b"\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+
+    def _append_cache_newline(self, expected_size: int) -> None:
+        with self.cache_path.open("ab") as handle:
+            self._ensure_cache_unchanged(handle, expected_size)
+            handle.write(b"\n")
+            handle.flush()
+            os.fsync(handle.fileno())
 
     def _check_or_write_meta(self) -> None:
         """校验/写入 sidecar 的模型身份，防止换模型后续跑串结果
 
         缓存键只覆盖 agent/system/user，不覆盖模型名；同一条消息换一个模型重跑，
         旧结果必须作废。--batch-resume 时身份不一致直接拒绝，而不是静默回放。
+        身份比较已在 _preflight_sidecars（任何文件修改之前）完成，这里只是复用。
         """
-        expected = self.profile.fingerprint()
-        if self.resume and not self.meta_path.exists() and (self.results or self.jobs_path.exists()):
+        actual = self._meta
+        if self.resume and actual is not None and actual != self._expected_meta:
             raise ValueError(
-                f"批量 sidecar {self.cache_path} 有结果但没有模型身份记录（.meta.json），"
-                "无法确认是否同一模型；请换一个 --batch-cache，或删掉旧 sidecar 后重跑"
+                f"批量 sidecar {self.cache_path} 的模型身份与本次不一致，拒绝续跑：\n"
+                f"  上次 {actual}\n  本次 {self._expected_meta}\n"
+                "请换一个 --batch-cache，或删掉旧 sidecar 后重跑"
             )
-        if self.meta_path.exists():
-            try:
-                actual = json.loads(self.meta_path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
-                actual = None
-            if self.resume and actual != expected:
-                raise ValueError(
-                    f"批量 sidecar {self.cache_path} 的模型身份与本次不一致，拒绝续跑：\n"
-                    f"  上次 {actual}\n  本次 {expected}\n"
-                    "请换一个 --batch-cache，或删掉旧 sidecar 后重跑"
-                )
-        if not self.resume or not self.meta_path.exists():
+        if not self.resume or actual is None:
             self.meta_path.write_text(
-                json.dumps(expected, ensure_ascii=False, indent=2), encoding="utf-8"
+                json.dumps(self._expected_meta, ensure_ascii=False, indent=2), encoding="utf-8"
             )
 
     def _load_jobs(self) -> None:
