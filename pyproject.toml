@@ -1,0 +1,58 @@
+[project]
+name = "direction-verb-extraction"
+version = "0.1.0"
+description = "Direction verb extraction pipeline"
+requires-python = ">=3.11,<3.12"
+
+dependencies = [
+    # 基础 / 本地模型
+    "ltp>=4.2.14,<4.3",
+    "OpenHowNet>=2.0,<3",
+    "torch>=2.10,<2.11",
+    "transformers>=4.57,<5",
+    "pydantic>=2.12,<3",
+    "json5>=0.13,<0.14",
+    "jsonlines>=4,<5",
+    "httpx[socks]>=0.28,<0.29",
+    "requests>=2.32,<3",
+    "tqdm>=4.67,<5",
+
+    # Agent / 图
+    "langchain>=1.4,<2",
+    "langchain-core>=1.6,<2",
+    "langgraph>=1.2,<2",
+    "deepagents>=0.7,<0.8",
+    "openrouter>=0.11,<0.12",
+]
+
+[project.optional-dependencies]
+llm = [
+    "langchain-openai>=1.6,<2",
+    "langchain-deepseek>=1.1,<2",
+    "langchain-anthropic>=1.7,<2",
+    "langchain-google-genai>=4.4,<5",
+    "langchain-openrouter>=0.2,<1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "ruff>=0.9",
+]
+
+[tool.uv]
+package = false
+
+# 支持的运行平台：Linux x86_64 / aarch64、Windows x86_64、macOS arm64。
+# Intel Mac 和 Windows ARM 没有 torch 2.10 的 wheel，不在支持范围内。
+
+# 首次迁移用已知可用的依赖冻结时间作为解析上限，避免 uv lock 顺手升级。
+# 需要升级依赖时，改这个日期（或临时删掉）后重新 uv lock。
+exclude-newer = "2026-09-23T00:00:00Z"
+
+# attrs 26 和 filelock 4 是尚未在项目里验证的新 major，先锁在已知可用的 major 内。
+# 验证通过后可以删除这两条约束。
+constraint-dependencies = [
+    "attrs<26",
+    "filelock<4",
+]
