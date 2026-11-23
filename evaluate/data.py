@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 from collections import Counter
 from dataclasses import dataclass
@@ -108,29 +109,43 @@ class Dataset:
         return sum(self.skipped.values())
 
 
-def read_records(path: str | Path) -> Iterator[RawRecord]:
-    """逐行读 JSONL；坏行不中断整个文件，交给跳过统计记一笔。"""
+def read_records(path: str | Path, *, text: str | None = None) -> Iterator[RawRecord]:
+    """逐行读 JSONL；坏行不中断整个文件，交给跳过统计记一笔。
+
+    ``text`` 用于调用方已经把文件字节读进内存的场景（先算哈希、再按同一份
+    内容解析行），避免「读行」和「算哈希」是两次独立读取、中间文件被替换后
+    旧行被关联到新哈希。传入时必须是用 ``utf-8-sig`` 解码后的完整文本。
+    """
     path = Path(path)
+    if text is not None:
+        # newline=None 让 StringIO 与文件对象一样处理 \r\n 和单独的 \r；
+        # 不用 splitlines()，避免把 JSON 字符串里合法的 U+2028/U+2029 当换行。
+        yield from _iter_records(io.StringIO(text, newline=None), path)
+        return
     with path.open("r", encoding="utf-8-sig") as handle:
-        for line_no, line in enumerate(handle, 1):
-            text = line.strip()
-            if not text:
-                continue
-            try:
-                record = json.loads(text)
-            except json.JSONDecodeError as exc:
-                yield RawRecord(path, line_no, None, SKIP_INVALID_JSON, f"JSON 解析失败：{exc}")
-                continue
-            if not isinstance(record, dict):
-                yield RawRecord(
-                    path,
-                    line_no,
-                    None,
-                    SKIP_INVALID_RECORD,
-                    f"记录不是 JSON 对象，而是 {type(record).__name__}",
-                )
-                continue
-            yield RawRecord(path, line_no, record)
+        yield from _iter_records(handle, path)
+
+
+def _iter_records(lines: Iterable[str], path: Path) -> Iterator[RawRecord]:
+    for line_no, line in enumerate(lines, 1):
+        text = line.strip()
+        if not text:
+            continue
+        try:
+            record = json.loads(text)
+        except json.JSONDecodeError as exc:
+            yield RawRecord(path, line_no, None, SKIP_INVALID_JSON, f"JSON 解析失败：{exc}")
+            continue
+        if not isinstance(record, dict):
+            yield RawRecord(
+                path,
+                line_no,
+                None,
+                SKIP_INVALID_RECORD,
+                f"记录不是 JSON 对象，而是 {type(record).__name__}",
+            )
+            continue
+        yield RawRecord(path, line_no, record)
 
 
 def _as_dict(value) -> dict | None:

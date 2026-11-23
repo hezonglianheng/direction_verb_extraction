@@ -11,6 +11,7 @@
 
 import asyncio
 import json
+import math
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -399,11 +400,19 @@ def disable_thinking_kwargs(model_cfg: dict) -> dict:
     return dict(_DISABLE_THINKING_DEFAULTS.get(provider) or {})
 
 
-def get_model(model_name: str, disable_thinking: bool = False):
+def get_model(
+    model_name: str,
+    disable_thinking: bool = False,
+    *,
+    timeout_seconds: float | None = None,
+):
     """按配置初始化 chat model
 
     Args:
         model_name (str): api_keys.json 中的配置名
+        timeout_seconds: 显式覆盖本次请求的 SDK 超时（秒）；None 表示沿用
+            模型配置里的 ``timeout``。补跑入口用它把单次超时临时调大，
+            不修改配置文件、也不影响同进程的其他模型。
         disable_thinking (bool): 是否关闭思考模式。deepseek 的思考模式不支持被强制的
             tool_choice（报 400 "Thinking mode does not support this tool_choice"），
             而 ToolStrategy 结构化输出正是靠强制调用结构化输出工具实现的，两者冲突；
@@ -437,6 +446,13 @@ def get_model(model_name: str, disable_thinking: bool = False):
     """
     model_cfg = load_model_config(model_name)
     policy = _request_policy(model_cfg, model_name)
+    if timeout_seconds is not None:
+        # 只替换本次调用的超时；重试次数/退避仍按模型配置。
+        if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)):
+            raise ValueError(f"timeout_seconds 必须是正数，收到 {timeout_seconds!r}")
+        if not math.isfinite(float(timeout_seconds)) or float(timeout_seconds) <= 0:
+            raise ValueError(f"timeout_seconds 必须是有限正数，收到 {timeout_seconds!r}")
+        policy = {**policy, "timeout": float(timeout_seconds)}
 
     # langchain 1.x 的 init_chat_model 把参数改名了：model_name -> model，
     # provider -> model_provider（旧名会被当成模型字段透传，随后报错），此处做一次映射。
@@ -485,11 +501,19 @@ def get_model(model_name: str, disable_thinking: bool = False):
         raise
 
 
-def get_agent(model_name: str, tools: list, system_prompt: str, response_format=None):
+def get_agent(
+    model_name: str,
+    tools: list,
+    system_prompt: str,
+    response_format=None,
+    *,
+    timeout_seconds: float | None = None,
+):
     """创建一个 langchain agent
 
     Args:
         model_name (str): 模型名称
+        timeout_seconds: 显式覆盖本次请求的 SDK 超时（秒）；None 表示沿用配置。
         tools (list): 工具列表，每个工具是一个 langchain Tool 对象
         system_prompt (str): 系统提示语，用于指导模型的行为。Claude 与已确认的千问
             显式缓存模型会在其末尾加一个缓存断点（见 annotate/prompt_cache.py），
@@ -503,7 +527,10 @@ def get_agent(model_name: str, tools: list, system_prompt: str, response_format=
     # OpenRouter/claude-opus-5.5 不支持强制 tool_choice，结构化输出改走原生
     # JSON Schema（见 _structured_output_for）。其余 provider 保持 ToolStrategy。
     response_format = _structured_output_for(model_name, response_format)
-    model = get_model(model_name, disable_thinking=response_format is not None)
+    model = get_model(
+        model_name, disable_thinking=response_format is not None,
+        timeout_seconds=timeout_seconds,
+    )
     # system 与 user 的稳定段各是一个断点：示例组变化时 system 缓存仍有效，反之亦然。
     # 非显式缓存家族返回原字符串，不携带任何缓存字段。
     family = prompt_cache.family_for_model_key(
@@ -522,6 +549,8 @@ def get_deep_agent(
     system_prompt: str,
     subagents: list | None = None,
     response_format=None,
+    *,
+    timeout_seconds: float | None = None,
 ):
     """创建一个 deepagents agent（带 task 工具，可把子任务派给 subagent）
 
@@ -533,6 +562,7 @@ def get_deep_agent(
             {"name": ..., "description": ..., "system_prompt": ..., "tools": [...]}。
             description 是主 agent 决定何时调用它的唯一依据，要写清"什么时候用它"。
         response_format: 结构化输出策略，见 get_agent
+        timeout_seconds: 显式覆盖本次请求的 SDK 超时（秒）；None 表示沿用配置。
 
     Returns:
         agent: 创建好的 deepagents agent 对象
@@ -540,7 +570,10 @@ def get_deep_agent(
     # create_deep_agent 只接受 model=/subagents=/response_format= 这些参数，
     # 模型要先由 init_chat_model 建好再传进来。
     response_format = _structured_output_for(model_name, response_format)
-    model = get_model(model_name, disable_thinking=response_format is not None)
+    model = get_model(
+        model_name, disable_thinking=response_format is not None,
+        timeout_seconds=timeout_seconds,
+    )
     # 主 agent 的 system 与普通 get_agent 同样按模型家族加断点；subagent 的提示语仍是
     # 纯字符串（deepagents 的子 agent 定义不接受 SystemMessage），它们的 user 稳定段
     # 依旧由 _invoke_sync 加断点。

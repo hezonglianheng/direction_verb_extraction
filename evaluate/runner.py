@@ -18,6 +18,11 @@ step 0：直接同义判断（默认）；1/2：一次完整标注，禁用/启�
     python -m evaluate.import_sentence_pairs <原始句对文件>.json \\
         --output results/evaluate/sample_sentence_pairs.jsonl
 
+只补跑某份明细里失败的条（默认同步，可临时调大请求超时）：
+
+    python -m evaluate.rerun --details results/evaluate/<模型名>_step<N>_<时间>.details.jsonl \\
+        --timeout-seconds 240
+
 每个模型独立写 ``results/evaluate/<模型名>_step<N>_<YYYYMMDDTHHMMSSZ>.json``；
 时间戳为 UTC（ISO 8601 基本格式，精确到秒），同一天可多次运行。默认另写同名
 ``.details.jsonl`` 逐条预测（``--no-details`` 可关）。模型之间并行、单模型内部

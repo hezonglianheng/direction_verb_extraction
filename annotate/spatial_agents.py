@@ -990,6 +990,7 @@ def _build_deep_feature_agent(
     class_prompts: list[str],
     *,
     allow_structured_retry: bool = True,
+    timeout_seconds: float | None = None,
 ):
     """建特征抽取用的 deep agent：每类特征一个 subagent，主 agent 汇总成结构化特征对象
 
@@ -1014,6 +1015,7 @@ def _build_deep_feature_agent(
         system_prompt=head_prompt,
         subagents=subagents,
         response_format=ToolStrategy(_feature_model(feature_classes), handle_errors=allow_structured_retry),
+        timeout_seconds=timeout_seconds,
     )
 
 
@@ -1266,6 +1268,18 @@ class BaseAgent:
                 if self._agent is None:
                     self._agent = self._build()
         return self._agent
+
+    def request_timeout(self) -> float | None:
+        """本实例策略里的请求超时（秒）；None 表示沿用模型配置。
+
+        ``self.retry_policy`` 与 ``retry.call_with_retry`` 共用一份策略；
+        把它的 timeout 一并交给模型工厂，``--timeout-seconds`` 之类的
+        显式覆盖才能真正作用到 SDK，而不是只改变业务层重试次数。
+        """
+        value = self.retry_policy.get("timeout")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return float(value)
 
     def warm(self) -> None:
         """提前把底层 agent 建好：配置错在启动时就暴露，且不留给多线程去抢着建"""
@@ -2351,7 +2365,9 @@ class FeatureAgent(BaseAgent):
     def _build(self):
         if not self.feature_classes:
             return agent_factory.get_agent(
-                self.model_key, self.tools(), self.system_prompt, response_format=self.response_format()
+                self.model_key, self.tools(), self.system_prompt,
+                response_format=self.response_format(),
+                timeout_seconds=self.request_timeout(),
             )
         if not self.deep:
             return agent_factory.get_agent(
@@ -2359,6 +2375,7 @@ class FeatureAgent(BaseAgent):
                 self.tools(),
                 self.system_prompt,
                 response_format=self.response_format(),
+                timeout_seconds=self.request_timeout(),
             )
         return _build_deep_feature_agent(
             self.model_key,
@@ -2368,6 +2385,7 @@ class FeatureAgent(BaseAgent):
             self.system_prompt,
             self.class_prompts,
             allow_structured_retry=self.allow_structured_retry,
+            timeout_seconds=self.request_timeout(),
         )
 
     def _subagent_tools(self) -> list:
@@ -2519,7 +2537,8 @@ class SchemaAgent(BaseAgent):
 
     def _build(self):
         return agent_factory.get_agent(
-            self.model_key, [], self.system_prompt, response_format=self.response_format()
+            self.model_key, [], self.system_prompt, response_format=self.response_format(),
+            timeout_seconds=self.request_timeout(),
         )
 
     def run(self, sentence: str, features: dict, focus_word: dict) -> dict:
@@ -2668,7 +2687,8 @@ class SynonymAgent(BaseAgent):
         if not self.system_prompt.strip():
             raise ValueError(f"同义判断提示语尚未填写：{self.prompt_paths[SYNONYM_PROMPT_FILE]}")
         return agent_factory.get_agent(
-            self.model_key, self.tools(), self.system_prompt, response_format=self.response_format()
+            self.model_key, self.tools(), self.system_prompt, response_format=self.response_format(),
+            timeout_seconds=self.request_timeout(),
         )
 
     def warm(self) -> None:
@@ -2769,7 +2789,8 @@ class JudgeAgent(BaseAgent):
 
     def _build(self):
         return agent_factory.get_agent(
-            self.model_key, self.tools(), self.system_prompt, response_format=self.response_format()
+            self.model_key, self.tools(), self.system_prompt, response_format=self.response_format(),
+            timeout_seconds=self.request_timeout(),
         )
 
     def run(
@@ -2982,7 +3003,10 @@ class AllInOneAgent(BaseAgent):
         return []
 
     def _build(self):
-        return agent_factory.get_agent(self.model_key, [], self.system_prompt, response_format=self.response_format())
+        return agent_factory.get_agent(
+            self.model_key, [], self.system_prompt, response_format=self.response_format(),
+            timeout_seconds=self.request_timeout(),
+        )
 
     def _candidates_block(self, label: str, focus: dict | None) -> str:
         candidates = st.schema_candidates(self.schema_table, focus)
