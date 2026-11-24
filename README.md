@@ -170,13 +170,14 @@ python pipeline.py --config path/to/your_pipeline.json5 --corpus-type localizati
 ### 四大模块独立入口
 
 所有模块支持 `python -m <模块>`（与 `python <模块>` 等价），`--help` 极快且不加载 LTP/PyTorch。
+点击下表的模块名，可查看各模块的主要功能、实现流程、使用示例与代码导航。
 
 | 模块 | 主要作用 | 典型命令 | 核心注意点 |
 | --- | --- | --- | --- |
-| **`extract`** | 切句、LTP 分析、规则 & HowNet 过滤、LLM 初筛 | `python -m extract data/raw.jsonl -f config_files/localization/localization_expressions.json5 -t results -o location_corpus --screen-model my-model` | `-f` 必填；独立运行时 `-t` 目录须已存在并允许重写；未通过/出错的句也会落盘，记录级状态看 `screening.status`（`true`/`false`/`error`/`limit`/`no_llm`），逐词细节看 `screening.verdicts`（`no_llm` 时为 `[]`） |
-| **`replace`** | 按 `alter_rules.json5` 单位置机械替换并做双侧检查 | `python -m replace --corpus results/location_corpus.jsonl --corpus-type localization --out-file results/location_pairs.jsonl --model my-model` | 默认拒绝覆盖（需 `--overwrite`）；`--limit` 默认限制**可用原句数**（在 `aligned` + `--reference-level verdict` 下按展开的 verdict 计数）；支持 `sequential`/`random`/`proportional`/`aligned`；`--no-llm` 产物不可入标注 |
-| **`annotate`** | 抽取空间特征、匹配图式并做同义判断或投票 | `python -m annotate --graph pair --corpus results/location_pairs.jsonl --corpus-type localization --model my-model --limit 100 --batch off` | 正式图默认 `--limit`：`pair`(100)、`synonym`(100)、`all_in_one`(1)，禁传 `0`（仅 `aligned` 省略时对齐全量）；兼容 `--engine staged\|all-in-one` 与 `python -m annotate.all_in_one`；下游只采纳 `admission.is_admitted=true` 记录 |
-| **`evaluate`** | 以 `annotate` 结果为参考，对模型做五档同义评测 | `python -m evaluate --corpus results/location_annotated.jsonl --corpus-type localization --models my-model --step 0 --limit 100 --batch off` | `--step` 0~4：0 直接判断，1/2 单次全标注（禁/启用查表），3/4 分步标注（禁/启用查表）；默认跑全量（`--limit 0` 为 0 条）；参考标签并非人工金标准，参与投票的模型结果会偏乐观 |
+| **[`extract`](extract/README.md)** | 切句、LTP 分析、规则 & HowNet 过滤、LLM 初筛 | `python -m extract data/raw.jsonl -f config_files/localization/localization_expressions.json5 -t results -o location_corpus --screen-model my-model` | `-f` 必填；独立运行时 `-t` 目录须已存在并允许重写；未通过/出错的句也会落盘，记录级状态看 `screening.status`（`true`/`false`/`error`/`limit`/`no_llm`），逐词细节看 `screening.verdicts`（`no_llm` 时为 `[]`） |
+| **[`replace`](replace/README.md)** | 按 `alter_rules.json5` 单位置机械替换并做双侧检查 | `python -m replace --corpus results/location_corpus.jsonl --corpus-type localization --out-file results/location_pairs.jsonl --model my-model` | 默认拒绝覆盖（需 `--overwrite`）；`--limit` 默认限制**可用原句数**（在 `aligned` + `--reference-level verdict` 下按展开的 verdict 计数）；支持 `sequential`/`random`/`proportional`/`aligned`；`--no-llm` 产物不可入标注 |
+| **[`annotate`](annotate/README.md)** | 抽取空间特征、匹配图式并做同义判断或投票 | `python -m annotate --graph pair --corpus results/location_pairs.jsonl --corpus-type localization --model my-model --limit 100 --batch off` | 正式图默认 `--limit`：`pair`(100)、`synonym`(100)、`all_in_one`(1)，禁传 `0`（仅 `aligned` 省略时对齐全量）；兼容 `--engine staged\|all-in-one` 与 `python -m annotate.all_in_one`；下游只采纳 `admission.is_admitted=true` 记录 |
+| **[`evaluate`](evaluate/README.md)** | 以 `annotate` 结果为参考，对模型做五档同义评测 | `python -m evaluate --corpus results/location_annotated.jsonl --corpus-type localization --models my-model --step 0 --limit 100 --batch off` | `--step` 0~4：0 直接判断，1/2 单次全标注（禁/启用查表），3/4 分步标注（禁/启用查表）；默认跑全量（`--limit 0` 为 0 条）；参考标签并非人工金标准，参与投票的模型结果会偏乐观 |
 
 **`annotate` 补充说明**：
 - **结构化错误重试**：`pair` / `synonym` 默认允许补发，`all_in_one` 默认禁止，可用 `--allow-retry` / `--no-allow-retry` 显式覆盖。
