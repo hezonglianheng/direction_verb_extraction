@@ -54,14 +54,14 @@ def _input_table(files: list[details_mod.LoadedDetails]) -> list[str]:
     return common._table(
         [
             "编号",
-            "文件",
-            "route",
-            "记录数",
+            "文件路径",
+            "评测路径 (route)",
+            "记录总数",
             "有身份",
             "无身份",
-            "prediction 分布",
+            "模型预测分布 (prediction)",
             "无结论原因",
-            "参考标签分布",
+            "参考标签分布 (reference)",
         ],
         rows,
     )
@@ -71,22 +71,25 @@ def _pair_section(comparison: common.Comparison) -> list[str]:
     lines = [
         f"### {comparison.left_label} vs {comparison.right_label}",
         "",
-        f"- 共同身份：{comparison.common}；仅左：{comparison.only_left}；"
-        f"仅右：{comparison.only_right}；并集：{comparison.union}",
+        f"- **共同身份**：{comparison.common}；**仅左文件有**：{comparison.only_left}；"
+        f"**仅右文件有**：{comparison.only_right}；**两侧并集**：{comparison.union}",
         f"- 身份内容冲突（句对不同，不计入分母）：{comparison.identity_conflicts}",
-        f"- 结论一致率（含未判定，分母=共同身份）："
+        f"- **结论一致率（含未判定，分母 = 共同身份）**："
         f"{comparison.common_agreement_text}",
-        f"- 有效结论一致率（双方都有标签）："
-        f"{comparison.defined_agreement_text}；涉及无结论：{comparison.unresolved}",
-        f"- 参考标签一致率："
+        f"- **有效结论一致率（只比双方都有标签）**："
+        f"{comparison.defined_agreement_text}；**涉及无结论**：{comparison.unresolved}",
+        f"- **参考标签一致率 (`reference`)**："
         f"{common.agreement_text(comparison.reference_same, comparison.reference_comparable)}",
         "",
-        "#### 结论转移",
+        "#### 结论转移表（`prediction` 变化明细）",
+        "",
+        "- **这张表看什么**：把共同身份记录中，左文件预测变成右文件预测的各种组合计数列出来。",
+        "- **怎么读**：`same → same`、`different → different` 表示判断一致；`same ↔ different` 是实质性结论分歧；出现 `（无结论）` 表示一侧或两侧跑失败/超限（如 `model_error` / `invalid_json`）。",
         "",
     ]
     lines.extend(
         common._table(
-            ["左侧 prediction", "右侧 prediction", "数量"],
+            ["左侧预测 (prediction)", "右侧预测 (prediction)", "条数"],
             common.transition_rows(comparison.label_transitions),
         )
     )
@@ -101,26 +104,63 @@ def format_summary(
 ) -> str:
     labels = [item.label for item in files]
     lines = [
-        "# evaluate details 多文件一致性",
+        "# evaluate details 多文件一致性对比报告",
         "",
-        "## 口径说明",
+        "这份报告用来对比**多份「评测明细（evaluate `.details.jsonl`）」**，看看不同模型、提示词或实验批次在相同测试句对上的预测结果有多一致。",
         "",
-        "- 对齐身份：优先 `(line_no, candidate.index, candidate.focus_index, "
-        "replacement)`，并带上 details 的 `input_file`；没有 candidate 时退回 `id`。",
-        "  物理行号、JSONL 记录顺序与单看 `id` 都不参与跨语料对齐。",
-        "- `input_file` 不同的记录即使行号/候选相同也不会强行配对；只在一份文件内"
-        "重复身份会直接报错。",
-        "- 主比较字段是 `prediction`：`same` / `different` / 无结论（null）。",
-        "  `reference` 只作上下文与参考标签一致率，不代替 prediction。",
-        "- 结论一致率（含未判定）把 null/null 计为相同状态；有效结论一致率只在"
-        "双方都有标签时计算；零分母写 `N/A (0/0)`。",
-        "- 差异本身不是错误；工具只报告一致性，不改写输入。",
+        "## 一分钟看懂这份报告",
         "",
-        "## 输入文件",
+        "### 1. 推荐阅读顺序",
+        "",
+        "1. 先看 **「输入文件概览」**：确认每个文件有多少条记录、评测的是哪条路（`route`），以及有多少「无身份」占位行或「无结论原因」（如 `model_error`、`invalid_json`）。",
+        "2. 再看 **「两两对比汇总」和「一致性矩阵」**：先看整体一致性，注意对比「结论一致率（含未判定）」和「有效结论一致率」。",
+        "3. 最后看 **「逐对明细」**：看具体有多少条从 `same` 变成了 `different`，以及有没有发生「身份内容冲突」。",
+        "",
+        "### 2. 看数字前先避开这 4 个坑",
+        "",
+        "- **主一致率比的是 `prediction`（模型预测），不是 `reference`（参考答案）**：`reference` 只作为对照上下文展示，不会用来代替模型预测。",
+        "- **两边都出错/无结论也会算进「含未判定一致率」**：如果两边同一条都返回 `null`，含未判定一致率会记为相同；想看双方真正给出判断时有多像，请看 **「有效结论一致率」**。",
+        "- **跨文件不会“硬对齐”不同来源或不同内容**：只有 `input_file` 和候选身份都相同、且句对文本一致才进入共同分母；如果同身份但句子文本不同，会被记为 **「身份内容冲突」** 并剔除出分母。",
+        "- **「无身份」占位行不参与配对**：例如补跑失败或 JSON 解析损坏留下的占位记录（`invalid_json`），只在输入文件表里统计个数。",
+        "",
+        "## 白话名词对照表",
         "",
     ]
+    lines.extend(
+        common._table(
+            ["报告里的说法", "对应的代码/原字段", "大白话解释"],
+            [
+                ["对齐身份", "`(input_file, line_no, candidate.index, focus_index, replacement)`", "没有 candidate 时退回 `id`；物理行号和记录顺序不参与跨语料对齐。"],
+                ["模型预测 (`prediction`)", "`same` / `different` / `null`", "评测模型认为原句与改写句空间语义是否相同；`null` 记为 `（无结论）`。"],
+                ["参考标签 (`reference`)", "输入自带标准/参考答案", "仅用于核对两边测试集参考标签是否一致，不代替模型预测。"],
+                ["评测路径 (`route`)", "`step` / `mode` / `corpus_type`", "标注这批评测跑的是第几步、哪种标注图和哪种语料类型。"],
+                ["有身份 / 无身份", "能否算出对齐身份", "正常记录为「有身份」；损坏/补跑失败占位行（如 `invalid_json`）没有候选信息，记为「无身份」。"],
+                ["身份内容冲突", "同身份但原句/替换句不同", "可能两份文件指向了不同版本的源语料；为防误统计，该条不进一致率分母。"],
+                ["含未判定 vs 有效结论一致率", "一致率双口径", "前者分母=共同身份（含 `null=null`）；后者只比双方都给出了有效标签的记录。"],
+            ],
+        )
+    )
+    lines.extend(
+        [
+            "",
+            "## 输入文件概览",
+            "",
+            "- **这张表看什么**：确认每份评测文件的规模、配置路径，以及报错无结论的分布。",
+            "- **怎么读**：`记录总数 = 有身份 + 无身份`；若 `无结论原因` 里有很多 `model_error` 或 `timeout`，应优先补跑失败条目。",
+            "",
+        ]
+    )
     lines.extend(_input_table(files))
-    lines.extend(["", "## 两两对比汇总", ""])
+    lines.extend(
+        [
+            "",
+            "## 两两对比汇总",
+            "",
+            "- **这张表看什么**：总览任意两份评测文件在共同身份上的各种一致率与异常计数。",
+            "- **怎么读（分母口径）**：`结论一致率（含未判定） = 相同 / 共同`；`有效结论一致率` 剔除了任意一侧为 `null` 的条；`同义二分类一致率` 只统计双方均为 `same` 或 `different` 的条；`仅左`、`仅右`、`身份内容冲突` 均不进一致率分母。",
+            "",
+        ]
+    )
     lines.extend(
         common._table(
             common.COMPARISON_COLUMNS,
@@ -130,10 +170,10 @@ def format_summary(
     lines.extend(
         [
             "",
-            "## 一致性矩阵",
+            "## 一致性矩阵（多文件横向速查）",
             "",
-            "单元格为 `结论一致率（含未判定，相同/共同身份）`；对角线写 `—`，"
-            "无共同身份写 `N/A (0/0)`。",
+            "- **这张表看什么**：当对比 3 个及以上评测文件时，速查任意两份文件的总体一致率。",
+            "- **怎么读**：单元格为 `结论一致率（含未判定，相同/共同身份）`；对角线写 `—`，无共同身份写 `N/A (0/0)`。",
             "",
         ]
     )
@@ -141,6 +181,15 @@ def format_summary(
     lines.extend(["", "## 逐对明细", ""])
     for comparison in comparisons:
         lines.extend(_pair_section(comparison))
+    lines.extend(
+        [
+            "## 明细 CSV 怎么看",
+            "",
+            "- 同目录下为每对文件生成了对应的 `.csv`（可用 Excel 直接打开），逐条保存了所有成功对齐的记录（发生「身份内容冲突」的记录不会混入）。",
+            "- **常用排查建议**：在 `比较结果` 列筛选 `不同`（或 `仅左侧` / `仅右侧`），再看 `左最终标签`、`右最终标签` 以及两侧原句/替换句与原因字段即可定位差异。",
+            "",
+        ]
+    )
     return "\n".join(lines)
 
 

@@ -616,23 +616,26 @@ def _pair_section(summary: PairSummary) -> list[str]:
     lines = [
         f"### {left.label} vs {right.label}",
         "",
-        f"- 对比文件：`{left.path}` ↔ `{right.path}`",
-        f"- 标注图：`{left.mode or '—'}` ↔ `{right.mode or '—'}`；"
-        f"记录类型：{left.kind} ↔ {right.kind}",
-        f"- 共同 key：{summary.common}；仅左：{summary.only_left}；"
-        f"仅右：{summary.only_right}；并集：{summary.union}",
-        f"- 结论一致率（含未判定，分母=共同 key）：{summary.common_agreement_text}",
-        f"- 有效结论一致率（双方都有结论）：{summary.defined_agreement_text}；"
-        f"涉及无结论：{summary.unresolved}",
-        f"- 最终状态一致率：{summary.status_agreement_text}；"
-        f"句子/关注词上下文变化：{summary.context_changed}",
+        f"- **对比文件**：`{left.path}` ↔ `{right.path}`",
+        f"- **标注图（mode）**：`{left.mode or '—'}` ↔ `{right.mode or '—'}`；"
+        f"**记录类型**：{left.kind} ↔ {right.kind}",
+        f"- **共同 key**：{summary.common}；**仅左文件有**：{summary.only_left}；"
+        f"**仅右文件有**：{summary.only_right}；**两侧并集**：{summary.union}",
+        f"- **结论一致率（含未判定，分母 = 共同 key）**：{summary.common_agreement_text}",
+        f"- **有效结论一致率（只比双方都有结论的共同 key）**：{summary.defined_agreement_text}；"
+        f"**涉及无结论条数**：{summary.unresolved}",
+        f"- **最终状态一致率**：{summary.status_agreement_text}；"
+        f"**句子/关注词上下文变化**：{summary.context_changed}（不为 0 时建议打开 CSV 核查是否版本不同）",
         "",
-        "#### 结论转移",
+        "#### 1. 最终结论转移表（看两边结论具体怎么对不上）",
+        "",
+        "- **这张表看什么**：把共同句对从“左文件最终结论”变成“右文件最终结论”的每一种组合按数量从多到少排出来。",
+        "- **怎么读**：左结论 = 右结论（例如 `same → same`、`different → different`）说明判断一致；`same ↔ different` 是核心语义分歧；出现 `（无结论）` 说明存在平票（`tie`）、无有效票（`no_valid_votes`）或单模型未成功给出结论。",
         "",
     ]
     lines.extend(
         _table(
-            ["左结论", "右结论", "数量"],
+            ["左文件结论", "右文件结论", "句对数量"],
             [
                 [_label_value(left_label), _label_value(right_label), count]
                 for (left_label, right_label), count in sorted(
@@ -643,7 +646,16 @@ def _pair_section(summary: PairSummary) -> list[str]:
         )
     )
 
-    lines.extend(["", "#### 同义判定字段矩阵", ""])
+    lines.extend(
+        [
+            "",
+            "#### 2. 同义判定字段矩阵 (`judgement.same_meaning`)",
+            "",
+            "- **这张表看什么**：只对比原字段 `judgement.same_meaning`（是否同义的原始布尔值）。",
+            "- **注意事项**：如果某侧是「投票汇总」，这个字段只是代表模型继承下来的值，**不是投票共识**（例如投票选出 `not_spatial` 时它可能是 `未判定`）；正式结论请以上方的「最终结论转移表」为准。",
+            "",
+        ]
+    )
     matrix = summary.same_meaning_matrix
     matrix_rows = []
     for left_value in (True, False, None):
@@ -655,7 +667,7 @@ def _pair_section(summary: PairSummary) -> list[str]:
         )
     lines.extend(
         _table(
-            ["左 \\ 右", "true", "false", "未判定"],
+            ["左文件 \\ 右文件", "是 (true)", "否 (false)", "未判定 (null)"],
             matrix_rows,
         )
     )
@@ -671,22 +683,37 @@ def _pair_section(summary: PairSummary) -> list[str]:
         ]
     )
 
-    lines.extend(["", "#### 最终状态转移", ""])
+    lines.extend(
+        [
+            "",
+            "#### 3. 最终运行状态转移 (`status`)",
+            "",
+            "- **这张表看什么**：对比两边记录的运行状态（如 `ok` 正常完成、报错或被过滤状态），看是不是因为有一边失败了才导致结论不同。",
+            "",
+        ]
+    )
     lines.extend(
         _table(
-            ["左状态", "右状态", "数量"],
+            ["左文件状态", "右文件状态", "句对数量"],
             _transition_rows(summary.status_transitions),
         )
     )
 
-    lines.extend(["", "#### 图式", ""])
+    lines.extend(["", "#### 4. 图式名称对比 (`schema`)", ""])
     if summary.schema_applicable:
         lines.extend(
+            [
+                "- **这张表看什么**：在 `pair` / `all_in_one` 图下，对比原句（a 侧）和改写句（b 侧）提取出的空间意象图式名称是否相同。",
+                "- **怎么读（分母口径）**：`一致率 = 相同 / 双方均有`；如果只有一侧写了图式或双方都为空，会单独列在右侧两列，不硬算进分母。（注：投票结果的图式来自代表模型。）",
+                "",
+            ]
+        )
+        lines.extend(
             _table(
-                ["侧", "相同", "双方均有", "一致率", "仅单侧有图式", "双方为空"],
+                ["句侧", "图式相同", "双方均有 (分母)", "一致率", "仅单侧有图式", "双方为空"],
                 [
                     [
-                        "a",
+                        "a（原句侧）",
                         summary.schema_a_same,
                         summary.schema_a_comparable,
                         agreement_text(
@@ -696,7 +723,7 @@ def _pair_section(summary: PairSummary) -> list[str]:
                         summary.schema_a_both_empty,
                     ],
                     [
-                        "b",
+                        "b（改写句侧）",
                         summary.schema_b_same,
                         summary.schema_b_comparable,
                         agreement_text(
@@ -710,17 +737,26 @@ def _pair_section(summary: PairSummary) -> list[str]:
         )
     else:
         lines.append(
-            "不适用：至少一侧是 synonym 结果（不写图式），或文件为空；"
+            "不适用：至少一侧是 `synonym` 结果（该标注图不写图式），或文件为空；"
             "图式只在双方都有名字时统计，不会把不适用当成不同。"
         )
 
-    lines.extend(["", "#### 准入与复核", ""])
+    lines.extend(
+        [
+            "",
+            "#### 5. 准入与复核对比 (`admitted` / `review_required`)",
+            "",
+            "- **这张表看什么**：对比两份结果是否同时建议放行入库（`是否准入`）以及是否同时标记需要人工复查（`需复核`）。",
+            "- **怎么读**：`一致率 = 相同 / 双方均有`，空值不参与分母，单独列在 `涉及空值`。",
+            "",
+        ]
+    )
     lines.extend(
         _table(
-            ["指标", "双方均有", "相同", "一致率", "涉及空值"],
+            ["检查指标", "双方均有 (分母)", "相同 (分子)", "一致率", "涉及空值 (不进分母)"],
             [
                 [
-                    "是否准入",
+                    "是否准入 (admitted)",
                     summary.admitted_comparable,
                     summary.admitted_same,
                     agreement_text(
@@ -729,7 +765,7 @@ def _pair_section(summary: PairSummary) -> list[str]:
                     summary.common - summary.admitted_comparable,
                 ],
                 [
-                    "需复核",
+                    "需复核 (review_required)",
                     summary.review_comparable,
                     summary.review_same,
                     agreement_text(
@@ -741,11 +777,17 @@ def _pair_section(summary: PairSummary) -> list[str]:
         )
     )
 
-    lines.extend(["", "#### 投票", ""])
+    lines.extend(["", "#### 6. 投票状态转移 (`voting.status`)", ""])
     if summary.voting_applicable:
         lines.extend(
+            [
+                "- **这张表看什么**：当两边都是多模型投票汇总文件时，看它们的投票结果形态（一致通过 `accepted`、平票 `tie`、无有效票 `no_valid_votes` 等）是否一致。",
+                "",
+            ]
+        )
+        lines.extend(
             _table(
-                ["左投票状态", "右投票状态", "数量"],
+                ["左投票状态", "右投票状态", "句对数量"],
                 [
                     [left_status, right_status, count]
                     for (left_status, right_status), count in sorted(
@@ -775,29 +817,56 @@ def format_overall_markdown(
     files: Sequence[records.LoadedFile], summaries: Sequence[PairSummary]
 ) -> str:
     lines = [
-        "# annotate 结果对比",
+        "# annotate 正式标注结果对比报告",
         "",
-        "## 口径说明",
+        "这份报告用来对比**多份「正式空间语义标注（annotate）」结果**（可以是单个模型跑出的结果，也可以是多模型投票后的最终结果），看它们在“原句和改写句是否同义、是否合法空间表达”上的结论有多一致。",
         "",
-        "- 唯一对齐键：`candidate_key`（`句子ID|关注词位置|替换词`）；"
-        "`id`、`line_no`、文件行序和出现顺序都不参与对齐。",
-        "- 无候选记录（`bad_record` / `alter_missed`）合法地没有 key，"
-        "单独计入「无候选」，不强行配对。",
-        "- 主比较字段是最终结论标签：单模型结果按 `annotate.voting.ballot_label` "
-        "同一套口径还原；投票结果取 `voting.winner_label`。",
-        "- 投票 `tie` / `no_valid_votes` 记为 `（无结论）`，"
-        "**不退回**代表模型继承的 `judgement.same_meaning`；"
-        "采纳 `not_spatial` / `not_fluent_*` 时该字段可能为 null，不是投票共识。",
-        "- 投票记录的 `schema` / `features` 等是代表模型继承下来的字段，"
-        "不是投票共识；本工具只把 `voting.winner_label` 当结论。",
-        "- `judgement.same_meaning` 另列三态矩阵；空值不当作 false。"
-        "「结论一致率（含未判定）」与「有效结论一致率」分开统计。",
-        "- 图式只在双方都有名字时统计；synonym 不写图式，记为不适用而不是不同。",
-        "- 理由与失败原因只展示，不进入一致率；差异本身不是错误。",
+        "## 一分钟看懂这份报告",
         "",
-        "## 输入文件",
+        "### 1. 推荐阅读顺序",
+        "",
+        "1. 先看 **「输入文件概览」**：确认每个文件是单模型还是投票汇总、包含多少条有候选键的记录，以及投票文件有没有出现大量平票（`tie`）、缺票或无效票模型。",
+        "2. 再看 **「两两对比汇总」和「一致性矩阵」**：先看整体一致性，注意区分「含未判定」和「仅有效结论」两种一致率。",
+        "3. 最后看 **「逐对明细」**：如果两份结果对不上，顺着「最终结论转移表」「图式」「准入与复核」和「投票状态转移」，能看出分歧主要是 `same ↔ different`，还是有一侧判成了 `not_spatial` / `not_fluent_*` / 平票无结论。",
+        "",
+        "### 2. 看数字前先避开这 4 个坑",
+        "",
+        "- **「最终结论」不等于原字段 `judgement.same_meaning`**：对于单模型结果，会按规则把合理性/通顺度闸门和同义判定还原成统一标签；对于投票结果，只认 `voting.winner_label`（哪怕代表模型继承的 `same_meaning` 是空值或另一种答案）。",
+        "- **平票（`tie`）与无有效票（`no_valid_votes`）记为 `（无结论）`**：不会退回去偷用代表模型的字段；如果两边都是 `（无结论）`，在「结论一致率（含未判定）」里会算成相同，但在 **「有效结论一致率」** 里会被剔除。",
+        "- **单模型文件 vs 投票文件互比是正常支持的**：单模型本身就没有 `voting` 块，报告会写明「不适用」，**不把「没有投票」当成缺票**。",
+        "- **无候选记录（`bad_record` / `alter_missed`）不强行配对**：这类记录没有 `candidate_key`，只会在输入概览的 `无候选` 一列里单独统计。",
+        "",
+        "## 白话名词对照表",
         "",
     ]
+    lines.extend(
+        _table(
+            ["报告里的说法", "对应的代码/原字段", "大白话解释"],
+            [
+                ["唯一对齐键", "`candidate_key` (`句子ID|关注词位置|替换词`)", "只有该键相同才算同一条候选句对；`id`、行号、出现顺序都不参与对齐。"],
+                ["`same`（空间语义相同）", "最终结论标签", "替换之后句子的空间关系与原句基本一致（同义）。"],
+                ["`different`（空间语义改变）", "最终结论标签", "替换之后句子还是合法空间表达，但空间关系含义变了（不同义）。"],
+                ["`not_spatial`（非空间表达）", "最终结论标签", "模型或闸门认为句子的核心表达不是空间关系。"],
+                ["`not_fluent_a/b/both`（不通顺）", "最终结论标签", "原句（a）、改写句（b）或两侧语句不通顺/不成立，无法作为合格空间句对。"],
+                ["`（无结论）`", "平票 `tie` / 无有效票 `no_valid_votes` / 缺结果", "未能得出有效最终标签（例如投票平票、模型调用全失败）。"],
+                ["含未判定一致率 vs 有效结论一致率", "主一致率双口径", "前者把「两边都无结论」也算相同（分母=共同 key）；后者只比双方都给出了有效标签的记录。"],
+                ["同义判定字段", "`judgement.same_meaning`", "单模型原始布尔字段；投票文件里它只是代表模型继承值，不是投票结果。"],
+                ["图式（a/b 图式）", "`schema` (`pair` / `all_in_one` 图)", "空间意象图式名称；`synonym` 标注图不记录图式，显示为「不适用」。"],
+                ["是否准入 / 需复核", "`admitted` / `review_required`", "系统建议是否放行入库，以及是否建议人工复查的标记。"],
+                ["投票不完整 / 缺票 / 无效票", "`voting` 完整性统计", "多模型投票时部分模型没返回票、或返回的票不合法的统计（单模型文件显示 `—`）。"],
+            ],
+        )
+    )
+    lines.extend(
+        [
+            "",
+            "## 输入文件概览",
+            "",
+            "- **这张表看什么**：摸清每个文件有多少条记录、属于单模型还是投票汇总、用到了哪些模型，以及各类最终结论和投票状态的分布。",
+            "- **怎么读**：`记录数 = 有候选键 + 无候选`；空文件会标为 `空文件`。如果投票文件里 `投票不完整` 或 `缺票模型` 数值较大，说明需要先排查对应模型的补跑情况。",
+            "",
+        ]
+    )
     lines.extend(
         _table(
             [
@@ -835,19 +904,31 @@ def format_overall_markdown(
             ],
         )
     )
-    lines.extend(["", "## 两两对比汇总", ""])
+    lines.extend(
+        [
+            "",
+            "## 两两对比汇总",
+            "",
+            "- **这张表看什么**：总览任意两份标注结果在共同候选键上的各种一致率。",
+            "- **怎么读（分母口径）**：",
+            "  - `结论一致率（含未判定）`：分母是 `共同` key（包括两边同时为 `（无结论）` 的情况）。",
+            "  - `有效结论一致率`：分母是“两边都拿到了有效最终结论”的共同 key（**最能反映模型语义判断像不像**）。",
+            "  - `仅左` / `仅右` 不参与任何一致率分母。",
+            "",
+        ]
+    )
     lines.extend(
         _table(
             [
                 "#",
-                "左",
-                "右",
-                "共同",
+                "左文件",
+                "右文件",
+                "共同 key",
                 "并集",
                 "结论一致率（含未判定）",
                 "有效结论一致率",
-                "仅左",
-                "仅右",
+                "仅左有",
+                "仅右有",
                 "状态一致率",
                 "a图式",
                 "b图式",
@@ -892,10 +973,10 @@ def format_overall_markdown(
     lines.extend(
         [
             "",
-            "## 一致性矩阵",
+            "## 一致性矩阵（多文件横向速查）",
             "",
-            "单元格为 `结论一致率（相同/共同 key）`，未判定对未判定计为相同状态；"
-            "仅单侧 key 不进入分母。对角线写 `—`，无共同 key 写 `N/A (0/0)`。",
+            "- **这张表看什么**：当对比 3 个及以上文件时，一眼比较谁和谁最接近。",
+            "- **怎么读**：单元格显示 `结论一致率（相同/共同 key）`，未判定对未判定计为相同状态；仅单侧 key 不进入分母。对角线写 `—`，无共同 key 写 `N/A (0/0)`。",
             "",
         ]
     )
@@ -903,6 +984,17 @@ def format_overall_markdown(
     lines.extend(["", "## 逐对明细", ""])
     for summary in summaries:
         lines.extend(_pair_section(summary))
+    lines.extend(
+        [
+            "## 明细 CSV 怎么看",
+            "",
+            "- 同目录下每一对文件都有一个对应的 `.csv`（可用 Excel 直接打开），逐条保存了共同记录以及 `仅左侧` / `仅右侧` 记录。",
+            "- **常用排查建议**：",
+            "  1. 在 `比较结果` 列筛选 `不同`，再看 `变化字段` 列，就能立刻知道差异出在 `最终结论`、状态还是图式。",
+            "  2. 对照 `左判定理由` / `右判定理由`（以及失败原因字段），可以直观看懂两边为什么得出不同结论（差异本身不一定代表报错）。",
+            "",
+        ]
+    )
     return "\n".join(lines)
 
 

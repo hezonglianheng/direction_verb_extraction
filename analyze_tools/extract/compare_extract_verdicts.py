@@ -2049,25 +2049,77 @@ def format_overall_markdown(
     files: Sequence[LoadedFile], summaries: Sequence[PairSummary]
 ) -> str:
     lines = [
-        "# extract 方位词筛选结果总体对比",
+        "# extract 原句初筛结果对比报告",
         "",
-        "本报告分三层对比筛选结果：",
+        "这份报告用来对比**多份「原句初筛（extract）」结果**，看不同模型或不同批次在挑出包含空间关系的句子和方位词时，结论有多一致、有多少句子能放行给下一步。",
         "",
-        "- **原始 extractable**：只看该词“是否空间可提取”的单项判断（与旧报告同口径，不代表能进入下游）。",
-        "- **严格逐词状态**：结合语法通顺、空间自洽和调用来源后的最终逐词状态；仅 `true` / `false` 为有效判定，`error`、`limit`、`no_llm` 各自独立。",
-        "- **整句与下游准入**（仅 JSONL）：整条语料只有未出错且通过（或未启用 LLM 的 `no_llm`）时，才允许进入后续 replace/标注。",
+        "## 一分钟看懂这份报告",
         "",
-        "## 输入文件",
+        "### 1. 这份报告为什么分「三层」来比较？",
         "",
-        "以下标签（如 `01_...`）用于下文各对比表；`完整三元组` 指目标物、参照物、动词均非空；`同词位重复组` 指同一文件内相同 `(源文件, 原句, 方位词, 字符偏移)` 出现多次的组数。",
+        "- **第一层 · 原始 `extractable`**：只看模型对单个词“有没有表达空间信息”的单项回答。保留它主要是为了和历史旧报告对齐；**注意：单项为 true 并不代表这句话能进下游**（因为句子可能语法不通或空间逻辑不自洽）。",
+        "- **第二层 · 严格逐词状态**：把“空间可提取（`extractable`）+ 语法通顺（`grammatical`）+ 空间自洽（`spatial_coherent`）+ 是否成功调用模型”合在一起算出的最终逐词状态。只有 `true` / `false` 算有效判定；`error` / `limit` / `no_llm` 各自独立。",
+        "- **第三层 · 整句与下游准入**（仅输入 `.jsonl` 时可统计）：看一条原句整体是否能放行给后续的替换（`replace`）与正式标注（`annotate`）。",
+        "",
+        "### 2. 推荐阅读顺序",
+        "",
+        "1. 先看 **「输入文件概览」和「逐词状态分布」**：检查每个文件一共测了多少条词位、多少条真正拿到了模型判定（`有效覆盖率`），有没有大量报错（`error`）或超额未送（`limit`）。",
+        "2. 再看 **「句级状态与下游准入」**：看最后真正能进入下游的原句比例（`准入率`）。",
+        "3. 再看 **「两两对比：词级 / 句级」和「一致性矩阵」**：先看整体重合与一致率，再重点看剔除未判定之后的 **「有效判定一致率」**。",
+        "4. 如果一致率偏低，看 **「逐词严格状态转移」** 找出主要分歧（例如是不是一方经常 `true`、另一方经常 `false` 或 `error`），并留意末尾的 **「重复 base 歧义警告」**。",
+        "",
+        "### 3. 看数字前先避开这 4 个坑",
+        "",
+        "- **「原始 true」≠「可用语料」**：必须三项全为 true 且没报错，才算严格 `true`。",
+        "- **「两边都是 unknown / error / limit」也会算成“相同”**：在词级「原始一致率」和「严格一致率」里，两侧状态相同就记为一致，哪怕两边都没判出来。真正衡量“模型想法像不像”，请看 **「有效判定一致率」**（只比两边都给出了明确 `true`/`false` 的项）。",
+        "- **词级一致率的分母是「两侧并集」**：也就是“共同项 + 仅左有 + 仅右有”。如果两份文件扫描到的词位集合差很多，即使共同项都一致，并集一致率也会被拉低。",
+        "- **旧版 CSV 与任意 CSV 的限制**：输入 CSV 时缺少“没有逐词判定的 `no_llm` 整句”，因此句级统计统一标 `N/A（需 JSONL）`；旧版 CSV 缺少严格四列时，严格指标统一标 `N/A（缺列，请重新导出）`。",
+        "",
+        "## 白话名词对照表",
         "",
     ]
     lines.extend(
         _md_table(
+            ["报告里的说法", "对应的代码/原字段", "大白话解释"],
+            [
+                {
+                    "报告里的说法": term,
+                    "对应的代码/原字段": code_ref,
+                    "大白话解释": desc,
+                }
+                for term, code_ref, desc in [
+                    ("原始 `extractable`", "`verdict.extractable`", "只看这一个词是否表达空间信息（`true` / `false` / `unknown`）。"),
+                    ("严格 `true` / `false`", "严格逐词状态", "只有 `extractable`、`grammatical`（语法通顺）、`spatial_coherent`（空间自洽）三项全为 true 且调用正常，才是严格 `true`；任一为 false（且非异常/限额/未启用）为严格 `false`。"),
+                    ("`error`（调用/数据异常）", "`source=error` 或字段缺失损坏", "请求失败、模型返回格式不对或关键字段缺失（不是“判假”）。"),
+                    ("`limit`（超额未送）", "`source=limit`", "达到了配置的发送上限，根本没发给模型（不是“判假”）。"),
+                    ("`no_llm`（未启用模型）", "`source=no_llm`", "未启用大模型筛选或历史旧语料；整句层面按规则允许直接放行下游。"),
+                    ("`unknown`（未判定）", "`extractable = null`", "原始口径里没拿到 true/false 布尔值的项（通常来自 `limit` 或 `error`）。"),
+                    ("有效判定 / 有效覆盖率", "严格 `true` + 严格 `false`", "剔除 `error`/`limit`/`no_llm` 后真正由模型判断过的词位数量及占比。"),
+                    ("准入句 / 下游准入率", "整句状态为 `true` 或 `no_llm`", "整条原句没有报错和超限、且至少通过或未启用筛选，允许进入后续 `replace` / 标注的句子。"),
+                    ("完整三元组", "`(target, reference, verb)` 均非空", "该词位的目标物、参照物、动词三个角色文本都提取出来了。"),
+                    ("同词位重复组（重复 base）", "`(源文件, 原句, 方位词, 字符偏移)` 重复", "同一文件里完全相同的“原句 + 词 + 位置”出现多次；跨文件只能按出现顺序第 1 对第 1 配对。"),
+                    ("两侧并集", "`共同 + 仅左 + 仅右`", "两个文件各自找出的所有词位或句子的总集合，用来做整体一致率分母。"),
+                ]
+            ],
+            ["---", "---", "---"],
+        )
+    )
+    lines.extend(
+        [
+            "",
+            "## 输入文件概览",
+            "",
+            "- **这张表看什么**：确认每个输入文件包含多少条逐词判定、多少条完整三元组，以及文件内部是否存在重复词位。",
+            "- **怎么读**：标签（如 `01_...`）是下文所有表格对文件的简称。",
+            "",
+        ]
+    )
+    lines.extend(
+        _md_table(
             [
                 "编号",
-                "标签",
-                "文件",
+                "文件标签",
+                "文件路径",
                 "格式",
                 "逐词判定数",
                 "完整三元组",
@@ -2076,8 +2128,8 @@ def format_overall_markdown(
             [
                 {
                     "编号": f"{item.index:02d}",
-                    "标签": item.label,
-                    "文件": item.path,
+                    "文件标签": item.label,
+                    "文件路径": item.path,
                     "格式": item.fmt,
                     "逐词判定数": item.total,
                     "完整三元组": item.complete_count,
@@ -2093,37 +2145,38 @@ def format_overall_markdown(
             "",
             "### 逐词状态分布",
             "",
-            "`有效判定 = 严格true + 严格false`；`有效覆盖率 = 有效判定 / 逐词判定数`。",
+            "- **这张表看什么**：对比每个文件在“原始 `extractable`”与“严格五态”下的分布，看有多少词位真的拿到了模型结论。",
+            "- **怎么读**：`有效判定 = 严格true + 严格false`；`有效覆盖率 = 有效判定 / 逐词判定数`。如果 `error` 或 `limit` 偏高，说明先要排查网络/配额，而不是急着评价模型好坏。",
             "",
         ]
     )
     lines.extend(
         _md_table(
             [
-                "标签",
+                "文件标签",
                 "原始true",
                 "原始false",
                 "原始unknown",
                 "严格true",
                 "严格false",
-                "error",
-                "limit",
-                "no_llm",
-                "有效判定",
+                "error (异常)",
+                "limit (超限)",
+                "no_llm (未用模型)",
+                "有效判定 (true+false)",
                 "有效覆盖率",
             ],
             [
                 {
-                    "标签": item.label,
+                    "文件标签": item.label,
                     "原始true": item.true_count,
                     "原始false": item.false_count,
                     "原始unknown": item.unknown_count,
                     "严格true": item.strict_count("true") if item.strict_available else "—",
                     "严格false": item.strict_count("false") if item.strict_available else "—",
-                    "error": item.strict_count("error") if item.strict_available else "—",
-                    "limit": item.strict_count("limit") if item.strict_available else "—",
-                    "no_llm": item.strict_count("no_llm") if item.strict_available else "—",
-                    "有效判定": item.effective_count if item.strict_available else "—",
+                    "error (异常)": item.strict_count("error") if item.strict_available else "—",
+                    "limit (超限)": item.strict_count("limit") if item.strict_available else "—",
+                    "no_llm (未用模型)": item.strict_count("no_llm") if item.strict_available else "—",
+                    "有效判定 (true+false)": item.effective_count if item.strict_available else "—",
                     "有效覆盖率": (
                         _ratio_text(item.effective_count, item.total, unavailable="N/A")
                         if item.strict_available
@@ -2138,9 +2191,10 @@ def format_overall_markdown(
     lines.extend(
         [
             "",
-            "## 句级状态与下游准入",
+            "## 句级状态与下游准入（仅 JSONL）",
             "",
-            "按每条原句统计；`准入句` 指整句状态为 `true` 或 `no_llm`、可进入后续 replace/标注的句子（CSV 不含无逐词判定的记录，无法统计整句全量）。",
+            "- **这张表看什么**：以“一整条原句”为单位，看各文件有多少句子最终获准进入下一阶段（`replace` / 标注）。",
+            "- **怎么读**：`准入句` 指整句状态为 `true` 或 `no_llm` 的句子；`准入率 = 准入句数 / 句数`。若输入是 CSV，因 CSV 不包含无逐词判定的记录，这里会显示 `N/A（需 JSONL）`。",
             "",
         ]
     )
@@ -2150,7 +2204,7 @@ def format_overall_markdown(
             sentence_rows.append(
                 {
                     "编号": f"{item.index:02d}",
-                    "标签": item.label,
+                    "文件标签": item.label,
                     "句数": "N/A（需 JSONL）",
                     "true": "—",
                     "false": "—",
@@ -2165,7 +2219,7 @@ def format_overall_markdown(
         sentence_rows.append(
             {
                 "编号": f"{item.index:02d}",
-                "标签": item.label,
+                "文件标签": item.label,
                 "句数": item.sentence_total,
                 "true": item.sentence_status_counts.get("true", 0),
                 "false": item.sentence_status_counts.get("false", 0),
@@ -2182,7 +2236,7 @@ def format_overall_markdown(
         )
     lines.extend(
         _md_table(
-            ["编号", "标签", "句数", "true", "false", "error", "limit", "no_llm", "准入句数", "准入率"],
+            ["编号", "文件标签", "句数", "true", "false", "error", "limit", "no_llm", "准入句数", "准入率"],
             sentence_rows,
             ["---", "---"] + ["---:"] * 8,
         )
@@ -2190,9 +2244,13 @@ def format_overall_markdown(
     lines.extend(
         [
             "",
-            "## 两两对比：词级",
+            "## 两两对比：词级（按相同词位对齐）",
             "",
-            "`共同` 为两侧按同一词位对齐的判定数；`并集 = 共同 + 仅左 + 仅右`；`有效共同` 仅包含两侧均为严格 `true`/`false` 的共同项。",
+            "- **这张表看什么**：任意两个文件在逐词判定上的重合度和一致性总表。",
+            "- **怎么读（分母口径）**：",
+            "  - `原始一致率 = 原始相同 / 并集`、`严格一致率 = 严格相同 / 并集`（包含仅单侧项，也包含两边同为 `error`/`limit`/`no_llm`）。",
+            "  - `有效一致率 = 有效相同 / 有效共同`（**最核心指标**：只比两边都给出了明确严格 `true`/`false` 的共同词位）。",
+            "- **注意事项**：`三元组变化` 说明虽然对齐到同一个词，但抽出来的目标物/参照物/动词文本变了，建议打开明细 CSV 核查。",
             "",
         ]
     )
@@ -2200,38 +2258,38 @@ def format_overall_markdown(
         _md_table(
             [
                 "#",
-                "左",
-                "右",
-                "共同",
-                "并集",
+                "左文件",
+                "右文件",
+                "共同词位",
+                "词位并集",
                 "原始相同",
-                "原始一致率",
+                "原始一致率 (相同/并集)",
                 "严格相同",
-                "严格一致率",
+                "严格一致率 (相同/并集)",
                 "有效共同",
                 "有效相同",
-                "有效一致率",
-                "仅左",
-                "仅右",
+                "有效一致率 (相同/有效共同)",
+                "仅左有",
+                "仅右有",
                 "三元组变化",
                 "明细 CSV",
             ],
             [
                 {
                     "#": index,
-                    "左": summary.left.label,
-                    "右": summary.right.label,
-                    "共同": summary.common,
-                    "并集": summary.union,
+                    "左文件": summary.left.label,
+                    "右文件": summary.right.label,
+                    "共同词位": summary.common,
+                    "词位并集": summary.union,
                     "原始相同": summary.same,
-                    "原始一致率": summary.agreement_text,
+                    "原始一致率 (相同/并集)": summary.agreement_text,
                     "严格相同": summary.strict_same if summary.strict_available else "—",
-                    "严格一致率": summary.strict_agreement_text,
+                    "严格一致率 (相同/并集)": summary.strict_agreement_text,
                     "有效共同": summary.common_effective if summary.strict_available else "—",
                     "有效相同": summary.same_effective if summary.strict_available else "—",
-                    "有效一致率": summary.effective_agreement_text,
-                    "仅左": summary.only_left,
-                    "仅右": summary.only_right,
+                    "有效一致率 (相同/有效共同)": summary.effective_agreement_text,
+                    "仅左有": summary.only_left,
+                    "仅右有": summary.only_right,
                     "三元组变化": summary.triple_changed,
                     "明细 CSV": f"[{summary.csv_name}]({summary.csv_name})",
                 }
@@ -2243,9 +2301,10 @@ def format_overall_markdown(
     lines.extend(
         [
             "",
-            "## 两两对比：句级",
+            "## 两两对比：句级（按相同原句对齐）",
             "",
-            "按 `(源文件, 原句, 同句出现序号)` 对齐原句；`准入并集 = 双方准入 + 仅左准入 + 仅右准入`。",
+            "- **这张表看什么**：从整句放行的视角，看两个文件挑出来的下游句子集合重合度有多高。",
+            "- **怎么读**：`准入并集 = 双方准入 + 仅左准入 + 仅右准入`；`准入重合率 = 双方准入 / 准入并集`（越接近 100%，代表两份结果放行去下一步的句子越一致）。",
             "",
         ]
     )
@@ -2253,8 +2312,8 @@ def format_overall_markdown(
         _md_table(
             [
                 "#",
-                "左",
-                "右",
+                "左文件",
+                "右文件",
                 "共同句",
                 "句并集",
                 "句状态相同",
@@ -2268,8 +2327,8 @@ def format_overall_markdown(
             [
                 {
                     "#": index,
-                    "左": summary.left.label,
-                    "右": summary.right.label,
+                    "左文件": summary.left.label,
+                    "右文件": summary.right.label,
                     "共同句": summary.sentence_common if summary.sentence_available else "—",
                     "句并集": summary.sentence_union if summary.sentence_available else "—",
                     "句状态相同": summary.sentence_same if summary.sentence_available else "—",
@@ -2290,7 +2349,8 @@ def format_overall_markdown(
             "",
             "## 逐词严格状态转移（非零）",
             "",
-            "仅统计两侧均存在且严格状态可计算的共同项；`error`、`limit`、`no_llm` 各自独立，不互算相同。",
+            "- **这张表看什么**：揭示共同词位上，左右文件具体是怎么“从一种状态变成另一种状态”的。",
+            "- **怎么读**：`true→false` 多说明右文件更严或认为语法/空间不自洽；`error`/`limit`/`no_llm` 与 `true`/`false` 之间的转移说明其中一次存在异常或未完整跑完（三者各自独立，不互算相同）。",
             "",
         ]
     )
@@ -2306,7 +2366,7 @@ def format_overall_markdown(
                             "左状态": left_state,
                             "右状态": right_state,
                             "数量": count,
-                            "占共同项": (
+                            "占可比共同项": (
                                 f"{count / summary.strict_comparable * 100:.2f}%"
                                 if summary.strict_comparable
                                 else "N/A"
@@ -2316,7 +2376,7 @@ def format_overall_markdown(
     if transition_rows:
         lines.extend(
             _md_table(
-                ["对比", "左状态", "右状态", "数量", "占共同项"],
+                ["对比", "左状态", "右状态", "数量", "占可比共同项"],
                 transition_rows,
                 ["---", "---", "---", "---:", "---:"],
             )
@@ -2326,13 +2386,14 @@ def format_overall_markdown(
     lines.extend(
         [
             "",
-            "## 一致性矩阵",
+            "## 一致性矩阵（多文件横向速查）",
             "",
-            "对角线 `—` 表示不与自身比较；分母为 0 时记 `N/A (0/0)`；旧版 CSV 缺严格列时记 `N/A（缺列，请重新导出）`；CSV 不计算句级指标时记 `N/A（需 JSONL）`。",
+            "- **这组矩阵看什么**：把两两对比的结果排成方阵，方便一次比较 3 个以上文件；交叉格子数值与上表一致。",
+            "- **怎么读符号**：对角线 `—` 表示自己不和自己比；分母为 0 记 `N/A (0/0)`；旧版 CSV 缺严格列记 `N/A（缺列，请重新导出）`；CSV 无法算句级指标记 `N/A（需 JSONL）`。",
             "",
             "### 原始 extractable 一致率",
             "",
-            "口径：只看 `extractable` 是否一致（`相同数 / 两侧词键并集`；`unknown→unknown` 记为相同）。",
+            "口径：只看 `extractable` 是否一致（`相同数 / 两侧词键并集`；`unknown→unknown` 也记为相同）。",
             "",
         ]
     )
@@ -2352,7 +2413,7 @@ def format_overall_markdown(
             "",
             "### 有效判定一致率",
             "",
-            "口径：只在双方都给出严格 `true`/`false` 的共同项内比较（`有效相同 / 有效共同`；未完成项不进入分母）。",
+            "口径：只在双方都给出严格 `true`/`false` 的共同项内比较（`有效相同 / 有效共同`；未完成或异常项不进入分母）。",
             "",
         ]
     )
@@ -2372,7 +2433,7 @@ def format_overall_markdown(
             "",
             "### 下游准入句集重合率",
             "",
-            "口径：双方都能进入下游的句子在至少一侧准入句子中的占比（`双方准入 / 准入并集`；准入指整句为 `true` 或 `no_llm`；仅 JSONL）。",
+            "口径：双方都能进入下游的句子在“至少一侧准入句子”中的占比（`双方准入 / 准入并集`；准入指整句为 `true` 或 `no_llm`；仅 JSONL）。",
             "",
         ]
     )
@@ -2382,8 +2443,9 @@ def format_overall_markdown(
             "",
             "## 原始 extractable 重复 base 歧义警告",
             "",
-            "同一源文件里，相同的 `(原句, 方位词, 字符偏移)` 在单文件内出现多次时，只能按出现顺序第 1 对第 1、第 2 对第 2 配对。",
-            "本节只量化**原始 extractable** 的相同数可能范围；严格五态与句级指标同样按出现顺序配对、存在相同歧义，但未单独计算其范围。",
+            "- **这一节看什么**：如果同一源文件里完全相同的 `(原句, 方位词, 字符偏移)` 在单个文件内出现多次，跨文件对比时只能按出现顺序“第 1 对第 1、第 2 对第 2”配对，万一其中一边少了一条就可能错位。",
+            "- **怎么读**：下面列出受影响组数，以及“假如组内任意重新配对，原始相同数最小~最大可能是多少”；如果区间很窄或提示未发现歧义，说明顺序配对非常可信。",
+            "  - 注：本节只量化**原始 extractable** 的可能范围；严格五态与句级指标同样按出现顺序配对、存在相同歧义，未单独重算区间。",
             "",
         ]
     )
@@ -2417,13 +2479,14 @@ def format_overall_markdown(
     lines.extend(
         [
             "",
-            "## 口径说明",
+            "## 口径补充与明细 CSV 怎么看",
             "",
-            "- **对齐方式**：词级按 `(源文件, 原句, 方位词, 字符偏移, 同位置出现序号)` 对齐；句级按 `(源文件, 原句, 同句出现序号)` 对齐。JSONL 行号、三元组文本与整句状态均不参与词级对齐。",
-            "- **严格判定规则**：严格 `true` 要求 `extractable`、`grammatical`、`spatial_coherent` 全为 true 且来源不是 `error`/`limit`/`no_llm`；来源不是上述三类且三项中任一为 false 时为严格 `false`；其余（如缺少字段、类型异常）为 `error`。",
-            "- **三元组变化**：仅统计共同项中 `(目标物, 参照物, 动词)` 文本是否不同；混合真值句中被判 `false` 的词位三元组可能已被剪除。",
+            "- **对齐方式**：词级按 `(源文件, 原句, 方位词, 字符偏移, 同位置出现序号)` 对齐；句级按 `(源文件, 原句, 同句出现序号)` 对齐。JSONL 行号、三元组文本与整句状态都不参与词级对齐。",
+            "- **严格判定规则**：严格 `true` 要求 `extractable`、`grammatical`、`spatial_coherent` 全为 true 且来源不是 `error`/`limit`/`no_llm`；来源不是上述三类且三项中任一为 false 时为严格 `false`；其余（如缺字段、非布尔脏值）为 `error`。",
+            "- **三元组变化**：只统计共同项中 `(目标物, 参照物, 动词)` 文本是否不同；混合真值句中被判 `false` 的词位三元组可能已被剪除。",
             "- **无逐词判定的记录**：未启用 LLM 且没有逐词判定的 `no_llm` 句子只计入句级统计，不会伪造词级行。",
-            "- **旧版 CSV 与明细**：缺少严格四列的旧版 CSV 仍可输出原始一致率，严格指标记 `N/A（缺列，请重新导出）`；同目录下的两两明细 CSV 保留全部共同项和仅单侧项。",
+            "- **明细 CSV 怎么看**：同目录下的 `.csv` 可用 Excel 打开，包含全部共同项和仅单侧项。",
+            "  - 筛选 `严格比较结果 = 不同`（或 `比较结果 = 不同`），即可逐句对比 `左判定` / `左理由` 与 `右判定` / `右理由`；筛选 `三元组是否变化 = 是`，可排查提取角色变化。",
             "",
         ]
     )
